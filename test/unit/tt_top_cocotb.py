@@ -8,27 +8,34 @@ COLS = 4
 PSUM_WIDTH = 16
 PSUM_BYTES = PSUM_WIDTH // 8
 
-CMD_NOP = 0
+CMD_STATUS = 0
 CMD_CLEAR = 1
-CMD_LOAD_WEIGHT = 2
-CMD_LOAD_ACT = 3
-CMD_LOAD_SEED = 4
+CMD_SET_ADDR = 2
+CMD_WRITE = 3
+CMD_READ = 4
 CMD_START = 5
-CMD_READ_RESULT = 6
-CMD_STATUS = 7
+CMD_NOP = 7
+
+ADDR_ROW = 0
+ADDR_COL = 1
+ADDR_BYTE = 2
+ADDR_BANK = 3
+
+BANK_WEIGHT = 1
+BANK_ACT = 2
+BANK_SEED = 3
+BANK_RESULT = 4
 
 STATUS_BUSY = 1 << 0
 STATUS_DONE = 1 << 1
 STATUS_WEIGHT_DONE = 1 << 2
 STATUS_ALL_VALID = 1 << 3
 STATUS_START_READY = 1 << 4
-STATUS_WEIGHT_READY = 1 << 5
-STATUS_ROW0_VALID = 1 << 6
-STATUS_ROW1_VALID = 1 << 7
+STATUS_ERROR = 1 << 6
 
 
-def pack_ui(cmd: int, index: int = 0, row: int = 0) -> int:
-    return (cmd & 0x7) | ((index & 0x3) << 3) | ((row & 0x1) << 5)
+def pack_ui(cmd: int, arg: int = 0) -> int:
+    return (cmd & 0x7) | ((arg & 0x1F) << 3)
 
 
 def to_bits(value: int, width: int) -> int:
@@ -60,9 +67,9 @@ async def init(dut):
     await ClockCycles(dut.clk, 2)
 
 
-async def command(dut, cmd: int, data: int = 0, index: int = 0, row: int = 0):
+async def command(dut, cmd: int, data: int = 0, arg: int = 0):
     await FallingEdge(dut.clk)
-    dut.ui_in.value = pack_ui(cmd, index=index, row=row)
+    dut.ui_in.value = pack_ui(cmd, arg=arg)
     dut.uio_in.value = data & 0xFF
     await RisingEdge(dut.clk)
     await ReadOnly()
@@ -77,38 +84,53 @@ async def read_status(dut) -> int:
     return int(dut.uo_out.value) & 0xFF
 
 
+async def set_addr(dut, addr_id: int, value: int):
+    await command(dut, CMD_SET_ADDR, data=value, arg=addr_id)
+
+
+async def set_bank(dut, bank: int):
+    await set_addr(dut, ADDR_BANK, bank)
+
+
+async def write_selected(dut, value: int):
+    await command(dut, CMD_WRITE, data=value)
+
+
+async def read_selected(dut) -> int:
+    await command(dut, CMD_READ)
+    return int(dut.uo_out.value) & 0xFF
+
+
 async def clear(dut):
     await command(dut, CMD_CLEAR)
     await nop(dut)
 
 
 async def load_weights(dut, weights_by_row: list[list[int]]):
-    for col in reversed(range(COLS)):
-        bits = 0
-        for row in range(ROWS):
-            bits |= weights_by_row[row][col] << row
-        await command(dut, CMD_LOAD_WEIGHT, data=bits)
-
-    await nop(dut)
-    status = await read_status(dut)
-    assert status & STATUS_WEIGHT_DONE
+    await set_bank(dut, BANK_WEIGHT)
+    for row, weights in enumerate(weights_by_row):
+        packed = 0
+        for col, bit in enumerate(weights):
+            packed |= (bit & 1) << col
+        await set_addr(dut, ADDR_ROW, row)
+        await set_addr(dut, ADDR_COL, 0)
+        await write_selected(dut, packed)
 
 
 async def load_acts(dut, acts: list[int]):
+    await set_bank(dut, BANK_ACT)
     for col, act in enumerate(acts):
-        await command(dut, CMD_LOAD_ACT, data=to_bits(act, 8), index=col)
+        await set_addr(dut, ADDR_COL, col)
+        await write_selected(dut, to_bits(act, 8))
 
 
 async def load_seed(dut, row: int, seed: int):
     raw = to_bits(seed, PSUM_WIDTH)
+    await set_bank(dut, BANK_SEED)
+    await set_addr(dut, ADDR_ROW, row)
     for byte in range(PSUM_BYTES):
-        await command(
-            dut,
-            CMD_LOAD_SEED,
-            data=(raw >> (8 * byte)) & 0xFF,
-            index=byte,
-            row=row,
-        )
+        await set_addr(dut, ADDR_BYTE, byte)
+        await write_selected(dut, (raw >> (8 * byte)) & 0xFF)
 
 
 async def start(dut):
@@ -118,9 +140,10 @@ async def start(dut):
     await nop(dut)
 
 
-async def wait_done(dut, limit: int = 64) -> int:
+async def wait_done(dut, limit: int = 128) -> int:
     for _ in range(limit):
         status = await read_status(dut)
+        assert not (status & STATUS_ERROR)
         if status & STATUS_DONE:
             return status
     raise AssertionError("top wrapper did not report done")
@@ -128,9 +151,11 @@ async def wait_done(dut, limit: int = 64) -> int:
 
 async def read_result(dut, row: int) -> int:
     raw = 0
+    await set_bank(dut, BANK_RESULT)
+    await set_addr(dut, ADDR_ROW, row)
     for byte in range(PSUM_BYTES):
-        await command(dut, CMD_READ_RESULT, index=byte, row=row)
-        raw |= (int(dut.uo_out.value) & 0xFF) << (8 * byte)
+        await set_addr(dut, ADDR_BYTE, byte)
+        raw |= (await read_selected(dut)) << (8 * byte)
     return to_signed(raw, PSUM_WIDTH)
 
 
@@ -141,8 +166,7 @@ async def run_vector(dut, acts: list[int], seeds: list[int]) -> list[int]:
     await start(dut)
     status = await wait_done(dut)
     assert status & STATUS_ALL_VALID
-    assert status & STATUS_ROW0_VALID
-    assert status & STATUS_ROW1_VALID
+    assert status & STATUS_WEIGHT_DONE
     return [await read_result(dut, row) for row in range(ROWS)]
 
 
@@ -156,10 +180,7 @@ async def tt_wrapper_loads_computes_and_reads_results(dut):
     ]
     acts = [7, -8, -128, 5]
     seeds = [11, -13]
-    expected = [
-        dot_ref(weights[row], acts, seeds[row])
-        for row in range(ROWS)
-    ]
+    expected = [dot_ref(weights[row], acts, seeds[row]) for row in range(ROWS)]
 
     await load_weights(dut, weights)
     got = await run_vector(dut, acts, seeds)
@@ -180,26 +201,21 @@ async def tt_wrapper_reuses_weights_for_multiple_vectors(dut):
     ]
 
     await load_weights(dut, weights)
-
     for acts, seeds in vectors:
-        expected = [
-            dot_ref(weights[row], acts, seeds[row])
-            for row in range(ROWS)
-        ]
+        expected = [dot_ref(weights[row], acts, seeds[row]) for row in range(ROWS)]
         got = await run_vector(dut, acts, seeds)
         assert got == expected
 
 
 @cocotb.test()
-async def tt_wrapper_clear_resets_status_and_input_registers(dut):
+async def tt_wrapper_clear_resets_control_state(dut):
     await init(dut)
 
-    await load_weights(dut, [[1, 1, 1, 1], [1, 1, 1, 1]])
+    await load_weights(dut, [[1, 1, 0, 0], [0, 0, 1, 1]])
+    await command(dut, CMD_START)
+    await ClockCycles(dut.clk, 2)
     await clear(dut)
 
     status = await read_status(dut)
+    assert not (status & STATUS_BUSY)
     assert not (status & STATUS_DONE)
-    assert not (status & STATUS_WEIGHT_DONE)
-
-    got = await run_vector(dut, [1, 2, 3, 4], [0, 0])
-    assert got == [10, 10]
