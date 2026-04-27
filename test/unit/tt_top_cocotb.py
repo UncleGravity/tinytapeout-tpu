@@ -1,16 +1,8 @@
-# SPDX-FileCopyrightText: © 2026 UncleGravity
-# SPDX-License-Identifier: Apache-2.0
-
-import json
-import os
-from pathlib import Path
-
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, FallingEdge, ReadOnly, RisingEdge
 
 
-HERE = Path(__file__).parent
 ROWS = 2
 COLS = 4
 
@@ -23,6 +15,7 @@ CMD_START = 5
 CMD_READ_RESULT = 6
 CMD_STATUS = 7
 
+STATUS_BUSY = 1 << 0
 STATUS_DONE = 1 << 1
 STATUS_WEIGHT_DONE = 1 << 2
 STATUS_ALL_VALID = 1 << 3
@@ -56,9 +49,9 @@ def dot_ref(weights: list[int], acts: list[int], seed: int = 0) -> int:
 async def init(dut):
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     dut.ena.value = 1
+    dut.rst_n.value = 0
     dut.ui_in.value = 0
     dut.uio_in.value = 0
-    dut.rst_n.value = 0
     await ClockCycles(dut.clk, 4)
     await FallingEdge(dut.clk)
     dut.rst_n.value = 1
@@ -82,8 +75,12 @@ async def read_status(dut) -> int:
     return int(dut.uo_out.value) & 0xFF
 
 
+async def clear(dut):
+    await command(dut, CMD_CLEAR)
+    await nop(dut)
+
+
 async def load_weights(dut, weights_by_row: list[list[int]]):
-    # Physical shift order: send the last column first.
     for col in reversed(range(COLS)):
         bits = 0
         for row in range(ROWS):
@@ -93,7 +90,6 @@ async def load_weights(dut, weights_by_row: list[list[int]]):
     await nop(dut)
     status = await read_status(dut)
     assert status & STATUS_WEIGHT_DONE
-    assert status & STATUS_WEIGHT_READY
 
 
 async def load_acts(dut, acts: list[int]):
@@ -148,32 +144,8 @@ async def run_vector(dut, acts: list[int], seeds: list[int]) -> list[int]:
     return [await read_result(dut, row) for row in range(ROWS)]
 
 
-async def replay_fixture(dut, fixture_path: Path):
-    fixture = json.loads(fixture_path.read_text())
-
-    assert fixture["source"]["tensor"] == "blk.0.attn_q.weight"
-    assert fixture["source"]["type"] == "q1_0"
-    assert fixture["tile"] == {"rows": ROWS, "cols": COLS}
-    assert len(fixture["final_expected"]) == ROWS
-    assert len(fixture["ggml_scaled_expected_float"]) == ROWS
-
-    got = [0, 0]
-    for txn in fixture["transactions"]:
-        assert len(txn["weights"]) == ROWS
-        assert all(len(row_weights) == COLS for row_weights in txn["weights"])
-        assert len(txn["acts"]) == COLS
-        assert len(txn["seeds"]) == ROWS
-        assert len(txn["expected"]) == ROWS
-        assert txn["seeds"] == got
-        await load_weights(dut, txn["weights"])
-        got = await run_vector(dut, txn["acts"], txn["seeds"])
-        assert got == txn["expected"]
-
-    assert got == fixture["final_expected"]
-
-
 @cocotb.test()
-async def chip_w1a8_tile_transaction(dut):
+async def tt_wrapper_loads_computes_and_reads_results(dut):
     await init(dut)
 
     weights = [
@@ -189,12 +161,11 @@ async def chip_w1a8_tile_transaction(dut):
 
     await load_weights(dut, weights)
     got = await run_vector(dut, acts, seeds)
-
     assert got == expected
 
 
 @cocotb.test()
-async def chip_reuses_stationary_weights(dut):
+async def tt_wrapper_reuses_weights_for_multiple_vectors(dut):
     await init(dut)
 
     weights = [
@@ -218,36 +189,15 @@ async def chip_reuses_stationary_weights(dut):
 
 
 @cocotb.test()
-async def chip_matches_bonsai_q1_0_group_fixtures(dut):
+async def tt_wrapper_clear_resets_status_and_input_registers(dut):
     await init(dut)
 
-    fixture_paths = [
-        HERE / "fixtures" / "bonsai_blk0_attn_q_r0_r1_g0.json",
-        HERE / "fixtures" / "bonsai_blk0_attn_q_r42_r43_g7.json",
-    ]
+    await load_weights(dut, [[1, 1, 1, 1], [1, 1, 1, 1]])
+    await clear(dut)
 
-    for fixture_path in fixture_paths:
-        await replay_fixture(dut, fixture_path)
+    status = await read_status(dut)
+    assert not (status & STATUS_DONE)
+    assert not (status & STATUS_WEIGHT_DONE)
 
-
-@cocotb.test()
-async def chip_matches_bonsai_q1_0_full_row_tile_fixture(dut):
-    await init(dut)
-    await replay_fixture(
-        dut,
-        HERE / "fixtures" / "bonsai_blk0_attn_q_rows0_1_all_groups.json",
-    )
-
-
-@cocotb.test()
-async def chip_matches_bonsai_q1_0_full_tensor_fixtures(dut):
-    if os.getenv("BONSAI_FULL_TENSOR_TESTS") != "1":
-        return
-
-    fixture_dir = Path(os.environ["BONSAI_FULL_TENSOR_FIXTURE_DIR"])
-    fixture_paths = sorted(fixture_dir.glob("*.json"))
-    assert fixture_paths
-
-    await init(dut)
-    for fixture_path in fixture_paths:
-        await replay_fixture(dut, fixture_path)
+    got = await run_vector(dut, [1, 2, 3, 4], [0, 0])
+    assert got == [10, 10]

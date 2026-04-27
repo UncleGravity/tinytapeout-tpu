@@ -8,7 +8,7 @@ project:
   clock_hz: 0 # Clock frequency in Hz (or 0 if not applicable)
 
   # How many tiles your design occupies? A single tile is about 167x108 uM.
-  tiles: "1x1" # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
+  tiles: "2x2" # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
 
   # Your top module name must start with "tt_um_".
   top_module: "tt_um_unclegravity_tpu"
@@ -17,41 +17,44 @@ project:
   # Source files must be in ./src and you must list each source file separately, one per line.
   # Don't forget to also update `PROJECT_SOURCES` in test/Makefile.
   source_files:
+    - "rtl/w1a8_pe.v"
+    - "rtl/w1a8_row.v"
+    - "rtl/w1a8_array.v"
+    - "rtl/w1a8_tile_controller.v"
     - "rtl/project.v"
-    - "rtl/pe1.v"
 
 # The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
 # This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
 pinout:
   # Inputs
-  ui[0]: "w (weight bit)"
-  ui[1]: "acc_en"
-  ui[2]: "acc_clear"
-  ui[3]: "readout_hi (0=low byte, 1=high byte)"
-  ui[4]: ""
-  ui[5]: ""
-  ui[6]: ""
-  ui[7]: ""
+  ui[0]: "cmd[0]"
+  ui[1]: "cmd[1]"
+  ui[2]: "cmd[2]"
+  ui[3]: "index[0]"
+  ui[4]: "index[1]"
+  ui[5]: "row"
+  ui[6]: "reserved"
+  ui[7]: "reserved"
 
   # Outputs
-  uo[0]: "acc byte [0]"
-  uo[1]: "acc byte [1]"
-  uo[2]: "acc byte [2]"
-  uo[3]: "acc byte [3]"
-  uo[4]: "acc byte [4]"
-  uo[5]: "acc byte [5]"
-  uo[6]: "acc byte [6]"
-  uo[7]: "acc byte [7] (sign when readout_hi=1)"
+  uo[0]: "status/result[0]"
+  uo[1]: "status/result[1]"
+  uo[2]: "status/result[2]"
+  uo[3]: "status/result[3]"
+  uo[4]: "status/result[4]"
+  uo[5]: "status/result[5]"
+  uo[6]: "status/result[6]"
+  uo[7]: "status/result[7]"
 
   # Bidirectional pins (used as inputs for the activation byte)
-  uio[0]: "a[0]"
-  uio[1]: "a[1]"
-  uio[2]: "a[2]"
-  uio[3]: "a[3]"
-  uio[4]: "a[4]"
-  uio[5]: "a[5]"
-  uio[6]: "a[6]"
-  uio[7]: "a[7] (sign)"
+  uio[0]: "data_in[0] / weight row0"
+  uio[1]: "data_in[1] / weight row1"
+  uio[2]: "data_in[2]"
+  uio[3]: "data_in[3]"
+  uio[4]: "data_in[4]"
+  uio[5]: "data_in[5]"
+  uio[6]: "data_in[6]"
+  uio[7]: "data_in[7]"
 
 # Do not change!
 yaml_version: 6

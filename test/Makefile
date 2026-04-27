@@ -49,6 +49,9 @@ endif
 # Waveform dump location
 COMPILE_ARGS    += -DDUMPFILE=\"$(SIM_BUILD)/tb.fst\"
 
+# Current RTL uses SystemVerilog constructs such as always_ff/always_comb.
+COMPILE_ARGS    += -g2012
+
 # Allow sharing configuration between design and testbench via `include`:
 COMPILE_ARGS 		+= -I$(SRC_DIR)
 

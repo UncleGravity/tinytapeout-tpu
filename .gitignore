@@ -3,8 +3,8 @@
 *.vcd
 *.fst
 *.fst.hier
-runs
-tt_submission
+runs/
+tt_submission/
 src/user_config.json
 src/_tt_fpga_top.v
 src/config_merged.json
@@ -16,6 +16,7 @@ test/unit/*.result.xml
 test/gate_level_netlist.v
 .venv/
 build/
-tt
+tt/
 .pdk/
-result
+result/
+models/
