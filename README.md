@@ -45,7 +45,7 @@ cd test && make -B GATES=yes            # gate-level test (needs prior harden)
 
 ## CI
 
-The upstream GitHub Actions workflows (`.github/workflows/{gds,docs,test,fpga}.yaml`) are unchanged and continue to build on TT's hosted runners — they don't depend on the flake.
+The upstream GitHub Actions workflows (`.github/workflows/{gds,docs,test,fpga}.yaml`) are unchanged from Tiny Tapeout.
 
 ## Resources
 
