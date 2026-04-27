@@ -9,7 +9,10 @@ The Makefile requires `PDK_ROOT` to be set; the Nix devshell (`nix develop`) set
 ```sh
 make -B # default RTL simulation
 ```
-This runs the cocotb suite plus some Bonsai Q1_0 fixtures in `test/fixtures/`.
+This runs the cocotb suite plus Bonsai Q1_0 x Q8_0 fixtures in `test/fixtures/`.
+Fixture tests reset the RTL seed at each 32-wide Q8_0 block, then apply the
+recorded scales in Python and compare the reconstructed float against GGML's
+`vec_dot` reference.
 
 ## Gate-level simulation 
 ```sh
@@ -27,8 +30,9 @@ make -B FST=
 ## Regenerate Fixtures
 
 ```sh
-make -C tools/bonsai_fixture generate
+make -C tools/bonsai_fixture generate-group
 make -C tools/bonsai_fixture generate-row-tile
+make -C tools/bonsai_fixture generate-tensor
 ```
 
 Use `tools/bonsai_fixture/bonsai_fixture --help`-style usage by running the
@@ -36,13 +40,13 @@ tool without arguments.
 
 ## Full Tensor One-Off
 
-Generates full `blk.0.attn_q.weight` tensor. Compares GGUF and systolic array outputs.
+Generates the full `blk.0.attn_q.weight` tensor fixture as one large uncommitted file. Compares scaled GGML references against outputs reconstructed from systolic-array Q8-block sums.
 
 ```sh
-set -euo pipefail; out=/tmp/tt-tpu-bonsai-full-tensor-fixtures; rm -rf "$out"; mkdir -p "$out"; for row in $(seq 0 2 2046); do tools/bonsai_fixture/bonsai_fixture generate-row-tile models/Bonsai-1.7B/Bonsai-1.7B-Q1_0.gguf "$out/blk0_attn_q_rows${row}_$((row+1))_all_groups.json" blk.0.attn_q.weight "$row" 2 4; done
+make -C tools/bonsai_fixture generate-tensor
 ```
 ```sh
-cd test && BONSAI_FULL_TENSOR_TESTS=1 BONSAI_FULL_TENSOR_FIXTURE_DIR=/tmp/tt-tpu-bonsai-full-tensor-fixtures make -B
+cd test && BONSAI_FULL_TENSOR_TESTS=1 BONSAI_FULL_TENSOR_FIXTURE=/tmp/tt-tpu-bonsai-full-tensor.json make -B
 ```
 
 ## How to view the waveform file

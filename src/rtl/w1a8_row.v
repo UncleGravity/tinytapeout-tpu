@@ -22,7 +22,7 @@
 
 module w1a8_row #(
     parameter ACT_WIDTH  = 8,
-    parameter PSUM_WIDTH = 24,
+    parameter PSUM_WIDTH = 16,
     parameter COLS       = 4
 ) (
     input  wire                              clk,
@@ -31,7 +31,6 @@ module w1a8_row #(
     input  wire                              clear,
     input  wire                              weight_load,
     input  wire                              weight_in,
-    output wire                              weight_out,
 
     input  wire signed [COLS*ACT_WIDTH-1:0] act_in,
     output wire signed [COLS*ACT_WIDTH-1:0] act_out,
@@ -47,8 +46,6 @@ module w1a8_row #(
     wire signed [PSUM_WIDTH-1:0] psum_chain [0:COLS];
 
     assign weight_chain[0] = weight_in;
-    assign weight_out      = weight_chain[COLS];
-
     assign valid_chain[0] = valid_in;
     assign valid_out      = valid_chain[COLS];
 

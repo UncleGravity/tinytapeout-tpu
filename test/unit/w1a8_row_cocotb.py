@@ -4,7 +4,7 @@ from cocotb.triggers import ClockCycles, FallingEdge, ReadOnly, RisingEdge
 
 
 ACT_WIDTH = 8
-PSUM_WIDTH = 24
+PSUM_WIDTH = 16
 COLS = 4
 
 
@@ -105,9 +105,6 @@ async def loads_weights_through_serial_chain(dut):
     weights = [1, 0, 1, 1]
     await load_weights(dut, weights)
 
-    # weight_out is the stored weight from the last column.
-    assert int(dut.weight_out.value) == weights[-1]
-
     acts = [3, 4, -5, 6]
     await drive_one_dot(dut, acts)
 
@@ -188,8 +185,6 @@ async def clear_flushes_pipeline_but_not_weights(dut):
     await clear_row(dut)
     assert int(dut.valid_out.value) == 0
     assert read_psum(dut) == 0
-    assert int(dut.weight_out.value) == weights[-1]
-
     acts = [1, 2, 3, 4]
     await drive_one_dot(dut, acts)
     assert read_psum(dut) == dot_ref(weights, acts)

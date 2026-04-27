@@ -4,7 +4,7 @@ from cocotb.triggers import ClockCycles, FallingEdge, ReadOnly, RisingEdge
 
 
 ACT_WIDTH = 8
-PSUM_WIDTH = 24
+PSUM_WIDTH = 16
 ROWS = 2
 COLS = 4
 

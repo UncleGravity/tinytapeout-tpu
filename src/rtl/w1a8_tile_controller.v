@@ -22,7 +22,7 @@
 
 module w1a8_tile_controller #(
     parameter ACT_WIDTH  = 8,
-    parameter PSUM_WIDTH = 24,
+    parameter PSUM_WIDTH = 16,
     parameter ROWS       = 2,
     parameter COLS       = 4
 ) (
@@ -34,7 +34,6 @@ module w1a8_tile_controller #(
     input  wire [ROWS-1:0]                     weight_load_bits,
     output wire                                weight_load_ready,
     output logic                               weight_load_done,
-    output wire [ROWS-1:0]                     weight_out,
 
     input  wire                                start,
     output wire                                start_ready,
@@ -170,7 +169,6 @@ module w1a8_tile_controller #(
         .clear      (clear),
         .weight_load(load_accept),
         .weight_in  (weight_load_bits),
-        .weight_out (weight_out),
         .act_in     (array_act_in),
         .act_out    (array_act_out),
         .psum_in    (array_psum_in),

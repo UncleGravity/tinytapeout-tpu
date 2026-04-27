@@ -21,7 +21,7 @@
 
 module w1a8_array #(
     parameter ACT_WIDTH  = 8,
-    parameter PSUM_WIDTH = 24,
+    parameter PSUM_WIDTH = 16,
     parameter ROWS       = 2,
     parameter COLS       = 4
 ) (
@@ -31,7 +31,6 @@ module w1a8_array #(
     input  wire                               clear,
     input  wire                               weight_load,
     input  wire [ROWS-1:0]                    weight_in,
-    output wire [ROWS-1:0]                    weight_out,
 
     input  wire signed [COLS*ACT_WIDTH-1:0]   act_in,
     output wire signed [COLS*ACT_WIDTH-1:0]   act_out,
@@ -60,7 +59,6 @@ module w1a8_array #(
                 .clear      (clear),
                 .weight_load(weight_load),
                 .weight_in  (weight_in[row]),
-                .weight_out (weight_out[row]),
                 .act_in     (act_chain[row]),
                 .act_out    (act_chain[row + 1]),
                 .psum_in    (psum_in[row*PSUM_WIDTH +: PSUM_WIDTH]),

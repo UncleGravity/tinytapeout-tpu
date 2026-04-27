@@ -4,7 +4,7 @@ from cocotb.triggers import ClockCycles, FallingEdge, RisingEdge
 
 
 ACT_WIDTH = 8
-PSUM_WIDTH = 24
+PSUM_WIDTH = 16
 
 
 def to_bits(value: int, width: int) -> int:

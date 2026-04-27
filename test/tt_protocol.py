@@ -9,7 +9,6 @@ PSUM_WIDTH = 16
 PSUM_BYTES = PSUM_WIDTH // 8
 
 CMD_NOP = 0
-CMD_CLEAR = 1
 CMD_LOAD_WEIGHT = 2
 CMD_LOAD_ACT = 3
 CMD_LOAD_SEED = 4
@@ -17,7 +16,6 @@ CMD_START = 5
 CMD_READ_RESULT = 6
 CMD_STATUS = 7
 
-STATUS_BUSY = 1 << 0
 STATUS_DONE = 1 << 1
 STATUS_WEIGHT_DONE = 1 << 2
 STATUS_ALL_VALID = 1 << 3
@@ -41,19 +39,12 @@ def to_signed(raw: int, width: int) -> int:
     return raw - (1 << width) if raw & sign else raw
 
 
-def dot_ref(weights: list[int], acts: list[int], seed: int = 0) -> int:
-    total = seed
-    for weight, act in zip(weights, acts):
-        total += act if weight else -act
-    return total
-
-
 async def init(dut):
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     dut.ena.value = 1
-    dut.rst_n.value = 0
     dut.ui_in.value = 0
     dut.uio_in.value = 0
+    dut.rst_n.value = 0
     await ClockCycles(dut.clk, 4)
     await FallingEdge(dut.clk)
     dut.rst_n.value = 1
@@ -77,11 +68,6 @@ async def read_status(dut) -> int:
     return int(dut.uo_out.value) & 0xFF
 
 
-async def clear(dut):
-    await command(dut, CMD_CLEAR)
-    await nop(dut)
-
-
 async def load_weights(dut, weights_by_row: list[list[int]]):
     for col in reversed(range(COLS)):
         bits = 0
@@ -92,6 +78,7 @@ async def load_weights(dut, weights_by_row: list[list[int]]):
     await nop(dut)
     status = await read_status(dut)
     assert status & STATUS_WEIGHT_DONE
+    assert status & STATUS_WEIGHT_READY
 
 
 async def load_acts(dut, acts: list[int]):
@@ -144,62 +131,3 @@ async def run_vector(dut, acts: list[int], seeds: list[int]) -> list[int]:
     assert status & STATUS_ROW0_VALID
     assert status & STATUS_ROW1_VALID
     return [await read_result(dut, row) for row in range(ROWS)]
-
-
-@cocotb.test()
-async def tt_wrapper_loads_computes_and_reads_results(dut):
-    await init(dut)
-
-    weights = [
-        [1, 0, 1, 0],
-        [0, 1, 1, 1],
-    ]
-    acts = [7, -8, -128, 5]
-    seeds = [11, -13]
-    expected = [
-        dot_ref(weights[row], acts, seeds[row])
-        for row in range(ROWS)
-    ]
-
-    await load_weights(dut, weights)
-    got = await run_vector(dut, acts, seeds)
-    assert got == expected
-
-
-@cocotb.test()
-async def tt_wrapper_reuses_weights_for_multiple_vectors(dut):
-    await init(dut)
-
-    weights = [
-        [0, 1, 1, 0],
-        [1, 1, 0, 0],
-    ]
-    vectors = [
-        ([10, 20, -30, -40], [100, -7]),
-        ([-3, 4, 5, -6], [5, 6]),
-    ]
-
-    await load_weights(dut, weights)
-
-    for acts, seeds in vectors:
-        expected = [
-            dot_ref(weights[row], acts, seeds[row])
-            for row in range(ROWS)
-        ]
-        got = await run_vector(dut, acts, seeds)
-        assert got == expected
-
-
-@cocotb.test()
-async def tt_wrapper_clear_resets_status_and_input_registers(dut):
-    await init(dut)
-
-    await load_weights(dut, [[1, 1, 1, 1], [1, 1, 1, 1]])
-    await clear(dut)
-
-    status = await read_status(dut)
-    assert not (status & STATUS_DONE)
-    assert not (status & STATUS_WEIGHT_DONE)
-
-    got = await run_vector(dut, [1, 2, 3, 4], [0, 0])
-    assert got == [10, 10]

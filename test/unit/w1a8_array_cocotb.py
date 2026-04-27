@@ -4,7 +4,7 @@ from cocotb.triggers import ClockCycles, FallingEdge, ReadOnly, RisingEdge
 
 
 ACT_WIDTH = 8
-PSUM_WIDTH = 24
+PSUM_WIDTH = 16
 ROWS = 2
 COLS = 4
 
@@ -181,9 +181,10 @@ async def loads_one_weight_row_per_array_row(dut):
     ]
     await load_weights(dut, weights)
 
-    # Each row has its own serial load lane; weight_out is that row's last PE.
-    got = int(dut.weight_out.value)
-    assert got == ((weights[0][-1] << 0) | (weights[1][-1] << 1))
+    acts = [3, 4, -5, 6]
+    got = await drive_one_vector_collect(dut, acts, [0, 0])
+    expected = [dot_ref(weights[row], acts) for row in range(ROWS)]
+    assert got == expected
 
 
 @cocotb.test()

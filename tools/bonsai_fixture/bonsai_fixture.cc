@@ -182,6 +182,7 @@ Q1Block read_q1_block(std::ifstream & file, const TensorMeta & meta, int row, in
     const size_t block_offset = tensor_offset + row * meta.tensor->nb[1] + group * Q1_BLOCK_BYTES;
 
     std::array<uint8_t, Q1_BLOCK_BYTES> raw{};
+    file.clear();
     file.seekg(static_cast<std::streamoff>(block_offset));
     file.read(reinterpret_cast<char *>(raw.data()), raw.size());
     if (!file) {
@@ -346,20 +347,7 @@ Reference write_transactions(
     return ref;
 }
 
-void write_fixture(const Config & cfg) {
-    auto meta = load_tensor(cfg.model, cfg.tensor);
-    validate(cfg, meta);
-
-    std::ifstream model(cfg.model, std::ios::binary);
-    if (!model) {
-        throw std::runtime_error("failed to open model: " + cfg.model);
-    }
-
-    std::ofstream out(cfg.output);
-    if (!out) {
-        throw std::runtime_error("failed to open output: " + cfg.output);
-    }
-
+void write_fixture_json(std::ostream & out, std::ifstream & model, const TensorMeta & meta, const Config & cfg) {
     const int row_last = cfg.select.row0 + cfg.tile.rows - 1;
     const int last_col = cfg.select.group_count * Q1_GROUP_SIZE - 1;
     const auto acts = activations(cfg.select);
@@ -398,6 +386,65 @@ void write_fixture(const Config & cfg) {
     out << "}\n";
 }
 
+void write_fixture(const Config & cfg) {
+    auto meta = load_tensor(cfg.model, cfg.tensor);
+    validate(cfg, meta);
+
+    std::ifstream model(cfg.model, std::ios::binary);
+    if (!model) {
+        throw std::runtime_error("failed to open model: " + cfg.model);
+    }
+
+    std::ofstream out(cfg.output);
+    if (!out) {
+        throw std::runtime_error("failed to open output: " + cfg.output);
+    }
+
+    write_fixture_json(out, model, meta, cfg);
+}
+
+void write_tensor_fixture(const Config & cfg) {
+    auto meta = load_tensor(cfg.model, cfg.tensor);
+    validate(cfg, meta);
+    if (meta.tensor->ne[1] % cfg.tile.rows != 0) {
+        throw std::runtime_error("tensor row count is not divisible by tile rows");
+    }
+
+    std::ifstream model(cfg.model, std::ios::binary);
+    if (!model) {
+        throw std::runtime_error("failed to open model: " + cfg.model);
+    }
+
+    std::ofstream out(cfg.output);
+    if (!out) {
+        throw std::runtime_error("failed to open output: " + cfg.output);
+    }
+
+    out << "{\n";
+    out << "  \"schema_version\": 1,\n";
+    out << "  \"kind\": \"tensor\",\n";
+    out << "  \"source\": {\n";
+    out << "    \"model\": \"" << cfg.model << "\",\n";
+    out << "    \"tensor\": \"" << cfg.tensor << "\",\n";
+    out << "    \"type\": \"" << ggml_type_name(meta.tensor->type) << "\",\n";
+    out << "    \"shape\": [" << meta.tensor->ne[0] << ", " << meta.tensor->ne[1] << "],\n";
+    out << "    \"row_stride_bytes\": " << meta.tensor->nb[1] << "\n";
+    out << "  },\n";
+    out << "  \"tile\": {\"rows\": " << cfg.tile.rows << ", \"cols\": " << cfg.tile.cols << "},\n";
+    out << "  \"row_tiles\": [\n";
+
+    const int row_tiles = static_cast<int>(meta.tensor->ne[1] / cfg.tile.rows);
+    for (int i = 0; i < row_tiles; ++i) {
+        Config row_cfg = cfg;
+        row_cfg.select.row0 = i * cfg.tile.rows;
+        write_fixture_json(out, model, meta, row_cfg);
+        out << (i + 1 == row_tiles ? "\n" : ",\n");
+    }
+
+    out << "  ]\n";
+    out << "}\n";
+}
+
 void inspect(const std::string & model, const std::string & tensor_name) {
     auto meta = load_tensor(model, tensor_name);
     std::cout << "model: " << model << "\n";
@@ -424,6 +471,7 @@ int groups_per_row(const std::string & model, const std::string & tensor_name) {
     std::cerr << "  " << program << " inspect [model.gguf] [tensor]\n";
     std::cerr << "  " << program << " generate-group [model.gguf] [output.json] [tensor] [row0] [group] [tile_rows] [tile_cols]\n";
     std::cerr << "  " << program << " generate-row-tile [model.gguf] [output.json] [tensor] [row0] [tile_rows] [tile_cols]\n";
+    std::cerr << "  " << program << " generate-tensor [model.gguf] [output.json] [tensor] [tile_rows] [tile_cols]\n";
     std::exit(EXIT_FAILURE);
 }
 
@@ -452,6 +500,18 @@ Config row_tile_config(int argc, char ** argv) {
     return cfg;
 }
 
+Config tensor_config(int argc, char ** argv) {
+    Config cfg;
+    cfg.model = argc > 2 ? argv[2] : DEFAULT_MODEL;
+    cfg.output = argc > 3 ? argv[3] : "/tmp/tt-tpu-bonsai-full-tensor.json";
+    cfg.tensor = argc > 4 ? argv[4] : DEFAULT_TENSOR;
+    cfg.tile.rows = argc > 5 ? std::stoi(argv[5]) : DEFAULT_TILE_ROWS;
+    cfg.tile.cols = argc > 6 ? std::stoi(argv[6]) : DEFAULT_TILE_COLS;
+    cfg.select.group_count = groups_per_row(cfg.model, cfg.tensor);
+    cfg.select.all_groups = true;
+    return cfg;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -471,6 +531,10 @@ int main(int argc, char ** argv) {
         }
         if (mode == "generate-row-tile") {
             write_fixture(row_tile_config(argc, argv));
+            return EXIT_SUCCESS;
+        }
+        if (mode == "generate-tensor") {
+            write_tensor_fixture(tensor_config(argc, argv));
             return EXIT_SUCCESS;
         }
 

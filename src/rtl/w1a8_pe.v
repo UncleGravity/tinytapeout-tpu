@@ -18,7 +18,7 @@
 
 module w1a8_pe #(
     parameter ACT_WIDTH  = 8,
-    parameter PSUM_WIDTH = 24
+    parameter PSUM_WIDTH = 16
 ) (
     input  wire                              clk,
     input  wire                              rst_n,
