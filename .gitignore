@@ -20,3 +20,5 @@ tt/
 .pdk/
 result/
 models/
+bonsai_fixture
+!bonsai_fixture/
