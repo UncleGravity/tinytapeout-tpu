@@ -25,7 +25,7 @@ Generate a fixture for a specific tensor, output row pair, and Q1_0 group:
 
 ```sh
 nix develop -c tools/bonsai_fixture/bonsai_fixture \
-  generate \
+  generate-group \
   models/Bonsai-1.7B/Bonsai-1.7B-Q1_0.gguf \
   test/fixtures/bonsai_blk0_attn_q_r42_r43_g7.json \
   blk.0.attn_q.weight \

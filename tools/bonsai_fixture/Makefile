@@ -9,7 +9,7 @@ TARGET = bonsai_fixture
 FIXTURE = ../../test/fixtures/bonsai_blk0_attn_q_r0_r1_g0.json
 ROW_TILE_FIXTURE = ../../test/fixtures/bonsai_blk0_attn_q_rows0_1_all_groups.json
 
-.PHONY: all clean inspect generate generate-row-tile
+.PHONY: all clean inspect generate-group generate-row-tile
 
 all: $(TARGET)
 
@@ -19,8 +19,8 @@ $(TARGET): bonsai_fixture.cc
 inspect: $(TARGET)
 	./$(TARGET) inspect ../../models/Bonsai-1.7B/Bonsai-1.7B-Q1_0.gguf blk.0.attn_q.weight
 
-generate: $(TARGET)
-	./$(TARGET) generate ../../models/Bonsai-1.7B/Bonsai-1.7B-Q1_0.gguf $(FIXTURE)
+generate-group: $(TARGET)
+	./$(TARGET) generate-group ../../models/Bonsai-1.7B/Bonsai-1.7B-Q1_0.gguf $(FIXTURE)
 
 generate-row-tile: $(TARGET)
 	./$(TARGET) generate-row-tile ../../models/Bonsai-1.7B/Bonsai-1.7B-Q1_0.gguf $(ROW_TILE_FIXTURE)

@@ -3,6 +3,7 @@
 
 import json
 import os
+import struct
 from pathlib import Path
 
 import cocotb
@@ -13,6 +14,8 @@ from cocotb.triggers import ClockCycles, FallingEdge, ReadOnly, RisingEdge
 HERE = Path(__file__).parent
 ROWS = 2
 COLS = 4
+Q8_BLOCK_SIZE = 32
+FLOAT_TOLERANCE = 1e-4
 
 CMD_NOP = 0
 CMD_CLEAR = 1
@@ -154,22 +157,81 @@ async def replay_fixture(dut, fixture_path: Path):
     assert fixture["source"]["tensor"] == "blk.0.attn_q.weight"
     assert fixture["source"]["type"] == "q1_0"
     assert fixture["tile"] == {"rows": ROWS, "cols": COLS}
-    assert len(fixture["final_expected"]) == ROWS
-    assert len(fixture["ggml_scaled_expected_float"]) == ROWS
+    assert fixture["schema_version"] == 1
+    assert fixture["quantization"]["q8_0_block_size"] == Q8_BLOCK_SIZE
+    assert Q8_BLOCK_SIZE % COLS == 0
+    assert len(fixture["reference"]["integer_final"]) == ROWS
+    assert len(fixture["reference"]["ggml_scaled_float"]) == ROWS
+    assert len(fixture["quantization"]["q1_scales_fp16_hex_by_group"]) > 0
+    assert len(fixture["quantization"]["q8_scales_fp16_hex_by_group"]) == len(
+        fixture["quantization"]["q1_scales_fp16_hex_by_group"]
+    )
 
-    got = [0, 0]
+    scaled_from_rtl = [0.0 for _ in range(ROWS)]
+    block_sums = [0 for _ in range(ROWS)]
+    current_block = None
+
     for txn in fixture["transactions"]:
         assert len(txn["weights"]) == ROWS
         assert all(len(row_weights) == COLS for row_weights in txn["weights"])
         assert len(txn["acts"]) == COLS
         assert len(txn["seeds"]) == ROWS
         assert len(txn["expected"]) == ROWS
-        assert txn["seeds"] == got
-        await load_weights(dut, txn["weights"])
-        got = await run_vector(dut, txn["acts"], txn["seeds"])
-        assert got == txn["expected"]
+        assert txn["cols"][0] % COLS == 0
 
-    assert got == fixture["final_expected"]
+        block_key = (txn["group"], (txn["cols"][0] % 128) // Q8_BLOCK_SIZE)
+        if block_key != current_block:
+            if current_block is not None:
+                accumulate_scaled_block(fixture, current_block, block_sums, scaled_from_rtl)
+            current_block = block_key
+            block_sums = [0 for _ in range(ROWS)]
+
+        deltas = [
+            txn["expected"][row] - txn["seeds"][row]
+            for row in range(ROWS)
+        ]
+        expected = [
+            block_sums[row] + deltas[row]
+            for row in range(ROWS)
+        ]
+
+        await load_weights(dut, txn["weights"])
+        got = await run_vector(dut, txn["acts"], block_sums)
+        assert got == expected
+        block_sums = got
+
+    if current_block is not None:
+        accumulate_scaled_block(fixture, current_block, block_sums, scaled_from_rtl)
+
+    for got, expected in zip(scaled_from_rtl, fixture["reference"]["ggml_scaled_float"]):
+        assert abs(got - expected) <= FLOAT_TOLERANCE
+
+
+def fp16_hex_to_float(value: str) -> float:
+    raw = int(value, 16)
+    return struct.unpack("<e", raw.to_bytes(2, byteorder="little"))[0]
+
+
+def accumulate_scaled_block(
+    fixture: dict,
+    block_key: tuple[int, int],
+    block_sums: list[int],
+    scaled_from_rtl: list[float],
+):
+    group, q8_block = block_key
+    if "groups" in fixture["selection"]:
+        group_start = fixture["selection"]["groups"][0]
+    else:
+        group_start = fixture["selection"]["group"]
+    group_index = group - group_start
+    q1_scales = fixture["quantization"]["q1_scales_fp16_hex_by_group"][group_index]
+    q8_scale = fp16_hex_to_float(
+        fixture["quantization"]["q8_scales_fp16_hex_by_group"][group_index][q8_block]
+    )
+
+    for row in range(ROWS):
+        q1_scale = fp16_hex_to_float(q1_scales[row])
+        scaled_from_rtl[row] += q1_scale * q8_scale * block_sums[row]
 
 
 @cocotb.test()
