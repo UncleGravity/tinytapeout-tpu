@@ -15,7 +15,6 @@ def test_tt_top():
             RTL_DIR / "w1a8_pe.v",
             RTL_DIR / "w1a8_row.v",
             RTL_DIR / "w1a8_array.v",
-            RTL_DIR / "w1a8_tile_controller.v",
             RTL_DIR / "project.v",
         ],
         hdl_toplevel="tt_um_unclegravity_tpu",

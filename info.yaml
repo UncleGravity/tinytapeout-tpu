@@ -20,7 +20,6 @@ project:
     - "rtl/w1a8_pe.v"
     - "rtl/w1a8_row.v"
     - "rtl/w1a8_array.v"
-    - "rtl/w1a8_tile_controller.v"
     - "rtl/project.v"
 
 # The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
