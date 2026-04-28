@@ -23,7 +23,7 @@
 module w1a8_row #(
     parameter ACT_WIDTH  = 8,
     parameter PSUM_WIDTH = 16,
-    parameter COLS       = 4
+    parameter COLS       = 2
 ) (
     input  wire                              clk,
     input  wire                              rst_n,

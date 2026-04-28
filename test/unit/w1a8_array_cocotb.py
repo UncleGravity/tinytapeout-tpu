@@ -1,310 +1,243 @@
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import cocotb
-from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles, FallingEdge, ReadOnly, RisingEdge
+
+from common import (
+    dot_ref,
+    drive_and_sample,
+    make_acts,
+    make_seeds,
+    make_weights,
+    pack_lanes,
+    start_clock_and_reset,
+    unpack_lanes,
+)
 
 
-ACT_WIDTH = 8
-PSUM_WIDTH = 16
-ROWS = 2
-COLS = 4
-
-
-def to_bits(value: int, width: int) -> int:
-    return value & ((1 << width) - 1)
-
-
-def to_signed(raw: int, width: int) -> int:
-    raw &= (1 << width) - 1
-    sign = 1 << (width - 1)
-    return raw - (1 << width) if raw & sign else raw
-
-
-def pack_acts(lanes: list[int]) -> int:
-    packed = 0
-    for col, value in enumerate(lanes):
-        packed |= to_bits(value, ACT_WIDTH) << (col * ACT_WIDTH)
-    return packed
-
-
-def unpack_acts(raw: int) -> list[int]:
-    return [
-        to_signed(raw >> (col * ACT_WIDTH), ACT_WIDTH)
-        for col in range(COLS)
-    ]
-
-
-def pack_psums(values: list[int]) -> int:
-    packed = 0
-    for row, value in enumerate(values):
-        packed |= to_bits(value, PSUM_WIDTH) << (row * PSUM_WIDTH)
-    return packed
-
-
-def unpack_psums(raw: int) -> list[int]:
-    return [
-        to_signed(raw >> (row * PSUM_WIDTH), PSUM_WIDTH)
-        for row in range(ROWS)
-    ]
-
-
-def dot_ref(weights: list[int], acts: list[int], seed: int = 0) -> int:
-    total = seed
-    for weight, act in zip(weights, acts):
-        total += act if weight else -act
-    return total
+def read_psums(dut, rows: int, pw: int) -> list[int]:
+    return unpack_lanes(int(dut.psum_out.value), rows, pw)
 
 
 async def init(dut):
-    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
-    dut.rst_n.value = 0
     dut.clear.value = 0
     dut.weight_load.value = 0
     dut.weight_in.value = 0
     dut.act_in.value = 0
     dut.psum_in.value = 0
     dut.valid_in.value = 0
-    await ClockCycles(dut.clk, 4)
-    await FallingEdge(dut.clk)
-    dut.rst_n.value = 1
-    await ClockCycles(dut.clk, 2)
+    await start_clock_and_reset(dut)
 
 
-async def cycle(dut, lanes=None, seeds=None, valids=None, weight_load=0, weight_in=None):
+async def cycle(dut, lanes=None, seeds=None, valids=None,
+                weight_load: int = 0, weight_in=None):
+    rows = int(dut.ROWS.value)
+    cols = int(dut.COLS.value)
+    aw = int(dut.ACT_WIDTH.value)
+    pw = int(dut.PSUM_WIDTH.value)
+
     if lanes is None:
-        lanes = [0] * COLS
+        lanes = [0] * cols
     if seeds is None:
-        seeds = [0] * ROWS
+        seeds = [0] * rows
     if valids is None:
-        valids = [0] * ROWS
+        valids = [0] * rows
     if weight_in is None:
-        weight_in = [0] * ROWS
+        weight_in = [0] * rows
 
-    valid_bits = 0
-    for row, valid in enumerate(valids):
-        valid_bits |= (1 if valid else 0) << row
+    valid_bits = sum((1 if v else 0) << r for r, v in enumerate(valids))
+    weight_bits = sum((1 if b else 0) << r for r, b in enumerate(weight_in))
 
-    weight_bits = 0
-    for row, bit in enumerate(weight_in):
-        weight_bits |= (1 if bit else 0) << row
-
-    await FallingEdge(dut.clk)
-    dut.clear.value = 0
-    dut.weight_load.value = weight_load
-    dut.weight_in.value = weight_bits
-    dut.act_in.value = pack_acts(lanes)
-    dut.psum_in.value = pack_psums(seeds)
-    dut.valid_in.value = valid_bits
-    await RisingEdge(dut.clk)
-    await ReadOnly()
+    await drive_and_sample(
+        dut,
+        clear=0,
+        weight_load=weight_load,
+        weight_in=weight_bits,
+        act_in=pack_lanes(lanes, aw),
+        psum_in=pack_lanes(seeds, pw),
+        valid_in=valid_bits,
+    )
 
 
-async def load_weights(dut, weights_by_row: list[list[int]]):
-    for col in reversed(range(COLS)):
+async def load_weights(dut, weights_by_row):
+    rows = int(dut.ROWS.value)
+    cols = int(dut.COLS.value)
+    for col in reversed(range(cols)):
         await cycle(
             dut,
             weight_load=1,
-            weight_in=[weights_by_row[row][col] for row in range(ROWS)],
+            weight_in=[weights_by_row[r][col] for r in range(rows)],
         )
     await cycle(dut)
 
 
 async def clear_array(dut):
-    await FallingEdge(dut.clk)
-    dut.clear.value = 1
-    dut.weight_load.value = 0
-    dut.valid_in.value = 0
-    await RisingEdge(dut.clk)
-    await ReadOnly()
+    await drive_and_sample(dut, clear=1, weight_load=0, valid_in=0)
 
 
-async def drive_one_vector(dut, acts: list[int], seeds: list[int]):
-    # Column skew happens at the top edge. Row skew is carried by valid/seed
-    # inputs so each row starts when x0 reaches that row.
-    for step in range(COLS + ROWS - 1):
-        lanes = [0] * COLS
-        for col in range(COLS):
-            if step == col:
-                lanes[col] = acts[col]
+async def drive_one_vector_collect(dut, acts, seeds) -> list[int]:
+    rows = int(dut.ROWS.value)
+    cols = int(dut.COLS.value)
+    pw = int(dut.PSUM_WIDTH.value)
 
-        valids = [1 if step == row else 0 for row in range(ROWS)]
-        row_seeds = [
-            seeds[row] if step == row else 0
-            for row in range(ROWS)
-        ]
-        await cycle(dut, lanes=lanes, seeds=row_seeds, valids=valids)
+    got = [None] * rows
 
-
-async def drive_one_vector_collect(dut, acts: list[int], seeds: list[int]) -> list[int]:
-    got = [None] * ROWS
-
-    for step in range(COLS + ROWS - 1):
-        lanes = [0] * COLS
-        for col in range(COLS):
-            if step == col:
-                lanes[col] = acts[col]
-
-        valids = [1 if step == row else 0 for row in range(ROWS)]
-        row_seeds = [
-            seeds[row] if step == row else 0
-            for row in range(ROWS)
-        ]
-        await cycle(dut, lanes=lanes, seeds=row_seeds, valids=valids)
-
+    def sample():
         valid_mask = int(dut.valid_out.value)
-        values = unpack_psums(int(dut.psum_out.value))
-        for row in range(ROWS):
-            if valid_mask & (1 << row):
-                got[row] = values[row]
+        if not valid_mask:
+            return
+        values = read_psums(dut, rows, pw)
+        for r in range(rows):
+            if valid_mask & (1 << r):
+                got[r] = values[r]
 
-    # The lowest rows can finish after the last top-edge activation injection.
-    for _ in range(ROWS):
-        if all(value is not None for value in got):
+    # Column skew at the top edge; row skew is carried by valid/seed inputs
+    # so each row starts when its activation reaches it.
+    for step in range(cols + rows - 1):
+        lanes = [0] * cols
+        for c in range(cols):
+            if step == c:
+                lanes[c] = acts[c]
+        valids    = [1 if step == r else 0 for r in range(rows)]
+        row_seeds = [seeds[r] if step == r else 0 for r in range(rows)]
+        await cycle(dut, lanes=lanes, seeds=row_seeds, valids=valids)
+        sample()
+
+    # Final drain: lower rows finish after the last top-edge activation injection.
+    for _ in range(rows):
+        if all(v is not None for v in got):
             break
         await cycle(dut)
-        valid_mask = int(dut.valid_out.value)
-        values = unpack_psums(int(dut.psum_out.value))
-        for row in range(ROWS):
-            if valid_mask & (1 << row):
-                got[row] = values[row]
+        sample()
 
-    assert all(value is not None for value in got), f"missing row outputs: {got}"
+    missing = [r for r, v in enumerate(got) if v is None]
+    assert not missing, f"no valid_out for rows={missing}, partial={got}"
     return got
 
 
 @cocotb.test()
 async def loads_one_weight_row_per_array_row(dut):
     await init(dut)
+    rows = int(dut.ROWS.value)
+    cols = int(dut.COLS.value)
 
-    weights = [
-        [1, 0, 1, 1],
-        [0, 1, 0, 1],
-    ]
+    weights = make_weights(rows, cols, kind=0)
     await load_weights(dut, weights)
 
-    acts = [3, 4, -5, 6]
-    got = await drive_one_vector_collect(dut, acts, [0, 0])
-    expected = [dot_ref(weights[row], acts) for row in range(ROWS)]
-    assert got == expected
+    acts = make_acts(cols, kind=0)
+    got = await drive_one_vector_collect(dut, acts, [0] * rows)
+    expected = [dot_ref(weights[r], acts) for r in range(rows)]
+    assert got == expected, f"got={got} expected={expected}"
 
 
 @cocotb.test()
 async def computes_two_output_rows_for_one_activation_vector(dut):
     await init(dut)
+    rows = int(dut.ROWS.value)
+    cols = int(dut.COLS.value)
 
-    weights = [
-        [1, 0, 1, 0],
-        [0, 1, 1, 1],
-    ]
-    acts = [7, -8, -128, 5]
-    seeds = [11, -13]
-    expected = [
-        dot_ref(weights[row], acts, seeds[row])
-        for row in range(ROWS)
-    ]
+    weights = make_weights(rows, cols, kind=1)
+    acts    = make_acts(cols, kind=1)
+    seeds   = make_seeds(rows, kind=1)
+    expected = [dot_ref(weights[r], acts, seeds[r]) for r in range(rows)]
 
     await load_weights(dut, weights)
     got = await drive_one_vector_collect(dut, acts, seeds)
-
-    assert got == expected
+    assert got == expected, f"got={got} expected={expected}"
 
 
 @cocotb.test()
 async def supports_back_to_back_activation_vectors(dut):
     await init(dut)
+    rows = int(dut.ROWS.value)
+    cols = int(dut.COLS.value)
+    pw = int(dut.PSUM_WIDTH.value)
 
-    weights = [
-        [0, 1, 1, 0],
-        [1, 1, 0, 0],
-    ]
-    acts_by_op = [
-        [10, 20, -30, -40],
-        [-3, 4, 5, -6],
-        [1, -2, 3, -4],
-    ]
-    seeds_by_op = [
-        [100, -7],
-        [5, 6],
-        [-3, 9],
-    ]
+    weights     = make_weights(rows, cols, kind=2)
+    acts_by_op  = [make_acts(cols, kind=k + 3) for k in range(3)]
+    seeds_by_op = [make_seeds(rows, kind=k + 3) for k in range(3)]
     expected_by_op = [
-        [
-            dot_ref(weights[row], acts_by_op[op], seeds_by_op[op][row])
-            for row in range(ROWS)
-        ]
+        [dot_ref(weights[r], acts_by_op[op], seeds_by_op[op][r]) for r in range(rows)]
         for op in range(len(acts_by_op))
     ]
 
     await load_weights(dut, weights)
 
-    got_by_row = [[] for _ in range(ROWS)]
-    for step in range(COLS + ROWS + len(acts_by_op) - 2):
-        lanes = [0] * COLS
-        for col in range(COLS):
-            op = step - col
+    got_by_row = [[] for _ in range(rows)]
+    for step in range(cols + rows + len(acts_by_op) - 2):
+        lanes = [0] * cols
+        for c in range(cols):
+            op = step - c
             if 0 <= op < len(acts_by_op):
-                lanes[col] = acts_by_op[op][col]
+                lanes[c] = acts_by_op[op][c]
 
-        valids = [0] * ROWS
-        seeds = [0] * ROWS
-        for row in range(ROWS):
-            op = step - row
+        valids = [0] * rows
+        seeds  = [0] * rows
+        for r in range(rows):
+            op = step - r
             if 0 <= op < len(acts_by_op):
-                valids[row] = 1
-                seeds[row] = seeds_by_op[op][row]
+                valids[r] = 1
+                seeds[r]  = seeds_by_op[op][r]
 
         await cycle(dut, lanes=lanes, seeds=seeds, valids=valids)
 
         valid_mask = int(dut.valid_out.value)
         if valid_mask:
-            values = unpack_psums(int(dut.psum_out.value))
-            for row in range(ROWS):
-                if valid_mask & (1 << row):
-                    got_by_row[row].append(values[row])
+            values = read_psums(dut, rows, pw)
+            for r in range(rows):
+                if valid_mask & (1 << r):
+                    got_by_row[r].append(values[r])
 
     expected_by_row = [
-        [expected_by_op[op][row] for op in range(len(acts_by_op))]
-        for row in range(ROWS)
+        [expected_by_op[op][r] for op in range(len(acts_by_op))]
+        for r in range(rows)
     ]
-    assert got_by_row == expected_by_row
+    assert got_by_row == expected_by_row, (
+        f"got={got_by_row} expected={expected_by_row}"
+    )
 
 
 @cocotb.test()
 async def forwards_activations_out_of_bottom_row(dut):
     await init(dut)
-    await load_weights(dut, [[1] * COLS, [1] * COLS])
+    rows = int(dut.ROWS.value)
+    cols = int(dut.COLS.value)
+    aw = int(dut.ACT_WIDTH.value)
 
-    lanes = [1, -2, 3, -4]
+    await load_weights(dut, [[1] * cols for _ in range(rows)])
+
+    lanes = make_acts(cols, kind=7)
     await cycle(dut, lanes=lanes)
-    assert unpack_acts(int(dut.act_out.value)) == [0] * COLS
+    assert unpack_lanes(int(dut.act_out.value), cols, aw) == [0] * cols
 
-    await cycle(dut)
-    assert unpack_acts(int(dut.act_out.value)) == lanes
+    # Activations need ROWS-1 additional cycles to propagate through every row.
+    for _ in range(rows - 1):
+        await cycle(dut)
+    assert unpack_lanes(int(dut.act_out.value), cols, aw) == lanes
 
 
 @cocotb.test()
 async def clear_flushes_array_but_keeps_weights(dut):
     await init(dut)
+    rows = int(dut.ROWS.value)
+    cols = int(dut.COLS.value)
+    pw = int(dut.PSUM_WIDTH.value)
 
-    weights = [
-        [1, 0, 0, 1],
-        [0, 0, 1, 1],
-    ]
-    acts = [8, 7, 6, 5]
+    weights = make_weights(rows, cols, kind=8)
+    acts1 = make_acts(cols, kind=8)
+    acts2 = make_acts(cols, kind=9)
+    seeds = make_seeds(rows, kind=9)
 
     await load_weights(dut, weights)
-    got = await drive_one_vector_collect(dut, acts, [0, 0])
-    assert got == [
-        dot_ref(weights[row], acts, 0)
-        for row in range(ROWS)
-    ]
+    got = await drive_one_vector_collect(dut, acts1, [0] * rows)
+    assert got == [dot_ref(weights[r], acts1) for r in range(rows)]
 
     await clear_array(dut)
     assert int(dut.valid_out.value) == 0
-    assert unpack_psums(int(dut.psum_out.value)) == [0, 0]
+    assert read_psums(dut, rows, pw) == [0] * rows
 
-    got = await drive_one_vector_collect(dut, acts, [3, -4])
-    expected = [
-        dot_ref(weights[row], acts, [3, -4][row])
-        for row in range(ROWS)
-    ]
-    assert got == expected
+    got = await drive_one_vector_collect(dut, acts2, seeds)
+    expected = [dot_ref(weights[r], acts2, seeds[r]) for r in range(rows)]
+    assert got == expected, f"got={got} expected={expected}"

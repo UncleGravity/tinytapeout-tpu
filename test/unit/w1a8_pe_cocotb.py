@@ -1,73 +1,52 @@
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import cocotb
-from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles, FallingEdge, RisingEdge
 
-
-ACT_WIDTH = 8
-PSUM_WIDTH = 16
-
-
-def to_bits(value: int, width: int) -> int:
-    return value & ((1 << width) - 1)
-
-
-def to_signed(raw: int, width: int) -> int:
-    raw &= (1 << width) - 1
-    sign = 1 << (width - 1)
-    return raw - (1 << width) if raw & sign else raw
+from common import drive_and_sample, start_clock_and_reset, to_bits, to_signed
 
 
 def read_act(dut) -> int:
-    return to_signed(int(dut.act_out.value), ACT_WIDTH)
+    return to_signed(int(dut.act_out.value), int(dut.ACT_WIDTH.value))
 
 
 def read_psum(dut) -> int:
-    return to_signed(int(dut.psum_out.value), PSUM_WIDTH)
+    return to_signed(int(dut.psum_out.value), int(dut.PSUM_WIDTH.value))
 
 
 async def init(dut):
-    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
-    dut.rst_n.value = 0
     dut.clear.value = 0
     dut.weight_load.value = 0
     dut.weight_in.value = 0
     dut.act_in.value = 0
     dut.psum_in.value = 0
     dut.valid_in.value = 0
-    await ClockCycles(dut.clk, 4)
-    await FallingEdge(dut.clk)
-    dut.rst_n.value = 1
-    await ClockCycles(dut.clk, 2)
+    await start_clock_and_reset(dut)
 
 
 async def load_weight(dut, bit: int):
-    await FallingEdge(dut.clk)
-    dut.weight_in.value = bit
-    dut.weight_load.value = 1
-    dut.valid_in.value = 0
-    await RisingEdge(dut.clk)
-    await FallingEdge(dut.clk)
-    dut.weight_load.value = 0
+    await drive_and_sample(dut, weight_in=bit, weight_load=1, valid_in=0)
+    await drive_and_sample(dut, weight_load=0)
 
 
 async def clear_pipeline(dut):
-    await FallingEdge(dut.clk)
-    dut.clear.value = 1
-    await RisingEdge(dut.clk)
-    await FallingEdge(dut.clk)
-    dut.clear.value = 0
+    # Drive valid_in/weight_load to 0 so the next non-clear cycle starts idle.
+    await drive_and_sample(dut, clear=1, weight_load=0, valid_in=0)
 
 
 async def compute(dut, act: int, psum: int, valid: int = 1):
-    await FallingEdge(dut.clk)
-    dut.act_in.value = to_bits(act, ACT_WIDTH)
-    dut.psum_in.value = to_bits(psum, PSUM_WIDTH)
-    dut.valid_in.value = valid
-    dut.weight_load.value = 0
-    dut.clear.value = 0
-    await RisingEdge(dut.clk)
-    await FallingEdge(dut.clk)
-    dut.valid_in.value = 0
+    aw = int(dut.ACT_WIDTH.value)
+    pw = int(dut.PSUM_WIDTH.value)
+    await drive_and_sample(
+        dut,
+        act_in=to_bits(act, aw),
+        psum_in=to_bits(psum, pw),
+        valid_in=valid,
+        weight_load=0,
+        clear=0,
+    )
 
 
 @cocotb.test()
@@ -130,17 +109,17 @@ async def weight_load_has_priority_over_compute(dut):
     await init(dut)
     await load_weight(dut, 1)
 
-    await FallingEdge(dut.clk)
-    dut.weight_in.value = 0
-    dut.weight_load.value = 1
-    dut.act_in.value = to_bits(9, ACT_WIDTH)
-    dut.psum_in.value = to_bits(3, PSUM_WIDTH)
-    dut.valid_in.value = 1
-    await RisingEdge(dut.clk)
-    await FallingEdge(dut.clk)
-    dut.weight_load.value = 0
-    dut.valid_in.value = 0
-
+    aw = int(dut.ACT_WIDTH.value)
+    pw = int(dut.PSUM_WIDTH.value)
+    await drive_and_sample(
+        dut,
+        weight_in=0,
+        weight_load=1,
+        act_in=to_bits(9, aw),
+        psum_in=to_bits(3, pw),
+        valid_in=1,
+        clear=0,
+    )
     assert int(dut.weight_out.value) == 0
     assert int(dut.valid_out.value) == 0
     assert read_psum(dut) == 0

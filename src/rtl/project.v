@@ -71,7 +71,7 @@ module tt_um_unclegravity_tpu (
     localparam integer ACT_WIDTH         = 8;
     localparam integer PSUM_WIDTH        = 16;
     localparam integer ROWS              = 2;
-    localparam integer COLS              = 4;
+    localparam integer COLS              = 2;
     localparam integer PSUM_BYTES        = (PSUM_WIDTH + 7) / 8;
     localparam integer ROW_SEL_WIDTH     = (ROWS  <= 1) ? 1 : $clog2(ROWS);
     localparam integer BYTE_SEL_WIDTH    = (PSUM_BYTES <= 1) ? 1 : $clog2(PSUM_BYTES);
