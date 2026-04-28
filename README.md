@@ -11,6 +11,9 @@ TODO: expand
 ## 2D Preview
 ![png](https://unclegravity.github.io/tt-tpu/gds_render.png)
 
+## 3D Viewer
+[Open 3D viewer](https://gds-viewer.tinytapeout.com/?model=https://unclegravity.github.io/tt-tpu/tinytapeout.oas&pdk=sky130A)
+
 ## TLDR:
 ```sh
 # Install Nix
