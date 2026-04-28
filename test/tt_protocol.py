@@ -9,35 +9,48 @@ PSUM_WIDTH = 16
 PSUM_BYTES = PSUM_WIDTH // 8
 
 CMD_STATUS = 0
-CMD_CLEAR = 1
-CMD_SET_ADDR = 2
-CMD_WRITE = 3
-CMD_READ = 4
-CMD_START = 5
-CMD_NOP = 7
+CMD_CLEAR  = 1
+CMD_LDW    = 2
+CMD_LDA    = 3
+CMD_SEED   = 4
+CMD_START  = 5
+CMD_RDP    = 6
+CMD_NOP    = 7
 
-ADDR_ROW = 0
-ADDR_COL = 1
-ADDR_BYTE = 2
-ADDR_BANK = 3
-
-BANK_WEIGHT = 1
-BANK_ACT = 2
-BANK_SEED = 3
-BANK_RESULT = 4
-BANK_STATUS = 5
-
-STATUS_BUSY = 1 << 0
-STATUS_DONE = 1 << 1
+STATUS_BUSY        = 1 << 0
+STATUS_DONE        = 1 << 1
 STATUS_WEIGHT_DONE = 1 << 2
-STATUS_ALL_VALID = 1 << 3
+STATUS_ALL_VALID   = 1 << 3
 STATUS_START_READY = 1 << 4
-STATUS_WEIGHT_READY = 1 << 5
-STATUS_ERROR = 1 << 6
+STATUS_ERROR       = 1 << 6
+
+
+def _row_bits() -> int:
+    return max(1, (ROWS - 1).bit_length())
+
+
+def _byte_bits() -> int:
+    return max(1, (PSUM_BYTES - 1).bit_length())
+
+
+def _col_bits() -> int:
+    return max(1, (COLS - 1).bit_length())
 
 
 def pack_ui(cmd: int, arg: int = 0) -> int:
     return (cmd & 0x7) | ((arg & 0x1F) << 3)
+
+
+def encode_row_byte_arg(row: int, byte: int) -> int:
+    return (row & ((1 << _row_bits()) - 1)) | (byte << _row_bits())
+
+
+def encode_col_arg(col: int) -> int:
+    return col & ((1 << _col_bits()) - 1)
+
+
+def encode_row_arg(row: int) -> int:
+    return row & ((1 << _row_bits()) - 1)
 
 
 def to_bits(value: int, width: int) -> int:
@@ -79,53 +92,35 @@ async def read_status(dut) -> int:
     return int(dut.uo_out.value) & 0xFF
 
 
-async def set_addr(dut, addr_id: int, value: int):
-    await command(dut, CMD_SET_ADDR, data=value, arg=addr_id)
-
-
-async def set_bank(dut, bank: int):
-    await set_addr(dut, ADDR_BANK, bank)
-
-
-async def write_selected(dut, value: int):
-    await command(dut, CMD_WRITE, data=value)
-
-
-async def read_selected(dut) -> int:
-    await command(dut, CMD_READ)
-    return int(dut.uo_out.value) & 0xFF
-
-
 async def clear(dut):
     await command(dut, CMD_CLEAR)
     await nop(dut)
 
 
 async def load_weights(dut, weights_by_row: list[list[int]]):
-    await set_bank(dut, BANK_WEIGHT)
+    # One LDW per row packs all COLS bits (assumes COLS <= 8).
+    assert COLS <= 8, "LDW packs all bits in one byte; COLS > 8 would need a chunk arg"
     for row, weights in enumerate(weights_by_row):
         packed = 0
         for col, bit in enumerate(weights):
             packed |= (bit & 1) << col
-        await set_addr(dut, ADDR_ROW, row)
-        await set_addr(dut, ADDR_COL, 0)
-        await write_selected(dut, packed)
+        await command(dut, CMD_LDW, data=packed, arg=encode_row_arg(row))
 
 
 async def load_acts(dut, acts: list[int]):
-    await set_bank(dut, BANK_ACT)
     for col, act in enumerate(acts):
-        await set_addr(dut, ADDR_COL, col)
-        await write_selected(dut, to_bits(act, 8))
+        await command(dut, CMD_LDA, data=to_bits(act, 8), arg=encode_col_arg(col))
 
 
 async def load_seed(dut, row: int, seed: int):
     raw = to_bits(seed, PSUM_WIDTH)
-    await set_bank(dut, BANK_SEED)
-    await set_addr(dut, ADDR_ROW, row)
     for byte in range(PSUM_BYTES):
-        await set_addr(dut, ADDR_BYTE, byte)
-        await write_selected(dut, (raw >> (8 * byte)) & 0xFF)
+        await command(
+            dut,
+            CMD_SEED,
+            data=(raw >> (8 * byte)) & 0xFF,
+            arg=encode_row_byte_arg(row, byte),
+        )
 
 
 async def start(dut):
@@ -146,11 +141,9 @@ async def wait_done(dut, limit: int = 128) -> int:
 
 async def read_result(dut, row: int) -> int:
     raw = 0
-    await set_bank(dut, BANK_RESULT)
-    await set_addr(dut, ADDR_ROW, row)
     for byte in range(PSUM_BYTES):
-        await set_addr(dut, ADDR_BYTE, byte)
-        raw |= (await read_selected(dut)) << (8 * byte)
+        await command(dut, CMD_RDP, arg=encode_row_byte_arg(row, byte))
+        raw |= (int(dut.uo_out.value) & 0xFF) << (8 * byte)
     return to_signed(raw, PSUM_WIDTH)
 
 

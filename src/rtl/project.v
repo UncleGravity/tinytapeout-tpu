@@ -6,31 +6,40 @@
  *
  * Pin protocol:
  *   ui_in[2:0] command
- *   ui_in[7:3] argument
+ *   ui_in[7:3] argument (5 bits, layout depends on command)
  *   uio_in     data byte
- *   uo_out     status or read data
+ *   uo_out     status byte, or RDP result byte
  *
  * Commands:
- *   0 STATUS    uo_out shows status
- *   1 CLEAR     clear FSM/datapath state, keep loaded weights
- *   2 SET_ADDR  arg[1:0] selects address register, uio_in is value
- *   3 WRITE     write uio_in to selected bank/address
- *   4 READ      uo_out reads selected bank/address
- *   5 START     load stored weights into PEs and run one compute
- *   7 NOP       uo_out shows status
+ *   0 STATUS  uo_out = status
+ *   1 CLEAR   reset FSM, clear acts/results, keep weights in PEs
+ *   2 LDW     write COLS packed weight bits (uio_in[COLS-1:0]) to row arg_row
+ *             (assumes COLS <= 8; one LDW call per row)
+ *   3 LDA     write one int8 activation (uio_in) to act_mem[arg_col]
+ *   4 SEED    write one byte (uio_in) to acc_q[arg_row][arg_byte*8 +: 8]
+ *   5 START   load stored weights into PEs, run one compute
+ *   6 RDP     uo_out = acc_q[arg_row][arg_byte*8 +: 8]
+ *   7 NOP     uo_out = status
  *
- * Address registers:
- *   0 row_addr   output row / weight row
- *   1 col_addr   activation column / first packed weight column
- *   2 byte_addr  seed/result byte (0 = LSB, 1 = MSB)
- *   3 bank_addr  selected bank
+ * Argument layout:
+ *   LDW       arg[ROW_SEL_WIDTH-1:0]                        = row
+ *   LDA       arg[LDA_COL_WIDTH-1:0]                        = col
+ *   SEED/RDP  arg[ROW_SEL_WIDTH-1:0]                        = row
+ *             arg[ROW_SEL_WIDTH +: BYTE_SEL_WIDTH]          = byte
  *
- * Banks:
- *   1 WEIGHT   WRITE packs up to 8 one-bit weights starting at col_addr
- *   2 ACT      WRITE one int8 activation at col_addr
- *   3 SEED     WRITE seed byte at row_addr/byte_addr
- *   4 RESULT   READ result byte at row_addr/byte_addr
- *   5 STATUS   READ status byte
+ * Per-row accumulator (acc_q):
+ *   One physical register per row holds the partial-sum accumulator. It is
+ *   the seed (input) AND the result (output) of one compute, because those
+ *   roles never overlap in time:
+ *
+ *     IDLE             host SEED writes  acc_q[r] = initial value
+ *     RUN, cycle r     array READS       psum_in = acc_q[r]   (seed consumed)
+ *     RUN, cycle r+COLS array WRITES     acc_q[r] = computed psum
+ *     IDLE             host RDP reads    final value
+ *
+ *   Chaining: the host can RDP one run's accumulator and SEED it into the
+ *   next run, which is how dot products longer than COLS are tiled (see
+ *   replay_q8_block in test/bonsai_fixture.py).
  *
  * Status byte:
  *   [0] busy
@@ -38,15 +47,9 @@
  *   [2] weight_load_done_latched
  *   [3] all result rows valid
  *   [4] start_ready (== idle)
- *   [5] weight_load_ready (== idle)
+ *   [5] reserved (held high while idle for protocol stability)
  *   [6] error_latched
  *   [7] reserved
- *
- * Compute phases (after START):
- *   LOAD : COLS cycles, shifts weight_mem rows into PE chains, last col first
- *   RUN  : drives column-skewed activations and row-skewed valid+seed pulses
- *          into the array; captures each row's psum on the cycle its
- *          valid_out fires.
  */
 
 `default_nettype none
@@ -62,39 +65,34 @@ module tt_um_unclegravity_tpu (
     input  wire       rst_n
 );
 
+    // ------------------------------------------------------------------------
+    // Tile parameters
+    // ------------------------------------------------------------------------
     localparam integer ACT_WIDTH         = 8;
     localparam integer PSUM_WIDTH        = 16;
     localparam integer ROWS              = 2;
     localparam integer COLS              = 4;
     localparam integer PSUM_BYTES        = (PSUM_WIDTH + 7) / 8;
-    localparam integer ROW_ADDR_WIDTH    = 4;
-    localparam integer COL_ADDR_WIDTH    = 4;
-    localparam integer BYTE_ADDR_WIDTH   = (PSUM_BYTES <= 1) ? 1 : $clog2(PSUM_BYTES);
-    localparam integer BANK_WIDTH        = 3;
-    localparam integer LOAD_COL_WIDTH    = (COLS <= 1) ? 1 : $clog2(COLS);
+    localparam integer ROW_SEL_WIDTH     = (ROWS  <= 1) ? 1 : $clog2(ROWS);
+    localparam integer BYTE_SEL_WIDTH    = (PSUM_BYTES <= 1) ? 1 : $clog2(PSUM_BYTES);
+    localparam integer LDA_COL_WIDTH     = (COLS  <= 1) ? 1 : $clog2(COLS);
+    localparam integer LOAD_COL_WIDTH    = LDA_COL_WIDTH;
     localparam integer COMPUTE_LAST_STEP = ROWS + COLS - 1;
     localparam integer STEP_MAX          = (COMPUTE_LAST_STEP > (COLS - 1))
                                                 ? COMPUTE_LAST_STEP : (COLS - 1);
     localparam integer STEP_WIDTH        = (STEP_MAX < 1) ? 1 : $clog2(STEP_MAX + 1);
 
-    localparam CMD_STATUS   = 3'd0;
-    localparam CMD_CLEAR    = 3'd1;
-    localparam CMD_SET_ADDR = 3'd2;
-    localparam CMD_WRITE    = 3'd3;
-    localparam CMD_READ     = 3'd4;
-    localparam CMD_START    = 3'd5;
-    localparam CMD_NOP      = 3'd7;
-
-    localparam ADDR_ROW  = 2'd0;
-    localparam ADDR_COL  = 2'd1;
-    localparam ADDR_BYTE = 2'd2;
-    localparam ADDR_BANK = 2'd3;
-
-    localparam BANK_WEIGHT = 3'd1;
-    localparam BANK_ACT    = 3'd2;
-    localparam BANK_SEED   = 3'd3;
-    localparam BANK_RESULT = 3'd4;
-    localparam BANK_STATUS = 3'd5;
+    // ------------------------------------------------------------------------
+    // Command encoding
+    // ------------------------------------------------------------------------
+    localparam CMD_STATUS = 3'd0;
+    localparam CMD_CLEAR  = 3'd1;
+    localparam CMD_LDW    = 3'd2;
+    localparam CMD_LDA    = 3'd3;
+    localparam CMD_SEED   = 3'd4;
+    localparam CMD_START  = 3'd5;
+    localparam CMD_RDP    = 3'd6;
+    localparam CMD_NOP    = 3'd7;
 
     localparam STATE_IDLE = 2'd0;
     localparam STATE_LOAD = 2'd1;
@@ -103,28 +101,29 @@ module tt_um_unclegravity_tpu (
     wire [2:0] cmd = ui_in[2:0];
     wire [4:0] arg = ui_in[7:3];
 
-    wire cmd_status   = (cmd == CMD_STATUS);
-    wire cmd_clear    = (cmd == CMD_CLEAR);
-    wire cmd_set_addr = (cmd == CMD_SET_ADDR);
-    wire cmd_write    = (cmd == CMD_WRITE);
-    wire cmd_read     = (cmd == CMD_READ);
-    wire cmd_start    = (cmd == CMD_START);
-    wire cmd_nop      = (cmd == CMD_NOP);
+    wire cmd_status = (cmd == CMD_STATUS);
+    wire cmd_clear  = (cmd == CMD_CLEAR);
+    wire cmd_ldw    = (cmd == CMD_LDW);
+    wire cmd_lda    = (cmd == CMD_LDA);
+    wire cmd_seed   = (cmd == CMD_SEED);
+    wire cmd_start  = (cmd == CMD_START);
+    wire cmd_rdp    = (cmd == CMD_RDP);
+    wire cmd_nop    = (cmd == CMD_NOP);
 
-    logic [ROW_ADDR_WIDTH-1:0]  row_addr;
-    logic [COL_ADDR_WIDTH-1:0]  col_addr;
-    logic [BYTE_ADDR_WIDTH-1:0] byte_addr;
-    logic [BANK_WIDTH-1:0]      bank_addr;
+    wire [ROW_SEL_WIDTH-1:0]  arg_row  = arg[ROW_SEL_WIDTH-1:0];
+    wire [BYTE_SEL_WIDTH-1:0] arg_byte = arg[ROW_SEL_WIDTH +: BYTE_SEL_WIDTH];
+    wire [LDA_COL_WIDTH-1:0]  arg_col  = arg[LDA_COL_WIDTH-1:0];
 
-    logic [1:0]              state_q;
-    logic [STEP_WIDTH-1:0]   step_q;
+    // ------------------------------------------------------------------------
+    // State + scratchpad
+    // ------------------------------------------------------------------------
+    logic [1:0]            state_q;
+    logic [STEP_WIDTH-1:0] step_q;
 
     logic                            weight_mem [0:ROWS-1][0:COLS-1];
     logic signed [ACT_WIDTH-1:0]     act_mem    [0:COLS-1];
-    logic signed [PSUM_WIDTH-1:0]    seed_mem   [0:ROWS-1];
-
-    logic signed [ROWS*PSUM_WIDTH-1:0] result_q;
-    logic [ROWS-1:0]                   result_valid_q;
+    logic signed [ROWS*PSUM_WIDTH-1:0] acc_q;
+    logic [ROWS-1:0]                   acc_done_q;
 
     logic done_latched;
     logic weight_done_latched;
@@ -135,36 +134,28 @@ module tt_um_unclegravity_tpu (
     wire run_phase  = (state_q == STATE_RUN);
     wire busy       = !idle;
 
-    wire signed [PSUM_WIDTH-1:0] selected_result =
-        (row_addr < ROWS) ?
-            result_q[row_addr*PSUM_WIDTH +: PSUM_WIDTH] :
-            {PSUM_WIDTH{1'b0}};
-    wire signed [PSUM_WIDTH-1:0] selected_seed =
-        (row_addr < ROWS) ? seed_mem[row_addr] : {PSUM_WIDTH{1'b0}};
-
-    wire [7:0] selected_result_byte = selected_result[byte_addr*8 +: 8];
-    wire [7:0] selected_seed_byte   = selected_seed  [byte_addr*8 +: 8];
+    // ------------------------------------------------------------------------
+    // Output muxes
+    // ------------------------------------------------------------------------
+    wire [7:0] selected_result_byte =
+        (arg_row < ROWS) ?
+            acc_q[arg_row*PSUM_WIDTH + arg_byte*8 +: 8] :
+            8'h00;
 
     wire [7:0] status_byte = {
         1'b0,
         error_latched,
         idle,
         idle,
-        &result_valid_q,
+        &acc_done_q,
         weight_done_latched,
         done_latched,
         busy
     };
 
-    logic [7:0] read_data;
-    always_comb begin
-        case (bank_addr)
-            BANK_ACT:    read_data = (col_addr < COLS) ? act_mem[col_addr] : 8'h00;
-            BANK_SEED:   read_data = (row_addr < ROWS) ? selected_seed_byte : 8'h00;
-            BANK_RESULT: read_data = selected_result_byte;
-            default:     read_data = status_byte;
-        endcase
-    end
+    assign uo_out  = cmd_rdp ? selected_result_byte : status_byte;
+    assign uio_out = 8'b0;
+    assign uio_oe  = 8'b0;
 
     // ------------------------------------------------------------------------
     // Compute datapath: drives the systolic array directly.
@@ -211,7 +202,8 @@ module tt_um_unclegravity_tpu (
             assign array_valid_in[gr] = run_phase && (step_q == gr);
             assign array_psum_in[gr*PSUM_WIDTH +: PSUM_WIDTH] =
                 (run_phase && (step_q == gr)) ?
-                    seed_mem[gr] : {PSUM_WIDTH{1'b0}};
+                    acc_q[gr*PSUM_WIDTH +: PSUM_WIDTH] :
+                    {PSUM_WIDTH{1'b0}};
         end
     endgenerate
 
@@ -235,40 +227,22 @@ module tt_um_unclegravity_tpu (
     );
 
     // ------------------------------------------------------------------------
-    // Result capture: latch each row's psum on the cycle its valid_out fires.
-    // Cleared on reset, CLEAR, and at the start of a new compute.
-    // ------------------------------------------------------------------------
-    always_ff @(posedge clk) begin
-        if (!rst_n || cmd_clear || (idle && cmd_start)) begin
-            result_q       <= {ROWS*PSUM_WIDTH{1'b0}};
-            result_valid_q <= {ROWS{1'b0}};
-        end else begin
-            for (int r = 0; r < ROWS; r = r + 1) begin
-                if (array_valid_out[r]) begin
-                    result_q[r*PSUM_WIDTH +: PSUM_WIDTH] <=
-                        array_psum_out[r*PSUM_WIDTH +: PSUM_WIDTH];
-                    result_valid_q[r] <= 1'b1;
-                end
-            end
-        end
-    end
-
-    // ------------------------------------------------------------------------
-    // Host I/O FSM + scratchpad.
+    // Single sequential block: FSM, scratchpad, accumulator.
+    //
+    // acc_q is the per-row accumulator: SEED writes (in IDLE) load the
+    // starting value; the array overwrites it later in RUN with the computed
+    // psum. The two writes are mutually exclusive in time, so no conflict.
     // ------------------------------------------------------------------------
     always_ff @(posedge clk) begin
         if (!rst_n) begin
-            row_addr            <= {ROW_ADDR_WIDTH{1'b0}};
-            col_addr            <= {COL_ADDR_WIDTH{1'b0}};
-            byte_addr           <= {BYTE_ADDR_WIDTH{1'b0}};
-            bank_addr           <= BANK_STATUS;
             state_q             <= STATE_IDLE;
             step_q              <= {STEP_WIDTH{1'b0}};
             done_latched        <= 1'b0;
             weight_done_latched <= 1'b0;
             error_latched       <= 1'b0;
+            acc_q            <= {ROWS*PSUM_WIDTH{1'b0}};
+            acc_done_q      <= {ROWS{1'b0}};
             for (int row_i = 0; row_i < ROWS; row_i = row_i + 1) begin
-                seed_mem[row_i] <= {PSUM_WIDTH{1'b0}};
                 for (int col_i = 0; col_i < COLS; col_i = col_i + 1) begin
                     weight_mem[row_i][col_i] <= 1'b0;
                 end
@@ -282,61 +256,56 @@ module tt_um_unclegravity_tpu (
             done_latched        <= 1'b0;
             weight_done_latched <= 1'b0;
             error_latched       <= 1'b0;
-            for (int row_i = 0; row_i < ROWS; row_i = row_i + 1) begin
-                seed_mem[row_i] <= {PSUM_WIDTH{1'b0}};
-            end
+            acc_q            <= {ROWS*PSUM_WIDTH{1'b0}};
+            acc_done_q      <= {ROWS{1'b0}};
             for (int col_i = 0; col_i < COLS; col_i = col_i + 1) begin
                 act_mem[col_i] <= {ACT_WIDTH{1'b0}};
             end
         end else begin
+            // Capture each row's psum on the cycle its valid_out fires.
+            // Only fires during/just-after RUN; in IDLE the array is quiet.
+            for (int r = 0; r < ROWS; r = r + 1) begin
+                if (array_valid_out[r]) begin
+                    acc_q[r*PSUM_WIDTH +: PSUM_WIDTH] <=
+                        array_psum_out[r*PSUM_WIDTH +: PSUM_WIDTH];
+                    acc_done_q[r] <= 1'b1;
+                end
+            end
+
             case (state_q)
                 STATE_IDLE: begin
-                    if (cmd_set_addr) begin
-                        case (arg[1:0])
-                            ADDR_ROW:  row_addr  <= uio_in[ROW_ADDR_WIDTH-1:0];
-                            ADDR_COL:  col_addr  <= uio_in[COL_ADDR_WIDTH-1:0];
-                            ADDR_BYTE: byte_addr <= uio_in[BYTE_ADDR_WIDTH-1:0];
-                            default:   bank_addr <= uio_in[BANK_WIDTH-1:0];
-                        endcase
+                    if (cmd_ldw) begin
+                        if (arg_row < ROWS) begin
+                            for (int i = 0; i < COLS; i = i + 1) begin
+                                weight_mem[arg_row][i] <= uio_in[i];
+                            end
+                        end else begin
+                            error_latched <= 1'b1;
+                        end
                     end
 
-                    if (cmd_write) begin
-                        case (bank_addr)
-                            BANK_WEIGHT: begin
-                                if (row_addr < ROWS) begin
-                                    for (int packed_col_i = 0; packed_col_i < 8; packed_col_i = packed_col_i + 1) begin
-                                        if ((col_addr + packed_col_i) < COLS) begin
-                                            weight_mem[row_addr][col_addr + packed_col_i] <= uio_in[packed_col_i];
-                                        end
-                                    end
-                                end else begin
-                                    error_latched <= 1'b1;
-                                end
-                            end
-                            BANK_ACT: begin
-                                if (col_addr < COLS) begin
-                                    act_mem[col_addr] <= uio_in;
-                                end else begin
-                                    error_latched <= 1'b1;
-                                end
-                            end
-                            BANK_SEED: begin
-                                if (row_addr < ROWS) begin
-                                    seed_mem[row_addr][byte_addr*8 +: 8] <= uio_in;
-                                end else begin
-                                    error_latched <= 1'b1;
-                                end
-                            end
-                            default: begin
-                            end
-                        endcase
+                    if (cmd_lda) begin
+                        if (arg_col < COLS) begin
+                            act_mem[arg_col] <= uio_in;
+                        end else begin
+                            error_latched <= 1'b1;
+                        end
+                    end
+
+                    if (cmd_seed) begin
+                        if (arg_row < ROWS) begin
+                            acc_q[arg_row*PSUM_WIDTH + arg_byte*8 +: 8] <= uio_in;
+                        end else begin
+                            error_latched <= 1'b1;
+                        end
                     end
 
                     if (cmd_start) begin
-                        done_latched        <= 1'b0;
-                        weight_done_latched <= 1'b0;
                         state_q             <= STATE_LOAD;
                         step_q              <= {STEP_WIDTH{1'b0}};
+                        done_latched        <= 1'b0;
+                        weight_done_latched <= 1'b0;
+                        acc_done_q      <= {ROWS{1'b0}};
                     end
                 end
 
@@ -355,7 +324,7 @@ module tt_um_unclegravity_tpu (
                         step_q <= step_q + 1'b1;
                     end
                     if ((step_q >= COMPUTE_LAST_STEP[STEP_WIDTH-1:0]) &&
-                        (&result_valid_q)) begin
+                        (&acc_done_q)) begin
                         state_q      <= STATE_IDLE;
                         done_latched <= 1'b1;
                     end
@@ -367,10 +336,6 @@ module tt_um_unclegravity_tpu (
             endcase
         end
     end
-
-    assign uo_out  = cmd_read ? read_data : status_byte;
-    assign uio_out = 8'b0;
-    assign uio_oe  = 8'b0;
 
     wire _unused = &{ena, cmd_status, cmd_nop, array_act_out, 1'b0};
 
