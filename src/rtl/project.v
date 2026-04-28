@@ -157,13 +157,9 @@ module tt_um_unclegravity_tpu (
         end
     endgenerate
 
-    integer row_i;
-    integer col_i;
-    integer packed_col_i;
-
     always_comb begin
         weight_load_bits = {ROWS{1'b0}};
-        for (row_i = 0; row_i < ROWS; row_i = row_i + 1) begin
+        for (int row_i = 0; row_i < ROWS; row_i = row_i + 1) begin
             weight_load_bits[row_i] = weight_mem[row_i][load_col_q];
         end
     end
@@ -239,13 +235,13 @@ module tt_um_unclegravity_tpu (
             done_latched        <= 1'b0;
             weight_done_latched <= 1'b0;
             error_latched       <= 1'b0;
-            for (row_i = 0; row_i < ROWS; row_i = row_i + 1) begin
+            for (int row_i = 0; row_i < ROWS; row_i = row_i + 1) begin
                 seed_mem[row_i] <= {PSUM_WIDTH{1'b0}};
-                for (col_i = 0; col_i < COLS; col_i = col_i + 1) begin
+                for (int col_i = 0; col_i < COLS; col_i = col_i + 1) begin
                     weight_mem[row_i][col_i] <= 1'b0;
                 end
             end
-            for (col_i = 0; col_i < COLS; col_i = col_i + 1) begin
+            for (int col_i = 0; col_i < COLS; col_i = col_i + 1) begin
                 act_mem[col_i] <= {ACT_WIDTH{1'b0}};
             end
         end else if (cmd_clear) begin
@@ -254,10 +250,10 @@ module tt_um_unclegravity_tpu (
             done_latched        <= 1'b0;
             weight_done_latched <= 1'b0;
             error_latched       <= 1'b0;
-            for (row_i = 0; row_i < ROWS; row_i = row_i + 1) begin
+            for (int row_i = 0; row_i < ROWS; row_i = row_i + 1) begin
                 seed_mem[row_i] <= {PSUM_WIDTH{1'b0}};
             end
-            for (col_i = 0; col_i < COLS; col_i = col_i + 1) begin
+            for (int col_i = 0; col_i < COLS; col_i = col_i + 1) begin
                 act_mem[col_i] <= {ACT_WIDTH{1'b0}};
             end
         end else begin
@@ -291,7 +287,7 @@ module tt_um_unclegravity_tpu (
                             end
                             BANK_WEIGHT: begin
                                 if (row_addr < ROWS) begin
-                                    for (packed_col_i = 0; packed_col_i < 8; packed_col_i = packed_col_i + 1) begin
+                                    for (int packed_col_i = 0; packed_col_i < 8; packed_col_i = packed_col_i + 1) begin
                                         if ((col_addr + packed_col_i) < COLS) begin
                                             weight_mem[row_addr][col_addr + packed_col_i] <= uio_in[packed_col_i];
                                         end
