@@ -4,9 +4,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     librelane.url = "github:librelane/librelane";
+    verilog-viewer.url = "github:UncleGravity/verilog-viewer";
   };
 
-  outputs = { self, nixpkgs, librelane }:
+  outputs = { self, nixpkgs, librelane, verilog-viewer }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [
         "aarch64-darwin"
@@ -31,7 +32,21 @@
           harden = mkDevApp pkgs "harden" "./tt/tt_tool.py --create-user-config && ./tt/tt_tool.py --harden --no-docker";
           fpga   = mkDevApp pkgs "fpga"   "./tt/tt_fpga.py harden";
           check  = mkDevApp pkgs "check"  "./tt/tt_tool.py --check-docs";
-          view   = mkDevApp pkgs "view"   "cd view && { [ -d node_modules ] || bun install; } && bun run generate && bun run dev";
+          view = {
+            type = "app";
+            program = toString (pkgs.writeShellScript "tt-view" ''
+              set -e
+              cd "$(git rev-parse --show-toplevel)"
+              TOP=""
+              if [ -f src/config_merged.json ]; then
+                TOP=$(${pkgs.jq}/bin/jq -r '.DESIGN_NAME // empty' src/config_merged.json)
+              fi
+              exec ${verilog-viewer.packages.${system}.default}/bin/verilog-viewer \
+                --rtl 'src/rtl/**/*.{v,sv}' \
+                ''${TOP:+--top "$TOP"} \
+                "$@"
+            '');
+          };
         }
       );
 
@@ -59,10 +74,6 @@
 
               # Testing
               pkgs.surfer
-
-              # Viewer
-              pkgs.netlistsvg
-              pkgs.bun
             ];
 
             # ------------------------------------------------------------------

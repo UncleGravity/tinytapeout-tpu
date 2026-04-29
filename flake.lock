@@ -129,10 +129,45 @@
         "type": "github"
       }
     },
+    "nixpkgs_3": {
+      "locked": {
+        "lastModified": 1777268161,
+        "narHash": "sha256-bxrdOn8SCOv8tN4JbTF/TXq7kjo9ag4M+C8yzzIRYbE=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "1c3fe55ad329cbcb28471bb30f05c9827f724c76",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "librelane": "librelane",
-        "nixpkgs": "nixpkgs_2"
+        "nixpkgs": "nixpkgs_2",
+        "verilog-viewer": "verilog-viewer"
+      }
+    },
+    "verilog-viewer": {
+      "inputs": {
+        "nixpkgs": "nixpkgs_3"
+      },
+      "locked": {
+        "lastModified": 1777417152,
+        "narHash": "sha256-NN/ds7vdpfko4fvN48SkbI27ExTjL47WBY/4FwAoeBo=",
+        "owner": "UncleGravity",
+        "repo": "verilog-viewer",
+        "rev": "e862dfbad13375e6563c3a4b96704da863c59faf",
+        "type": "github"
+      },
+      "original": {
+        "owner": "UncleGravity",
+        "repo": "verilog-viewer",
+        "type": "github"
       }
     }
   },

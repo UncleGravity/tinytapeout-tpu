@@ -20,5 +20,6 @@ tt/
 .pdk/
 result/
 models/
+.verilog-viewer/
 bonsai_fixture
 !bonsai_fixture/
