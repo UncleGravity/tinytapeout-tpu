@@ -1,11 +1,13 @@
 """Chip-level protocol helpers for tt_um_unclegravity_tpu.
 
-Tile shape (ROWS / COLS / ACT_WIDTH / PSUM_WIDTH) is read from the DUT after
-reset, so changing the wrapper's localparams is enough to retarget the tests.
-The Tile is stashed on dut as `dut._tile` so subsequent helpers can reach it
-without the caller threading it through every call.
+Tile shape (ROWS / COLS / ACT_WIDTH / PSUM_WIDTH) is parsed from project.v's
+localparams, so changing them is enough to retarget the tests. The Tile is stashed
+on dut as `dut._tile` so subsequent helpers can reach it without the caller
+threading it through every call.
 """
+import re
 from dataclasses import dataclass
+from pathlib import Path
 
 from common import (
     BITS_PER_BYTE,
@@ -14,6 +16,9 @@ from common import (
     to_bits,
     to_signed,
 )
+
+
+_PROJECT_V = Path(__file__).parent.parent / "src" / "rtl" / "project.v"
 
 
 # Command opcodes (must match project.v).
@@ -73,15 +78,18 @@ def tile(dut) -> Tile:
     return dut._tile
 
 
-def _read_tile(dut) -> Tile:
-    # tb.v names the wrapper instance `user_project`; Icarus exposes its
-    # localparams via VPI under that hierarchy.
-    wrapper = dut.user_project
+def _read_tile() -> Tile:
+    text = _PROJECT_V.read_text()
+    def lp(name: str) -> int:
+        m = re.search(rf"localparam\s+{name}\s*=\s*(\d+)", text)
+        if not m:
+            raise RuntimeError(f"localparam {name} not found in {_PROJECT_V}")
+        return int(m.group(1))
     return Tile(
-        rows       = int(wrapper.ROWS.value),
-        cols       = int(wrapper.COLS.value),
-        act_width  = int(wrapper.ACT_WIDTH.value),
-        psum_width = int(wrapper.PSUM_WIDTH.value),
+        rows       = lp("ROWS"),
+        cols       = lp("COLS"),
+        act_width  = lp("ACT_WIDTH"),
+        psum_width = lp("PSUM_WIDTH"),
     )
 
 
@@ -107,7 +115,7 @@ async def init(dut):
     dut.ui_in.value = 0
     dut.uio_in.value = 0
     await start_clock_and_reset(dut)
-    dut._tile = _read_tile(dut)
+    dut._tile = _read_tile()
 
 
 async def command(dut, cmd: int, data: int = 0, arg: int = 0):
