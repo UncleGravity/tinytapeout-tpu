@@ -54,15 +54,17 @@ module w1a8_array #(
                 .PSUM_WIDTH(PSUM_WIDTH),
                 .COLS      (COLS)
             ) u_row (
+                // inputs
                 .clk        (clk),
                 .rst_n      (rst_n),
                 .clear      (clear),
                 .weight_load(weight_load),
                 .weight_in  (weight_in[row]),
                 .act_in     (act_chain[row]),
-                .act_out    (act_chain[row + 1]),
                 .psum_in    (psum_in[row*PSUM_WIDTH +: PSUM_WIDTH]),
                 .valid_in   (valid_in[row]),
+                // outputs
+                .act_out    (act_chain[row + 1]),
                 .psum_out   (psum_out[row*PSUM_WIDTH +: PSUM_WIDTH]),
                 .valid_out  (valid_out[row])
             );

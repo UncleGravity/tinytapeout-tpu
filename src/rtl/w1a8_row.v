@@ -59,15 +59,17 @@ module w1a8_row #(
                 .ACT_WIDTH (ACT_WIDTH),
                 .PSUM_WIDTH(PSUM_WIDTH)
             ) u_pe (
+                // inputs
                 .clk        (clk),
                 .rst_n      (rst_n),
                 .clear      (clear),
                 .weight_load(weight_load),
                 .weight_in  (weight_chain[col]),
-                .weight_out (weight_chain[col + 1]),
                 .act_in     (act_in[col*ACT_WIDTH +: ACT_WIDTH]),
                 .psum_in    (psum_chain[col]),
                 .valid_in   (valid_chain[col]),
+                // outputs
+                .weight_out (weight_chain[col + 1]),
                 .act_out    (act_out[col*ACT_WIDTH +: ACT_WIDTH]),
                 .psum_out   (psum_chain[col + 1]),
                 .valid_out  (valid_chain[col + 1])

@@ -20,6 +20,12 @@ project:
     - "rtl/w1a8_pe.v"
     - "rtl/w1a8_row.v"
     - "rtl/w1a8_array.v"
+    - "rtl/tpu_cmd_decode.v"
+    - "rtl/tpu_weight_mem.v"
+    - "rtl/tpu_act_mem.v"
+    - "rtl/tpu_acc_mem.v"
+    - "rtl/tpu_tile_ctrl.v"
+    - "rtl/tpu_status.v"
     - "rtl/project.v"
 
 # The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
