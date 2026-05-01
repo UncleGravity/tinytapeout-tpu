@@ -78,6 +78,23 @@
         "type": "github"
       }
     },
+    "llama-cpp-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1777583950,
+        "narHash": "sha256-IcIz6r8AxK35pHybEDq9p98Qi6nBxB6VdP8DK6DUIt0=",
+        "owner": "ggml-org",
+        "repo": "llama.cpp",
+        "rev": "a95a11e5b834057e684712963f90bbb730f4745c",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ggml-org",
+        "repo": "llama.cpp",
+        "rev": "a95a11e5b834057e684712963f90bbb730f4745c",
+        "type": "github"
+      }
+    },
     "nix-eda": {
       "inputs": {
         "nixpkgs": "nixpkgs"
@@ -148,6 +165,7 @@
     "root": {
       "inputs": {
         "librelane": "librelane",
+        "llama-cpp-src": "llama-cpp-src",
         "nixpkgs": "nixpkgs_2",
         "verilog-viewer": "verilog-viewer"
       }
