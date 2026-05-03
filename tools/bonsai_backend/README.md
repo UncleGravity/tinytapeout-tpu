@@ -1,11 +1,10 @@
-# Bonsai llama.cpp Backend
+# Custom llama.cpp Backend
 
-This directory contains an out-of-tree `ggml-bonsai` backend. The backend
-registers as a fake accelerator, accepts host buffers, and offloads
-`GGML_OP_MUL_MAT` nodes whose inputs can be converted to F32 and whose output
-is F32.
+Llama.cpp backend that intercepts all `GGML_OP_MUL_MAT` nodes in the GGML compute graph and passes 
+them to a custom "accelerator".
 
-Non-matmul ops stay on the regular CPU backend through ggml's scheduler. Matmul splits assigned to Bonsai are computed by the Bonsai module.
+Non-matmul ops stay on the regular CPU backend through ggml's scheduler. 
+Matmul splits assigned to Bonsai are computed by the Bonsai module.
 
 ## Out-of-tree dynamic backend
 
@@ -80,8 +79,6 @@ backend is a loadable module itself on macOS.
 The root flake exposes:
 
 ```sh
-nix build .#bonsai-llama-cpp-dl
-nix build .#bonsai-backend
 nix build .#llama-cli-bonsai
 ```
 
@@ -90,45 +87,8 @@ library search path before execing the matched `llama-cli` build:
 
 ```sh
 nix run .#llama-cli-bonsai -- \
-  -m $PWD/models/Bonsai-1.7B/Bonsai-1.7B-Q1_0.gguf \
+  -m $PWD/models/Bonsai-1.7B/Bonsai-1.7B.gguf \
   -p Hello -n 2 -c 128 -b 16 -ub 16 -t 4 \
   --device Bonsai \
   --temp 0 --no-warmup --single-turn --no-display-prompt --verbosity 2
-```
-
-The package requires a pinned llama.cpp source from the top-level flake:
-
-```nix
-inputs.llama-cpp-src = {
-  url = "github:ggml-org/llama.cpp/<commit>";
-  flake = false;
-};
-
-bonsai = pkgs.callPackage ./tools/bonsai_backend/package.nix {
-  llamaCppSrc = llama-cpp-src;
-};
-```
-
-Because the package has no `./llama.cpp` fallback, `nix build
-.#llama-cli-bonsai` does not depend on a local checkout or submodule. Newly
-added Bonsai package files still need to be tracked or staged so flakes can see
-them.
-
-## In-tree build
-
-```sh
-nix develop -c cmake -S tools/bonsai_backend/llama.cpp \
-  -B tools/bonsai_backend/llama.cpp/build \
-  -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DLLAMA_BUILD_TESTS=OFF \
-  -DLLAMA_BUILD_EXAMPLES=OFF \
-  -DLLAMA_BUILD_SERVER=ON \
-  -DLLAMA_CURL=OFF \
-  -DGGML_METAL=OFF \
-  -DGGML_ACCELERATE=OFF \
-  -DGGML_BLAS=OFF \
-  -DGGML_BONSAI=ON
-
-nix develop -c cmake --build tools/bonsai_backend/llama.cpp/build --target llama-cli
 ```
