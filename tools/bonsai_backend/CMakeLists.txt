@@ -108,4 +108,5 @@ if(BONSAI_BUILD_SMOKE_TESTS)
 
     bonsai_add_test(bonsai-matmul-smoke "${CMAKE_CURRENT_LIST_DIR}/src/matmul-smoke.cpp")
     bonsai_add_test(bonsai-driver-bench "${CMAKE_CURRENT_LIST_DIR}/src/driver-bench.cpp")
+    bonsai_add_test(bonsai-asic-probe   "${CMAKE_CURRENT_LIST_DIR}/src/driver-asic-probe.cpp")
 endif()
