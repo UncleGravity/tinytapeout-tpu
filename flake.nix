@@ -84,6 +84,7 @@
               python
               pkgs.cairosvg
               pkgs.ggml
+              pkgs.libusb1
               pkgs.pkg-config
               pkgs.cmake
               pkgs.ninja
