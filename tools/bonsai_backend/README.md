@@ -82,14 +82,14 @@ The root flake exposes:
 ```sh
 nix build .#bonsai-llama-cpp-dl
 nix build .#bonsai-backend
-nix build .#bonsai-llama-cli
+nix build .#llama-cli-bonsai
 ```
 
-`.#bonsai-llama-cli` is a wrapper that sets `GGML_BACKEND_PATH` and the dynamic
+`.#llama-cli-bonsai` is a wrapper that sets `GGML_BACKEND_PATH` and the dynamic
 library search path before execing the matched `llama-cli` build:
 
 ```sh
-nix run .#bonsai-llama-cli -- \
+nix run .#llama-cli-bonsai -- \
   -m $PWD/models/Bonsai-1.7B/Bonsai-1.7B-Q1_0.gguf \
   -p Hello -n 2 -c 128 -b 16 -ub 16 -t 4 \
   --device Bonsai \
@@ -110,7 +110,7 @@ bonsai = pkgs.callPackage ./tools/bonsai_backend/package.nix {
 ```
 
 Because the package has no `./llama.cpp` fallback, `nix build
-.#bonsai-llama-cli` does not depend on a local checkout or submodule. Newly
+.#llama-cli-bonsai` does not depend on a local checkout or submodule. Newly
 added Bonsai package files still need to be tracked or staged so flakes can see
 them.
 

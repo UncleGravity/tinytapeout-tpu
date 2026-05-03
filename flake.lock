@@ -1,5 +1,24 @@
 {
   "nodes": {
+    "bonsai-backend": {
+      "inputs": {
+        "llama-cpp-src": [
+          "llama-cpp-src"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "path": "./tools/bonsai_backend",
+        "type": "path"
+      },
+      "original": {
+        "path": "./tools/bonsai_backend",
+        "type": "path"
+      },
+      "parent": []
+    },
     "ciel": {
       "inputs": {
         "nix-eda": [
@@ -164,6 +183,7 @@
     },
     "root": {
       "inputs": {
+        "bonsai-backend": "bonsai-backend",
         "librelane": "librelane",
         "llama-cpp-src": "llama-cpp-src",
         "nixpkgs": "nixpkgs_2",

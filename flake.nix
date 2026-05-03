@@ -9,9 +9,14 @@
       url = "github:ggml-org/llama.cpp/a95a11e5b834057e684712963f90bbb730f4745c";
       flake = false;
     };
+    bonsai-backend = {
+      url = "path:./tools/bonsai_backend";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.llama-cpp-src.follows = "llama-cpp-src";
+    };
   };
 
-  outputs = { self, nixpkgs, librelane, verilog-viewer, llama-cpp-src }:
+  outputs = { self, nixpkgs, librelane, verilog-viewer, llama-cpp-src, bonsai-backend }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [
         "aarch64-darwin"
@@ -32,17 +37,14 @@
       apps = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          bonsai = pkgs.callPackage ./tools/bonsai_backend/package.nix {
-            llamaCppSrc = llama-cpp-src;
-          };
         in {
           test   = mkDevApp pkgs "test"   "cd test && make -B";
           harden = mkDevApp pkgs "harden" "./tt/tt_tool.py --create-user-config && ./tt/tt_tool.py --harden --no-docker";
           fpga   = mkDevApp pkgs "fpga"   "./tt/tt_fpga.py harden";
           check  = mkDevApp pkgs "check"  "./tt/tt_tool.py --check-docs";
-          bonsai-llama-cli = {
+          llama-cli-bonsai = {
             type = "app";
-            program = "${bonsai.bonsai-llama-cli}/bin/bonsai-llama-cli";
+            program = pkgs.lib.getExe bonsai-backend.packages.${system}.llama-cli-bonsai;
           };
           view = {
             type = "app";
@@ -59,19 +61,6 @@
                 "$@"
             '');
           };
-        }
-      );
-
-      packages = forAllSystems (system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-          bonsai = pkgs.callPackage ./tools/bonsai_backend/package.nix {
-            llamaCppSrc = llama-cpp-src;
-          };
-        in {
-          bonsai-llama-cpp-dl = bonsai.llama-cpp-dl;
-          bonsai-backend = bonsai.bonsai-backend;
-          bonsai-llama-cli = bonsai.bonsai-llama-cli;
         }
       );
 

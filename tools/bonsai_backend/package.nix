@@ -103,22 +103,23 @@ let
     };
   };
 
-  bonsai-llama-cli-unwrapped = writeShellScriptBin "bonsai-llama-cli" ''
+  llama-cli-bonsai-unwrapped = writeShellScriptBin "llama-cli-bonsai" ''
     set -e
     export GGML_BACKEND_PATH="${bonsai-backend}/lib/libggml-bonsai.so"
     export ${dynamicLibraryPathVar}="${llama-cpp-dl}/lib:${llama-cpp-dl}/bin:${bonsai-backend}/lib''${${dynamicLibraryPathVar}:+:''${${dynamicLibraryPathVar}}}"
     exec "${llama-cpp-dl}/bin/llama-cli" "$@"
   '';
 
-  bonsai-llama-cli = symlinkJoin {
-    name = "bonsai-llama-cli";
-    paths = [ bonsai-llama-cli-unwrapped ];
+  llama-cli-bonsai = symlinkJoin {
+    name = "llama-cli-bonsai";
+    paths = [ llama-cli-bonsai-unwrapped ];
+    meta.mainProgram = "llama-cli-bonsai";
     passthru = {
       inherit llama-cpp-dl bonsai-backend;
     };
   };
 in
 {
-  inherit llama-cpp-dl bonsai-backend bonsai-llama-cli;
-  default = bonsai-llama-cli;
+  inherit llama-cpp-dl bonsai-backend llama-cli-bonsai;
+  default = llama-cli-bonsai;
 }
