@@ -26,22 +26,11 @@ echo "flashing: $UF2"
 PORT=$(ls /dev/tty.usbmodem* 2>/dev/null | head -1 || true)
 
 if [ -n "$PORT" ]; then
-    echo "trying BOOTSEL via $PORT..."
-    # rp_streamer accepts a 'B' + u32(0) header to reset_usb_boot.
-    nix-shell -p 'python3.withPackages(ps: [ps.pyserial])' --run "
-python3 -c \"
-import serial, struct
-try:
-    s = serial.Serial('$PORT', 115200, timeout=0.3)
-    s.write(b'B' + struct.pack('<I', 0))
-    s.flush()
-    s.close()
-except Exception:
-    pass
-\"
-" >/dev/null 2>&1 || true
-
-    # TT-MicroPython path.
+    # Vendor-class rp_streamer no longer exposes /dev/tty.usbmodem*, so this
+    # path only fires when TT-MicroPython is currently running. The
+    # vendor-class bootsel reset is intentionally not exposed via libusb here:
+    # if you're already running the bonsai backend you can call its driver,
+    # and otherwise the manual BOOT+RESET fallback below is one tap.
     nix-shell -p mpremote --run "mpremote connect $PORT exec 'import machine; machine.bootloader()'" >/dev/null 2>&1 || true
 fi
 

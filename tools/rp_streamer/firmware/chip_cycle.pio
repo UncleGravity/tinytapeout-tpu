@@ -1,0 +1,58 @@
+; One chip cycle (drive ui+uio, latch on rising clk, sample uo_out) per FIFO
+; word. A single SM with PIO_GPIOBASE=16 spans GPIOs 16-47, covering both
+; banks: clk(16) + ui_in(17-24) + uio(25-32) + uo_out(33-40).
+;
+; Wire format: TX FIFO low 16 bits = ui | (uio << 8). RX FIFO low byte = uo_out.
+;
+; Timing at 150 MHz sysclk: 64+64 = ~427 ns setup + ~427 ns hold ≈ 854 ns per
+; chip cycle (1.17 M cycles/sec on the device side, well above the FS-USB host
+; ceiling). This matches the C version's delay_cycles(32) busy loop, which
+; was validated end-to-end by matmul_smoke. The 4 [15] NOPs per side land 64
+; cycles each because .side_set 1 caps the delay field at 4 bits ([15] max).
+
+.pio_version 1
+.program chip_cycle
+.side_set 1
+
+.wrap_target
+    ; Explicit pull (autopull off) keeps a strict 1-FIFO-word ↔ 1-chip-cycle
+    ; binding. Autopull is "lazy" — the SM advances into the next OUT before
+    ; stalling, shifting stale OSR onto the pins and producing a phantom IN.
+    pull block     side 0
+    out pins, 16   side 0 [15]
+    nop            side 0 [15]
+    nop            side 0 [15]
+    nop            side 0 [15]
+    nop            side 1 [15]   ; clk hi — chip latches on rising edge
+    nop            side 1 [15]
+    nop            side 1 [15]
+    nop            side 1 [15]
+    in  pins, 8    side 0
+.wrap
+
+% c-sdk {
+static inline void chip_cycle_program_init(
+        PIO pio, uint sm, uint offset,
+        uint pin_clk, uint pin_ui_base, uint pin_uo_base) {
+    pio_sm_config c = chip_cycle_program_get_default_config(offset);
+
+    sm_config_set_sideset_pins(&c, pin_clk);
+    sm_config_set_out_pins(&c, pin_ui_base, 16);   // ui_in[0:7] + uio_in[0:7]
+    sm_config_set_in_pins (&c, pin_uo_base);       // uo_out[0:7]
+
+    // IN shifts left so the sampled byte lands in ISR[7:0]; right-shift would
+    // put it in ISR[31:24] and the host's (uint8_t) cast on the FIFO word
+    // would always read 0.
+    sm_config_set_out_shift(&c, /*shift_right=*/ true,  /*autopull=*/ false, 16);
+    sm_config_set_in_shift (&c, /*shift_right=*/ false, /*autopush=*/ true,  8);
+
+    for (uint g = pin_clk;     g < pin_ui_base + 16; g++) pio_gpio_init(pio, g);
+    for (uint g = pin_uo_base; g < pin_uo_base + 8;  g++) pio_gpio_init(pio, g);
+
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_clk,    17, /*is_out=*/ true);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_uo_base, 8, /*is_out=*/ false);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

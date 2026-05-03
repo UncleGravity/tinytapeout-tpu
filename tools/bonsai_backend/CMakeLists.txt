@@ -29,6 +29,9 @@ find_library(GGML_BASE_LIBRARY ggml-base
     HINTS "${LLAMA_CPP_BUILD_DIR}/bin" "${LLAMA_CPP_BUILD_DIR}/lib"
     REQUIRED NO_DEFAULT_PATH)
 
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0)
+
 if(APPLE)
     set(_bonsai_rpath "@loader_path;${LLAMA_CPP_BUILD_DIR}/bin;${LLAMA_CPP_BUILD_DIR}/lib")
 else()
@@ -44,7 +47,7 @@ target_include_directories(bonsai_common INTERFACE
     "${CMAKE_CURRENT_LIST_DIR}/include"
     "${LLAMA_CPP_DIR}/ggml/include"
     "${LLAMA_CPP_DIR}/ggml/src")
-target_link_libraries(bonsai_common INTERFACE "${GGML_BASE_LIBRARY}")
+target_link_libraries(bonsai_common INTERFACE "${GGML_BASE_LIBRARY}" PkgConfig::LIBUSB)
 target_compile_definitions(bonsai_common INTERFACE GGML_SHARED)
 
 if(BONSAI_ENABLE_VERILATOR)

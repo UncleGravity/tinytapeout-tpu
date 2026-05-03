@@ -97,5 +97,49 @@ int main() {
     std::printf("probe: %d x cell with wait_done in %.1f ms (%.3f ms/cell, mean polls=%.2f, max=%d, errors=%d), sink=%d\n",
         n, wait_ms, wait_ms / n, (double) polls_total / n, max_polls_seen, errors, (int) sink);
 
+    // Same workload via the batched run_tile path (single X-frame per tile).
+    // This is the route matmul.cpp's run_cell takes when it has only one
+    // tile to process (matches the per-tile cost of run_tile_batch(n=1)).
+    t0 = std::chrono::steady_clock::now();
+    sink = 0;
+    for (int i = 0; i < n; ++i) {
+        const int8_t acts[bonsai::Tile::cols] = {
+            (int8_t) (i & 0x7f),
+            (int8_t) ((i >> 1) & 0x7f),
+        };
+        sink ^= driver->run_tile((uint8_t) (i & 0xff), acts, 0);
+    }
+    t1 = std::chrono::steady_clock::now();
+    const double tile_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    std::printf("probe: %d x run_tile in %.1f ms (%.3f ms/tile), sink=%d\n",
+        n, tile_ms, tile_ms / n, (int) sink);
+
+    // Same workload via run_tile_batch at varying batch sizes — shows how
+    // much per-tile cost we can claw back by amortizing the USB round-trip.
+    for (int batch_size : { 1, 4, 16, 64, 256 }) {
+        const int total_tiles = 1024;
+        const int n_batches = total_tiles / batch_size;
+        std::vector<uint8_t>  packed_w((size_t) batch_size);
+        std::vector<int8_t>   acts_buf((size_t) batch_size * bonsai::Tile::cols);
+        std::vector<int16_t>  psums   ((size_t) batch_size);
+        t0 = std::chrono::steady_clock::now();
+        sink = 0;
+        for (int b = 0; b < n_batches; ++b) {
+            for (int i = 0; i < batch_size; ++i) {
+                const int idx = b * batch_size + i;
+                packed_w[(size_t) i] = (uint8_t) (idx & 0xff);
+                acts_buf[(size_t) i * 2 + 0] = (int8_t) (idx & 0x7f);
+                acts_buf[(size_t) i * 2 + 1] = (int8_t) ((idx >> 1) & 0x7f);
+            }
+            driver->run_tile_batch(packed_w.data(), acts_buf.data(),
+                                   nullptr, psums.data(), batch_size);
+            for (int i = 0; i < batch_size; ++i) sink ^= psums[(size_t) i];
+        }
+        t1 = std::chrono::steady_clock::now();
+        const double batch_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::printf("probe: batch=%-3d  %d tiles in %.1f ms (%.3f ms/tile)\n",
+            batch_size, total_tiles, batch_ms, batch_ms / total_tiles);
+    }
+
     return 0;
 }

@@ -3,6 +3,8 @@
   stdenv,
   cmake,
   ninja,
+  pkg-config,
+  libusb1,
   verilator,
   writeShellScriptBin,
   symlinkJoin,
@@ -80,7 +82,12 @@ let
     nativeBuildInputs = [
       cmake
       ninja
+      pkg-config
       verilator
+    ];
+
+    buildInputs = [
+      libusb1
     ];
 
     cmakeFlags = [

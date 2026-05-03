@@ -109,24 +109,14 @@ static void quantize_acts_q8_0(const float * a, i64 n, ActQuants & out) {
     }
 }
 
-static bool wait_done(BonsaiDriver & driver) {
-    constexpr int max_polls = 128;
-    for (int i = 0; i < max_polls; ++i) {
-        const uint8_t status = driver.status();
-        if ((status & status_error) != 0) {
-            return false;
-        }
-        if ((status & status_done) != 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 struct CellScratch {
-    std::vector<float> w_floats;
-    std::vector<float> a_floats;
-    ActQuants          act_quants;
+    std::vector<float>   w_floats;
+    std::vector<float>   a_floats;
+    ActQuants            act_quants;
+    // Pre-built tile inputs for run_tile_batch, sized to one Q8 sub-block.
+    std::vector<uint8_t> tile_packed_w;
+    std::vector<int8_t>  tile_acts;
+    std::vector<int16_t> tile_psums;
 };
 
 static bool run_cell(
@@ -190,29 +180,34 @@ static bool run_cell(
                 continue;
             }
 
-            int32_t sub_sum = 0;
-            for (i64 k0 = q8_start; k0 < q8_end; k0 += Tile::cols) {
+            const int n_tiles = (int) ((q8_end - q8_start + Tile::cols - 1) / Tile::cols);
+            scratch.tile_packed_w.resize((size_t) n_tiles);
+            scratch.tile_acts    .resize((size_t) n_tiles * Tile::cols);
+            scratch.tile_psums   .resize((size_t) n_tiles);
+
+            for (int t = 0; t < n_tiles; ++t) {
+                const i64 k0 = q8_start + (i64) t * Tile::cols;
                 uint8_t packed_weights = 0;
                 for (int lane = 0; lane < Tile::cols; ++lane) {
                     const i64 k = k0 + lane;
                     const bool weight_bit = k < q8_end && weights[k] >= 0.0f;
                     packed_weights |= (uint8_t) weight_bit << lane;
+                    scratch.tile_acts[(size_t) t * Tile::cols + (size_t) lane] =
+                        k < q8_end ? scratch.act_quants.q[(size_t) k] : (int8_t) 0;
                 }
-
-                driver.clear();
-                driver.ldw(0, packed_weights);
-                for (int lane = 0; lane < Tile::cols; ++lane) {
-                    const i64 k = k0 + lane;
-                    driver.lda(lane, k < q8_end ? scratch.act_quants.q[(size_t) k] : (int8_t) 0);
-                }
-                driver.seed(0, 0);
-                driver.start();
-                if (!wait_done(driver)) {
-                    return false;
-                }
-                sub_sum += (int32_t) driver.rdp(0);
+                scratch.tile_packed_w[(size_t) t] = packed_weights;
             }
+            driver.run_tile_batch(
+                scratch.tile_packed_w.data(),
+                scratch.tile_acts    .data(),
+                /*seeds=*/ nullptr,
+                scratch.tile_psums   .data(),
+                n_tiles);
 
+            int32_t sub_sum = 0;
+            for (int t = 0; t < n_tiles; ++t) {
+                sub_sum += (int32_t) scratch.tile_psums[(size_t) t];
+            }
             acc += d_w * d_a * (float) sub_sum;
         }
     }
@@ -229,6 +224,49 @@ static bool run_serial(const MatMulJob & job, BonsaiDriver & driver, i64 work) {
         }
     }
     return true;
+}
+
+// Threaded fan-out. Each worker owns its own driver instance because the
+// per-driver state (current weights, activations, in-flight start/done) is
+// not safe to share across threads. If we cannot allocate spare drivers,
+// fall back to serial on the caller's driver.
+static bool run_threaded(
+        const MatMulJob & job,
+        BonsaiDriver & driver,
+        DriverKind driver_kind,
+        int n_threads,
+        i64 work) {
+    std::vector<std::unique_ptr<BonsaiDriver>> spare_drivers;
+    spare_drivers.reserve((size_t) (n_threads - 1));
+    for (int i = 1; i < n_threads; ++i) {
+        std::unique_ptr<BonsaiDriver> d = create_bonsai_driver(driver_kind);
+        if (d == nullptr) {
+            return run_serial(job, driver, work);
+        }
+        spare_drivers.push_back(std::move(d));
+    }
+
+    std::atomic<bool> ok{true};
+    auto worker = [&](BonsaiDriver & local, int ith) {
+        CellScratch scratch;
+        for (i64 i = ith; i < work; i += n_threads) {
+            if (!ok.load(std::memory_order_relaxed)) return;
+            if (!run_cell(job, i, local, scratch)) {
+                ok.store(false, std::memory_order_relaxed);
+                return;
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve((size_t) (n_threads - 1));
+    for (int ith = 1; ith < n_threads; ++ith) {
+        BonsaiDriver & ref = *spare_drivers[(size_t) (ith - 1)];
+        threads.emplace_back([&worker, &ref, ith]() { worker(ref, ith); });
+    }
+    worker(driver, 0);
+    for (std::thread & t : threads) t.join();
+    return ok.load();
 }
 
 } // namespace
@@ -321,52 +359,23 @@ bool run_bonsai_matmul(const MatMulJob & job, BonsaiDriver & driver, DriverKind 
 
     n_threads = std::max(1, std::min<int>(n_threads, (int) work));
 
-    if (n_threads == 1) {
-        return run_serial(job, driver, work);
+    // The asic driver shares one chip across all wrappers in the process.
+    // Worker threads would interleave their per-cell command sequences
+    // (clear/ldw/lda/seed/start/status/rdp) and corrupt the chip state
+    // machine, since our per-X-frame mutex is finer-grained than a cell.
+    // Force serial execution for the real chip; sw-only drivers (cpu,
+    // verilator) parallelize fine because each instance owns its own state.
+    if (driver_kind == DriverKind::asic) {
+        n_threads = 1;
     }
 
-    // Drivers carry state across calls, so each worker thread needs its own
-    // instance. If we cannot allocate spares (e.g. asic stub returns null),
-    // fall back to the serial path on the caller's driver.
-    std::vector<std::unique_ptr<BonsaiDriver>> spare_drivers;
-    spare_drivers.reserve((size_t) (n_threads - 1));
-    for (int i = 1; i < n_threads; ++i) {
-        std::unique_ptr<BonsaiDriver> d = create_bonsai_driver(driver_kind);
-        if (d == nullptr) {
-            return run_serial(job, driver, work);
-        }
-        spare_drivers.push_back(std::move(d));
-    }
+    const bool ok = (n_threads == 1)
+        ? run_serial(job, driver, work)
+        : run_threaded(job, driver, driver_kind, n_threads, work);
 
-    std::atomic<bool> ok{true};
-
-    auto worker = [&](BonsaiDriver & local, int ith) {
-        CellScratch scratch;
-        for (i64 i = ith; i < work; i += n_threads) {
-            if (!ok.load(std::memory_order_relaxed)) {
-                return;
-            }
-            if (!run_cell(job, i, local, scratch)) {
-                ok.store(false, std::memory_order_relaxed);
-                return;
-            }
-        }
-    };
-
-    std::vector<std::thread> threads;
-    threads.reserve((size_t) (n_threads - 1));
-    for (int ith = 1; ith < n_threads; ++ith) {
-        BonsaiDriver & ref = *spare_drivers[(size_t) (ith - 1)];
-        threads.emplace_back([&worker, &ref, ith]() { worker(ref, ith); });
-    }
-
-    worker(driver, 0);
-
-    for (std::thread & t : threads) {
-        t.join();
-    }
-
-    return ok.load();
+    // run_tile drops per-tile error checks for batching speed, so sample the
+    // chip's error_latched bit once at end-of-matmul. Cheap (one X-frame).
+    return ok && !(driver.status() & status_error);
 }
 
 } // namespace bonsai
