@@ -1,169 +1,36 @@
 #include "ggml-bonsai.h"
 
+#include "driver.h"
+#include "matmul.h"
+
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 
-#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <new>
-#include <thread>
-#include <vector>
 
-// This backend is currently a scheduler/driver scaffold:
-// - ggml tensors stay in host memory via the CPU buffer type
-// - the device advertises itself as an accelerator for MUL_MAT
-// - graph_compute dispatches supported matmuls to a replaceable driver
-//
-// The CPU driver below is intentionally plain. It is the host-side stand-in for
-// a future RTL/FPGA command driver.
+// Layer 1: ggml backend plumbing.
+// This file only registers the Bonsai device, accepts graph splits, and hands
+// supported MUL_MAT nodes to the lowering layer. Tensor storage stays in host
+// memory for now; the Bonsai driver models the tiny command-level tile.
+
 namespace {
 
-constexpr const char * k_backend_name        = "Bonsai";
-constexpr const char * k_device_description  = "Bonsai fake accelerator";
-constexpr const char * k_set_threads_proc    = "ggml_backend_set_n_threads";
-constexpr const char * k_get_features_proc   = "ggml_backend_get_features";
-
-using i64 = int64_t;
-
-struct MatMulJob {
-    ggml_tensor * dst = nullptr;
-
-    const ggml_tensor * src0 = nullptr;
-    const ggml_tensor * src1 = nullptr;
-
-    i64 k = 0;
-    i64 n_rows = 0;
-    i64 n_cols = 0;
-    i64 n_b2 = 0;
-    i64 n_b3 = 0;
-
-    i64 src0_b2 = 0;
-    i64 src0_b3 = 0;
-
-    size_t src0_nb1 = 0;
-    size_t src0_nb2 = 0;
-    size_t src0_nb3 = 0;
-
-    size_t src1_nb1 = 0;
-    size_t src1_nb2 = 0;
-    size_t src1_nb3 = 0;
-
-    size_t dst_nb0 = 0;
-    size_t dst_nb1 = 0;
-    size_t dst_nb2 = 0;
-    size_t dst_nb3 = 0;
-};
-
-class CpuReferenceDriver {
-public:
-    void compute_mul_mat(const MatMulJob & job, int n_threads) const {
-        const i64 work = job.n_rows * job.n_cols * job.n_b2 * job.n_b3;
-        if (work == 0) {
-            return;
-        }
-
-        n_threads = std::max(1, n_threads);
-        n_threads = std::min<int>(n_threads, (int) work);
-
-        auto worker = [&](int ith) {
-            std::vector<float> src0_scratch;
-            std::vector<float> src1_scratch;
-
-            for (i64 iw = ith; iw < work; iw += n_threads) {
-                compute_cell(job, iw, src0_scratch, src1_scratch);
-            }
-        };
-
-        if (n_threads == 1) {
-            worker(0);
-            return;
-        }
-
-        std::vector<std::thread> threads;
-        threads.reserve(n_threads - 1);
-        for (int ith = 1; ith < n_threads; ++ith) {
-            threads.emplace_back(worker, ith);
-        }
-
-        worker(0);
-
-        for (std::thread & thread : threads) {
-            thread.join();
-        }
-    }
-
-private:
-    static const float * row_to_float(
-            const ggml_tensor * tensor,
-            const void * data,
-            i64 n,
-            std::vector<float> & scratch) {
-        if (tensor->type == GGML_TYPE_F32) {
-            return (const float *) data;
-        }
-
-        scratch.resize(n);
-        ggml_get_type_traits(tensor->type)->to_float(data, scratch.data(), n);
-        return scratch.data();
-    }
-
-    static float dot(const float * x, const float * y, i64 n) {
-        float sum = 0.0f;
-        for (i64 i = 0; i < n; ++i) {
-            sum += x[i] * y[i];
-        }
-        return sum;
-    }
-
-    static void compute_cell(
-            const MatMulJob & job,
-            i64 linear_index,
-            std::vector<float> & src0_scratch,
-            std::vector<float> & src1_scratch) {
-        const i64 row = linear_index % job.n_rows;
-        const i64 rem = linear_index / job.n_rows;
-
-        const i64 b3  = rem / (job.n_b2 * job.n_cols);
-        const i64 b2  = (rem - b3 * job.n_b2 * job.n_cols) / job.n_cols;
-        const i64 col = rem - b3 * job.n_b2 * job.n_cols - b2 * job.n_cols;
-
-        const i64 src0_i3 = b3 / job.src0_b3;
-        const i64 src0_i2 = b2 / job.src0_b2;
-
-        const void * src0_row =
-            (const char *) job.src0->data +
-            row * job.src0_nb1 +
-            src0_i2 * job.src0_nb2 +
-            src0_i3 * job.src0_nb3;
-
-        const void * src1_row =
-            (const char *) job.src1->data +
-            col * job.src1_nb1 +
-            b2 * job.src1_nb2 +
-            b3 * job.src1_nb3;
-
-        float * dst_cell =
-            (float *) ((char *) job.dst->data +
-            row * job.dst_nb0 +
-            col * job.dst_nb1 +
-            b2 * job.dst_nb2 +
-            b3 * job.dst_nb3);
-
-        const float * x = row_to_float(job.src0, src0_row, job.k, src0_scratch);
-        const float * y = row_to_float(job.src1, src1_row, job.k, src1_scratch);
-        *dst_cell = dot(x, y, job.k);
-    }
-};
+constexpr const char * k_backend_name       = "Bonsai";
+constexpr const char * k_device_description = "Bonsai accelerator scaffold";
+constexpr const char * k_set_threads_proc   = "ggml_backend_set_n_threads";
+constexpr const char * k_get_features_proc  = "ggml_backend_get_features";
 
 struct BackendContext {
     int n_threads = GGML_DEFAULT_N_THREADS;
     uint64_t n_graphs = 0;
     uint64_t n_mul_mat = 0;
     int trace_limit = 0;
-    CpuReferenceDriver driver;
+    bonsai::DriverKind driver_kind = bonsai::DriverKind::cpu;
+    std::unique_ptr<bonsai::BonsaiDriver> driver;
 };
 
 static bool env_enabled(const char * name) {
@@ -187,15 +54,6 @@ static int get_trace_limit() {
         : 0;
 }
 
-static bool type_can_convert_to_float(ggml_type type) {
-    if (type == GGML_TYPE_F32) {
-        return true;
-    }
-
-    const ggml_type_traits * traits = ggml_get_type_traits(type);
-    return traits != nullptr && traits->to_float != nullptr;
-}
-
 static bool is_metadata_op(ggml_op op) {
     switch (op) {
         case GGML_OP_NONE:
@@ -209,86 +67,6 @@ static bool is_metadata_op(ggml_op op) {
     }
 }
 
-static bool make_matmul_job(ggml_tensor * dst, MatMulJob * job) {
-    if (dst == nullptr || dst->op != GGML_OP_MUL_MAT) {
-        return false;
-    }
-
-    const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
-    if (src0 == nullptr || src1 == nullptr) {
-        return false;
-    }
-
-    if (!type_can_convert_to_float(src0->type) ||
-            !type_can_convert_to_float(src1->type) ||
-            dst->type != GGML_TYPE_F32) {
-        return false;
-    }
-
-    if (src0->ne[0] != src1->ne[0]) {
-        return false;
-    }
-
-    if (src0->ne[0] % ggml_blck_size(src0->type) != 0 ||
-            src1->ne[0] % ggml_blck_size(src1->type) != 0) {
-        return false;
-    }
-
-    if (dst->ne[0] != src0->ne[1] ||
-            dst->ne[1] != src1->ne[1] ||
-            dst->ne[2] != src1->ne[2] ||
-            dst->ne[3] != src1->ne[3]) {
-        return false;
-    }
-
-    if (src0->ne[2] <= 0 ||
-            src0->ne[3] <= 0 ||
-            src1->ne[2] % src0->ne[2] != 0 ||
-            src1->ne[3] % src0->ne[3] != 0) {
-        return false;
-    }
-
-    if (src0->nb[0] != ggml_type_size(src0->type) ||
-            src1->nb[0] != ggml_type_size(src1->type) ||
-            dst->nb[0] != sizeof(float)) {
-        return false;
-    }
-
-    if (job == nullptr) {
-        return true;
-    }
-
-    *job = {
-        /* .dst      = */ dst,
-        /* .src0     = */ src0,
-        /* .src1     = */ src1,
-        /* .k        = */ src0->ne[0],
-        /* .n_rows   = */ dst->ne[0],
-        /* .n_cols   = */ dst->ne[1],
-        /* .n_b2     = */ dst->ne[2],
-        /* .n_b3     = */ dst->ne[3],
-        /* .src0_b2  = */ dst->ne[2] / src0->ne[2],
-        /* .src0_b3  = */ dst->ne[3] / src0->ne[3],
-        /* .src0_nb1 = */ src0->nb[1],
-        /* .src0_nb2 = */ src0->nb[2],
-        /* .src0_nb3 = */ src0->nb[3],
-        /* .src1_nb1 = */ src1->nb[1],
-        /* .src1_nb2 = */ src1->nb[2],
-        /* .src1_nb3 = */ src1->nb[3],
-        /* .dst_nb0  = */ dst->nb[0],
-        /* .dst_nb1  = */ dst->nb[1],
-        /* .dst_nb2  = */ dst->nb[2],
-        /* .dst_nb3  = */ dst->nb[3],
-    };
-
-    return true;
-}
-
-static bool supports_matmul(const ggml_tensor * op) {
-    return make_matmul_job((ggml_tensor *) op, nullptr);
-}
-
 static void trace_matmul(const BackendContext & ctx, const ggml_tensor * dst) {
     if (ctx.trace_limit <= 0 || (int) ctx.n_mul_mat > ctx.trace_limit) {
         return;
@@ -299,7 +77,7 @@ static void trace_matmul(const BackendContext & ctx, const ggml_tensor * dst) {
 
     GGML_LOG_INFO(
             "bonsai: MUL_MAT #%llu %s: src0=%s [%lld,%lld,%lld,%lld] %s, "
-            "src1=%s [%lld,%lld,%lld,%lld] %s -> [%lld,%lld,%lld,%lld] %s\n",
+            "src1=%s [%lld,%lld,%lld,%lld] %s -> [%lld,%lld,%lld,%lld] %s via %s\n",
             (unsigned long long) ctx.n_mul_mat,
             dst->name,
             src0->name,
@@ -312,7 +90,8 @@ static void trace_matmul(const BackendContext & ctx, const ggml_tensor * dst) {
             ggml_type_name(src1->type),
             (long long) dst->ne[0], (long long) dst->ne[1],
             (long long) dst->ne[2], (long long) dst->ne[3],
-            ggml_type_name(dst->type));
+            ggml_type_name(dst->type),
+            bonsai::driver_kind_name(ctx.driver_kind));
 }
 
 static enum ggml_status compute_graph(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -334,15 +113,19 @@ static enum ggml_status compute_graph(ggml_backend_t backend, ggml_cgraph * cgra
             return GGML_STATUS_FAILED;
         }
 
-        MatMulJob job;
-        if (!make_matmul_job(node, &job)) {
+        bonsai::MatMulJob job;
+        if (!bonsai::make_matmul_job(node, &job)) {
             GGML_LOG_ERROR("bonsai: unsupported MUL_MAT shape or type for node %s\n", node->name);
             return GGML_STATUS_FAILED;
         }
 
         ++ctx->n_mul_mat;
         trace_matmul(*ctx, node);
-        ctx->driver.compute_mul_mat(job, ctx->n_threads);
+        if (!bonsai::run_bonsai_matmul(job, *ctx->driver, ctx->driver_kind, ctx->n_threads)) {
+            GGML_LOG_ERROR("bonsai: driver %s failed while computing node %s\n",
+                    ctx->driver->name(), node->name);
+            return GGML_STATUS_FAILED;
+        }
     }
 
     return GGML_STATUS_SUCCESS;
@@ -356,9 +139,10 @@ static const char * backend_get_name(ggml_backend_t backend) {
 static void backend_free(ggml_backend_t backend) {
     BackendContext * ctx = (BackendContext *) backend->context;
     if (ctx != nullptr && ctx->trace_limit > 0) {
-        GGML_LOG_INFO("bonsai: computed %llu MUL_MAT node(s) across %llu graph split(s)\n",
+        GGML_LOG_INFO("bonsai: computed %llu MUL_MAT node(s) across %llu graph split(s) via %s\n",
                 (unsigned long long) ctx->n_mul_mat,
-                (unsigned long long) ctx->n_graphs);
+                (unsigned long long) ctx->n_graphs,
+                bonsai::driver_kind_name(ctx->driver_kind));
     }
 
     delete ctx;
@@ -399,6 +183,13 @@ static ggml_backend_t init_backend() {
     }
 
     ctx->trace_limit = get_trace_limit();
+    ctx->driver_kind = bonsai::driver_kind_from_env();
+    ctx->driver = bonsai::create_bonsai_driver(ctx->driver_kind);
+    if (ctx->driver == nullptr) {
+        GGML_LOG_ERROR("bonsai: driver %s is not available yet\n",
+                bonsai::driver_kind_name(ctx->driver_kind));
+        return nullptr;
+    }
 
     ggml_backend_t backend = new (std::nothrow) ggml_backend {
         /* .guid    = */ backend_guid(),
@@ -481,7 +272,16 @@ static ggml_backend_buffer_t device_buffer_from_host_ptr(
 
 static bool device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_UNUSED(dev);
-    return is_metadata_op(op->op) || supports_matmul(op);
+    if (is_metadata_op(op->op)) {
+        return true;
+    }
+    if (!bonsai::supports_matmul(op)) {
+        return false;
+    }
+    // The W1A8 fabric only handles 1-bit-weight matmuls. FP src0 tensors
+    // (e.g. attention Q@K^T, attn@V) would be destroyed by binarization, so we
+    // leave them for the CPU backend via the scheduler.
+    return op->src[0]->type == GGML_TYPE_Q1_0;
 }
 
 static bool device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
@@ -534,7 +334,8 @@ static ggml_backend_dev_t reg_get_device(ggml_backend_reg_t reg, size_t index) {
 }
 
 static ggml_backend_feature g_features[] = {
-    { "mul_mat", "host-f32-reference" },
+    { "mul_mat", "bonsai-command-lowering" },
+    { "driver",  "cpu|verilator|asic" },
     { "buffer",  "host" },
     { nullptr,   nullptr },
 };
@@ -577,10 +378,6 @@ ggml_backend_reg_t ggml_backend_bonsai_reg(void) {
     return &reg;
 }
 
-/*
-Macro from `ggml-backend-impl.h`.
-When `GGML_BACKEND_DL` is enabled, it expands into an exported C ABI function
-named ggml_backend_init(), that calls ggml_backend_bonsai_reg() and returns
-the `ggml_backend_reg_t`.
-*/
+// Export ggml_backend_init(), the standard dynamic-loader entry point that
+// returns this backend's registry when llama.cpp loads libggml-bonsai.so.
 GGML_BACKEND_DL_IMPL(ggml_backend_bonsai_reg)

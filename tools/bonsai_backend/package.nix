@@ -3,6 +3,7 @@
   stdenv,
   cmake,
   ninja,
+  verilator,
   writeShellScriptBin,
   symlinkJoin,
   llamaCppSrc,
@@ -79,6 +80,7 @@ let
     nativeBuildInputs = [
       cmake
       ninja
+      verilator
     ];
 
     cmakeFlags = [
