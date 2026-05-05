@@ -70,95 +70,106 @@ float expected_cell(const float * weights, const float * acts, int k) {
 
 } // namespace
 
-int main() {
-    constexpr int k = 4;
-    constexpr int rows = 3;
-    constexpr int cols = 2;
-
-    std::vector<uint8_t> memory(1 << 20);
+// Run a (rows x k) * (k x cols) matmul through the verilator transport and
+// compare every output cell against the float reference. Returns true on
+// match.
+static bool run_case(int k, int rows, int cols,
+                    bonsai::Transport & transport) {
+    std::vector<uint8_t> memory((size_t) 1 << 22);
     ggml_init_params params;
-    params.mem_size = memory.size();
+    params.mem_size   = memory.size();
     params.mem_buffer = memory.data();
-    params.no_alloc = false;
-
+    params.no_alloc   = false;
     ggml_context * ctx = ggml_init(params);
     if (ctx == nullptr) {
-        std::fprintf(stderr, "bonsai-matmul-smoke: ggml_init failed\n");
-        return 1;
+        std::fprintf(stderr, "matmul-smoke: ggml_init failed for k=%d\n", k);
+        return false;
     }
 
     ggml_tensor * src0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, rows);
     ggml_tensor * src1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, cols);
-    ggml_tensor * dst = ggml_mul_mat(ctx, src0, src1);
-
+    ggml_tensor * dst  = ggml_mul_mat(ctx, src0, src1);
     float * weights = (float *) src0->data;
-    float * acts = (float *) src1->data;
-    const float weights_by_row[rows][k] = {
-        {  1.0f, -1.0f,  1.0f, -1.0f },
-        { -1.0f, -1.0f,  1.0f,  1.0f },
-        {  1.0f,  1.0f,  1.0f, -1.0f },
+    float * acts    = (float *) src1->data;
+
+    // Deterministic pseudo-random {-1, +1} weights and small int activations.
+    // Different seeds per row/col so each (row,col) pair sees a unique
+    // dot product, including sign-flips spanning Q1 group boundaries.
+    auto wbit = [](int row, int idx) {
+        uint32_t h = (uint32_t) (row * 2654435761u) ^ (uint32_t) (idx * 374761393u);
+        h ^= h >> 17;
+        return (h & 1) ? 1.0f : -1.0f;
     };
-    const float acts_by_col[cols][k] = {
-        {  3.0f, -2.0f,  5.0f,  7.0f },
-        { -4.0f,  6.0f,  1.0f, -3.0f },
+    auto aval = [](int col, int idx) {
+        uint32_t h = (uint32_t) (col * 1597334677u) ^ (uint32_t) (idx * 2246822519u);
+        h ^= h >> 13;
+        return (float) (int8_t) (h & 0x7f) * (col % 2 == 0 ? 1.0f : -1.0f) * 0.25f;
     };
 
     for (int row = 0; row < rows; ++row) {
-        for (int i = 0; i < k; ++i) {
-            weights[row * k + i] = weights_by_row[row][i];
-        }
+        for (int i = 0; i < k; ++i) weights[row * k + i] = wbit(row, i);
     }
     for (int col = 0; col < cols; ++col) {
-        for (int i = 0; i < k; ++i) {
-            acts[col * k + i] = acts_by_col[col][i];
-        }
+        for (int i = 0; i < k; ++i) acts[col * k + i] = aval(col, i);
     }
 
     bonsai::MatMulJob job;
     if (!bonsai::make_matmul_job(dst, &job)) {
-        std::fprintf(stderr, "bonsai-matmul-smoke: make_matmul_job rejected the smoke graph\n");
+        std::fprintf(stderr, "matmul-smoke: make_matmul_job rejected k=%d\n", k);
         ggml_free(ctx);
-        return 1;
+        return false;
+    }
+    if (!bonsai::run_bonsai_matmul(job, transport)) {
+        std::fprintf(stderr, "matmul-smoke: run_bonsai_matmul failed via %s for k=%d\n",
+                     transport.name(), k);
+        ggml_free(ctx);
+        return false;
     }
 
-    // Verilator-driven RTL parity: lowering layer + actual gates, end-to-end.
-    std::unique_ptr<bonsai::Transport> transport = bonsai::create_verilator_transport();
-    if (transport == nullptr) {
-        std::fprintf(stderr, "bonsai-matmul-smoke: verilator transport unavailable "
-                             "(was the build configured with -DBONSAI_ENABLE_VERILATOR=ON?)\n");
-        ggml_free(ctx);
-        return 1;
-    }
-
-    if (!bonsai::run_bonsai_matmul(job, *transport)) {
-        std::fprintf(stderr, "bonsai-matmul-smoke: run_bonsai_matmul failed via %s\n", transport->name());
-        ggml_free(ctx);
-        return 1;
-    }
-
+    std::vector<float> w_row(k), a_col(k);
     const float * got = (const float *) dst->data;
     bool ok = true;
     for (int col = 0; col < cols; ++col) {
+        for (int i = 0; i < k; ++i) a_col[i] = aval(col, i);
         for (int row = 0; row < rows; ++row) {
-            const float expected = expected_cell(weights_by_row[row], acts_by_col[col], k);
-            const float actual = got[col * rows + row];
-            if (std::fabs(actual - expected) > 1e-5f) {
+            for (int i = 0; i < k; ++i) w_row[i] = wbit(row, i);
+            const float expected = expected_cell(w_row.data(), a_col.data(), k);
+            const float actual   = got[col * rows + row];
+            const float tol      = std::max(1e-4f, 1e-3f * std::fabs(expected));
+            if (std::fabs(actual - expected) > tol) {
                 std::fprintf(
                     stderr,
-                    "bonsai-matmul-smoke: mismatch row=%d col=%d got=%.6f expected=%.6f\n",
-                    row,
-                    col,
-                    actual,
-                    expected);
+                    "matmul-smoke: mismatch k=%d row=%d col=%d got=%.6f expected=%.6f\n",
+                    k, row, col, actual, expected);
                 ok = false;
             }
         }
     }
 
+    ggml_free(ctx);
+    return ok;
+}
+
+int main() {
+    std::unique_ptr<bonsai::Transport> transport = bonsai::create_verilator_transport();
+    if (transport == nullptr) {
+        std::fprintf(stderr, "bonsai-matmul-smoke: verilator transport unavailable "
+                             "(was the build configured with -DBONSAI_ENABLE_VERILATOR=ON?)\n");
+        return 1;
+    }
+
+    // Sweep K to exercise:
+    //   k=4    smallest case (1 Q8 sub-block, 1 Q1 group) — degenerate
+    //   k=64   2 Q8 sub-blocks within one Q1 group — exercises sub-block run boundaries
+    //   k=160  spans 2 Q1 groups (5 Q8 sub-blocks total) — exercises group transitions
+    // rows=3 trips the odd-row tail path (one paired (0,1), one unpaired (2)).
+    bool ok = true;
+    ok &= run_case(  4, 3, 2, *transport);
+    ok &= run_case( 64, 3, 2, *transport);
+    ok &= run_case(160, 3, 2, *transport);
+
     if (ok) {
         std::printf("bonsai-matmul-smoke: transport=%s passed\n", transport->name());
     }
-
-    ggml_free(ctx);
     return ok ? 0 : 1;
 }

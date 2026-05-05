@@ -114,11 +114,21 @@ struct CellScratch {
     std::vector<float>   w_floats[Tile::rows];
     std::vector<float>   a_floats;
     ActQuants            act_quants;
-    // Reusable Plan + matching output buffer; cleared and re-filled per
-    // Q8 sub-block so we keep their backing storage hot across cells.
-    // psums_buf is sized n_tiles * Tile::rows (row-major).
+    // Reusable Plan + matching output buffer; one Plan per cell-pair
+    // covers ALL Q8 sub-blocks (so the USB round-trip is amortized across
+    // the whole K dimension instead of paid 64x per cell at K=2048).
+    // psums_buf is sized plan.ops.size() * Tile::rows (row-major).
     Plan                 plan;
     std::vector<int16_t> psums_buf;
+    // Per-sub-block fold metadata: where in plan.ops the run tail lives
+    // and which (d_w, d_a) scales to apply when folding the run's psum
+    // back into the host-side accumulator.
+    struct SubBlockMeta {
+        size_t tail_op_index;   // run-tail op index in plan.ops
+        float  d_w[Tile::rows]; // weight-group scales per array row
+        float  d_a;             // act-block scale (shared across rows)
+    };
+    std::vector<SubBlockMeta> sub_blocks;
 };
 
 // Compute Tile::rows adjacent output rows in lockstep, exercising both rows
@@ -167,13 +177,18 @@ static bool run_cell_pair(
 
     quantize_acts_q8_0(acts, job.k, scratch.act_quants);
 
-    // Mirror ggml_vec_dot_q1_0_q8_0's accumulation order: outer loop over Q1_0
-    // weight blocks (128 elements), inner loop over Q8_0 sub-blocks (32 acts).
-    // Each Q8_0 sub-block sums in int32 with no FP error (max magnitude
-    // 32 * 127 = 4064, fits in int16 already), then a single
-    // `acc += d_w * d_a * sub_sum` fold per sub-block matches the reference
-    // exactly modulo FP add-order across blocks.
-    float acc[Tile::rows] = { 0.0f, 0.0f };
+    // Build ONE Plan covering every Q8 sub-block for this cell-pair. The
+    // chip resets acc_q at each sub-block's run-head (CLEAR) and reads it
+    // out at the run-tail (RDP); 64 separate execute() round-trips at
+    // K=2048 collapse to a single USB round-trip per cell-pair.
+    //
+    // Mirrors ggml_vec_dot_q1_0_q8_0's accumulation order: outer loop over
+    // Q1_0 weight groups (128 elements, shared d_w), inner loop over Q8_0
+    // sub-blocks (32 acts, shared d_a). The host fold below preserves that
+    // order so FP rounding matches the CPU reference.
+    scratch.plan.clear();
+    scratch.sub_blocks.clear();
+
     for (i64 q1_start = 0; q1_start < job.k; q1_start += k_weight_group) {
         const i64 q1_end = std::min(q1_start + k_weight_group, job.k);
 
@@ -194,15 +209,13 @@ static bool run_cell_pair(
             }
 
             const int n_tiles = (int) ((q8_end - q8_start + Tile::cols - 1) / Tile::cols);
-            scratch.plan.clear();
-            scratch.plan.ops.reserve((size_t) n_tiles);
-            scratch.psums_buf.resize((size_t) n_tiles * Tile::rows);
+            const size_t op_base = scratch.plan.ops.size();
 
-            // Output-stationary across the whole Q8 sub-block: the head
-            // tile zeros acc_q via CLEAR, intermediate tiles just LDW +
-            // LDA + START (no RDP), the tail tile reads the accumulated
-            // psum back. The per-Q8-block sum lands directly in the chip
-            // accumulator so we no longer fold psums on the host.
+            // Output-stationary across the whole sub-block: head tile
+            // CLEARs, intermediates just LDW+LDA+START, tail RDPs the run
+            // total. Tile-level dual-row + run-level batching means each
+            // sub-block contributes 16 ops to the plan but only 4 bytes on
+            // the wire reply (one psum-pair, not 16).
             for (int t = 0; t < n_tiles; ++t) {
                 const i64 k0 = q8_start + (i64) t * Tile::cols;
                 uint8_t packed_weights[Tile::rows] = { 0, 0 };
@@ -221,9 +234,6 @@ static bool run_cell_pair(
                         acts_buf[lane] = 0;
                     }
                 }
-                // seeds = {0, 0}: only honored on the run head where the
-                // chip latches them as acc_q's initial value (CLEAR also
-                // zeros acc_q, so seeds=0 here is redundant but explicit).
                 const int16_t seeds[Tile::rows] = { 0, 0 };
                 const bool starts = (t == 0);
                 const bool ends   = (t == n_tiles - 1);
@@ -231,21 +241,39 @@ static bool run_cell_pair(
                                                   starts, ends);
             }
 
-            if (!transport.execute(scratch.plan, scratch.psums_buf.data())) {
-                return false;
-            }
+            scratch.sub_blocks.push_back({
+                /* tail_op_index = */ op_base + (size_t) (n_tiles - 1),
+                /* d_w           = */ { d_w[0], d_w[1] },
+                /* d_a           = */ d_a,
+            });
+        }
+    }
 
-            // Only the run-tail tile (n_tiles - 1) holds a real psum — the
-            // chip accumulated across the whole sub-block. Earlier slots
-            // were left zero by the transport.
-            const size_t tail = (size_t) (n_tiles - 1) * Tile::rows;
-            const int32_t sub_sum0 = (int32_t) scratch.psums_buf[tail + 0];
-            const int32_t sub_sum1 = (weights1 != nullptr)
-                ? (int32_t) scratch.psums_buf[tail + 1] : 0;
-            acc[0] += d_w[0] * d_a * (float) sub_sum0;
-            if (weights1 != nullptr) {
-                acc[1] += d_w[1] * d_a * (float) sub_sum1;
-            }
+    if (scratch.plan.ops.empty()) {
+        // Every sub-block was skipped (all-zero weights or activations).
+        // Nothing to compute on the chip; output cells stay zero.
+        *dst_cell_ptr(row0_idx) = 0.0f;
+        if (row1_idx >= 0) *dst_cell_ptr(row1_idx) = 0.0f;
+        return true;
+    }
+
+    scratch.psums_buf.resize(scratch.plan.ops.size() * (size_t) Tile::rows);
+    if (!transport.execute(scratch.plan, scratch.psums_buf.data())) {
+        return false;
+    }
+
+    // Fold each sub-block's run-tail psum into the host accumulator. Order
+    // matches the original CPU reference (q1 outer, q8 inner) because we
+    // pushed sub_blocks in that order.
+    float acc[Tile::rows] = { 0.0f, 0.0f };
+    for (const CellScratch::SubBlockMeta & meta : scratch.sub_blocks) {
+        const size_t tail = meta.tail_op_index * (size_t) Tile::rows;
+        const int32_t sub_sum0 = (int32_t) scratch.psums_buf[tail + 0];
+        const int32_t sub_sum1 = (weights1 != nullptr)
+            ? (int32_t) scratch.psums_buf[tail + 1] : 0;
+        acc[0] += meta.d_w[0] * meta.d_a * (float) sub_sum0;
+        if (weights1 != nullptr) {
+            acc[1] += meta.d_w[1] * meta.d_a * (float) sub_sum1;
         }
     }
 
