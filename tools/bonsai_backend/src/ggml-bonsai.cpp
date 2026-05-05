@@ -1,7 +1,7 @@
 #include "ggml-bonsai.h"
 
-#include "driver.h"
 #include "matmul.h"
+#include "transport.h"
 
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
@@ -12,10 +12,9 @@
 #include <memory>
 #include <new>
 
-// Layer 1: ggml backend plumbing.
-// This file only registers the Bonsai device, accepts graph splits, and hands
-// supported MUL_MAT nodes to the lowering layer. Tensor storage stays in host
-// memory for now; the Bonsai driver models the tiny command-level tile.
+// ggml backend plumbing.
+// This file only registers the device, accepts graph splits, and hands
+// supported MUL_MAT nodes to the lowering layer.
 
 namespace {
 
@@ -25,12 +24,14 @@ constexpr const char * k_set_threads_proc   = "ggml_backend_set_n_threads";
 constexpr const char * k_get_features_proc  = "ggml_backend_get_features";
 
 struct BackendContext {
+    // n_threads is accepted from ggml's set_n_threads hook for API
+    // compatibility but currently ignored — the matmul lowering runs
+    // cells serially against a single Transport instance.
     int n_threads = GGML_DEFAULT_N_THREADS;
     uint64_t n_graphs = 0;
     uint64_t n_mul_mat = 0;
     int trace_limit = 0;
-    bonsai::DriverKind driver_kind = bonsai::DriverKind::cpu;
-    std::unique_ptr<bonsai::BonsaiDriver> driver;
+    std::unique_ptr<bonsai::Transport> transport;
 };
 
 static bool env_enabled(const char * name) {
@@ -91,7 +92,7 @@ static void trace_matmul(const BackendContext & ctx, const ggml_tensor * dst) {
             (long long) dst->ne[0], (long long) dst->ne[1],
             (long long) dst->ne[2], (long long) dst->ne[3],
             ggml_type_name(dst->type),
-            bonsai::driver_kind_name(ctx.driver_kind));
+            ctx.transport->name());
 }
 
 static enum ggml_status compute_graph(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -121,9 +122,9 @@ static enum ggml_status compute_graph(ggml_backend_t backend, ggml_cgraph * cgra
 
         ++ctx->n_mul_mat;
         trace_matmul(*ctx, node);
-        if (!bonsai::run_bonsai_matmul(job, *ctx->driver, ctx->driver_kind, ctx->n_threads)) {
-            GGML_LOG_ERROR("bonsai: driver %s failed while computing node %s\n",
-                    ctx->driver->name(), node->name);
+        if (!bonsai::run_bonsai_matmul(job, *ctx->transport)) {
+            GGML_LOG_ERROR("bonsai: transport %s failed while computing node %s\n",
+                    ctx->transport->name(), node->name);
             return GGML_STATUS_FAILED;
         }
     }
@@ -142,7 +143,7 @@ static void backend_free(ggml_backend_t backend) {
         GGML_LOG_INFO("bonsai: computed %llu MUL_MAT node(s) across %llu graph split(s) via %s\n",
                 (unsigned long long) ctx->n_mul_mat,
                 (unsigned long long) ctx->n_graphs,
-                bonsai::driver_kind_name(ctx->driver_kind));
+                ctx->transport ? ctx->transport->name() : "(none)");
     }
 
     delete ctx;
@@ -183,11 +184,10 @@ static ggml_backend_t init_backend() {
     }
 
     ctx->trace_limit = get_trace_limit();
-    ctx->driver_kind = bonsai::driver_kind_from_env();
-    ctx->driver = bonsai::create_bonsai_driver(ctx->driver_kind);
-    if (ctx->driver == nullptr) {
-        GGML_LOG_ERROR("bonsai: driver %s is not available yet\n",
-                bonsai::driver_kind_name(ctx->driver_kind));
+    ctx->transport   = bonsai::create_usb_transport();
+    if (ctx->transport == nullptr) {
+        GGML_LOG_ERROR("bonsai: USB transport unavailable; backend will not load "
+                       "(ggml scheduler will route MUL_MAT to other backends)\n");
         return nullptr;
     }
 
@@ -334,10 +334,10 @@ static ggml_backend_dev_t reg_get_device(ggml_backend_reg_t reg, size_t index) {
 }
 
 static ggml_backend_feature g_features[] = {
-    { "mul_mat", "bonsai-command-lowering" },
-    { "driver",  "cpu|verilator|asic" },
-    { "buffer",  "host" },
-    { nullptr,   nullptr },
+    { "mul_mat",   "bonsai-plan-lowering" },
+    { "transport", "usb" },
+    { "buffer",    "host" },
+    { nullptr,     nullptr },
 };
 
 static ggml_backend_feature * get_features(ggml_backend_reg_t reg) {

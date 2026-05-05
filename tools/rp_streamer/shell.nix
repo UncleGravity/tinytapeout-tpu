@@ -1,7 +1,9 @@
 { pkgs ? import <nixpkgs> {} }:
 let
   pico-sdk-full = pkgs.pico-sdk.override { withSubmodules = true; };
-  pyenv = pkgs.python3.withPackages (ps: [ ps.pyserial ]);
+  # pyusb talks to the vendor-class rp_streamer firmware over libusb;
+  # pyserial stays around for the TT-MicroPython REPL scaffold scripts.
+  pyenv = pkgs.python3.withPackages (ps: [ ps.pyserial ps.pyusb ]);
 in
 pkgs.mkShell {
   buildInputs = with pkgs; [

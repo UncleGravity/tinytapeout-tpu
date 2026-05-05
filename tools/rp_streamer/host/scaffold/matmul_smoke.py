@@ -1,10 +1,13 @@
 """
-Quick matmul smoke test against tt_um_unclegravity_tpu running on the FPGA
-breakout via TT-MicroPython.
+FPGA bring-up scaffolding (NOT a regression test).
 
-Sends a tiny test vector through the chip protocol (LDW + LDA + SEED + START
-+ RDP) and verifies the output partial sums match the dot_ref model from
-test/common.py:
+Drives tt_um_unclegravity_tpu via the TT-MicroPython REPL on the FPGA
+breakout. Useful before flashing the rp_streamer C firmware to confirm the
+bitstream landed and the chip's ui_in/uio/uo_out path is intact. Production
+testing uses bonsai-matmul-smoke (verilator) and host/cli.py (firmware).
+
+Sends a tiny test vector (LDW + LDA + SEED + START + RDP), verifies the
+output partial sums match the dot_ref model from test/common.py:
 
     psum[r] = seed[r] + sum( act[c] if w[r][c] else -act[c] for c in range(cols) )
 
@@ -12,7 +15,7 @@ Bypasses the SDK's contention check on ui_in pins (FPGA pads pull HIGH which
 otherwise blocks the RP from driving them).
 
 Usage:
-    python host/matmul_smoke.py [/dev/tty.usbmodemXXXX]
+    python host/scaffold/matmul_smoke.py [/dev/tty.usbmodemXXXX]
 """
 import sys
 from pathlib import Path

@@ -1,13 +1,12 @@
 #include "matmul.h"
 
+#include "plan.h"
+
 #include "ggml-impl.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstdint>
-#include <memory>
-#include <thread>
 #include <vector>
 
 namespace bonsai {
@@ -113,16 +112,16 @@ struct CellScratch {
     std::vector<float>   w_floats;
     std::vector<float>   a_floats;
     ActQuants            act_quants;
-    // Pre-built tile inputs for run_tile_batch, sized to one Q8 sub-block.
-    std::vector<uint8_t> tile_packed_w;
-    std::vector<int8_t>  tile_acts;
-    std::vector<int16_t> tile_psums;
+    // Reusable Plan + matching output buffer; cleared and re-filled per
+    // Q8 sub-block so we keep their backing storage hot across cells.
+    Plan                 plan;
+    std::vector<int16_t> psums_buf;
 };
 
 static bool run_cell(
         const MatMulJob & job,
         i64 linear_index,
-        BonsaiDriver & driver,
+        Transport & transport,
         CellScratch & scratch) {
     const i64 row = linear_index % job.n_rows;
     const i64 rem = linear_index / job.n_rows;
@@ -181,32 +180,34 @@ static bool run_cell(
             }
 
             const int n_tiles = (int) ((q8_end - q8_start + Tile::cols - 1) / Tile::cols);
-            scratch.tile_packed_w.resize((size_t) n_tiles);
-            scratch.tile_acts    .resize((size_t) n_tiles * Tile::cols);
-            scratch.tile_psums   .resize((size_t) n_tiles);
+            scratch.plan.clear();
+            scratch.plan.ops.reserve((size_t) n_tiles);
+            scratch.psums_buf.resize((size_t) n_tiles);
 
             for (int t = 0; t < n_tiles; ++t) {
                 const i64 k0 = q8_start + (i64) t * Tile::cols;
                 uint8_t packed_weights = 0;
+                int8_t acts_buf[Tile::cols];
                 for (int lane = 0; lane < Tile::cols; ++lane) {
                     const i64 k = k0 + lane;
                     const bool weight_bit = k < q8_end && weights[k] >= 0.0f;
                     packed_weights |= (uint8_t) weight_bit << lane;
-                    scratch.tile_acts[(size_t) t * Tile::cols + (size_t) lane] =
+                    acts_buf[lane] =
                         k < q8_end ? scratch.act_quants.q[(size_t) k] : (int8_t) 0;
                 }
-                scratch.tile_packed_w[(size_t) t] = packed_weights;
+                // seed = 0: this Q8 sub-block accumulates fresh; the
+                // per-block partial sum is folded into FP outside the
+                // chip via `d_w * d_a * sub_sum` below.
+                scratch.plan.add_matmul_tile(packed_weights, acts_buf, 0);
             }
-            driver.run_tile_batch(
-                scratch.tile_packed_w.data(),
-                scratch.tile_acts    .data(),
-                /*seeds=*/ nullptr,
-                scratch.tile_psums   .data(),
-                n_tiles);
+
+            if (!transport.execute(scratch.plan, scratch.psums_buf.data())) {
+                return false;
+            }
 
             int32_t sub_sum = 0;
             for (int t = 0; t < n_tiles; ++t) {
-                sub_sum += (int32_t) scratch.tile_psums[(size_t) t];
+                sub_sum += (int32_t) scratch.psums_buf[(size_t) t];
             }
             acc += d_w * d_a * (float) sub_sum;
         }
@@ -214,59 +215,6 @@ static bool run_cell(
 
     *dst_cell = acc;
     return true;
-}
-
-static bool run_serial(const MatMulJob & job, BonsaiDriver & driver, i64 work) {
-    CellScratch scratch;
-    for (i64 i = 0; i < work; ++i) {
-        if (!run_cell(job, i, driver, scratch)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-// Threaded fan-out. Each worker owns its own driver instance because the
-// per-driver state (current weights, activations, in-flight start/done) is
-// not safe to share across threads. If we cannot allocate spare drivers,
-// fall back to serial on the caller's driver.
-static bool run_threaded(
-        const MatMulJob & job,
-        BonsaiDriver & driver,
-        DriverKind driver_kind,
-        int n_threads,
-        i64 work) {
-    std::vector<std::unique_ptr<BonsaiDriver>> spare_drivers;
-    spare_drivers.reserve((size_t) (n_threads - 1));
-    for (int i = 1; i < n_threads; ++i) {
-        std::unique_ptr<BonsaiDriver> d = create_bonsai_driver(driver_kind);
-        if (d == nullptr) {
-            return run_serial(job, driver, work);
-        }
-        spare_drivers.push_back(std::move(d));
-    }
-
-    std::atomic<bool> ok{true};
-    auto worker = [&](BonsaiDriver & local, int ith) {
-        CellScratch scratch;
-        for (i64 i = ith; i < work; i += n_threads) {
-            if (!ok.load(std::memory_order_relaxed)) return;
-            if (!run_cell(job, i, local, scratch)) {
-                ok.store(false, std::memory_order_relaxed);
-                return;
-            }
-        }
-    };
-
-    std::vector<std::thread> threads;
-    threads.reserve((size_t) (n_threads - 1));
-    for (int ith = 1; ith < n_threads; ++ith) {
-        BonsaiDriver & ref = *spare_drivers[(size_t) (ith - 1)];
-        threads.emplace_back([&worker, &ref, ith]() { worker(ref, ith); });
-    }
-    worker(driver, 0);
-    for (std::thread & t : threads) t.join();
-    return ok.load();
 }
 
 } // namespace
@@ -351,31 +299,29 @@ bool supports_matmul(const ggml_tensor * op) {
     return make_matmul_job((ggml_tensor *) op, nullptr);
 }
 
-bool run_bonsai_matmul(const MatMulJob & job, BonsaiDriver & driver, DriverKind driver_kind, int n_threads) {
+bool run_bonsai_matmul(const MatMulJob & job, Transport & transport) {
     const i64 work = job.n_rows * job.n_cols * job.n_b2 * job.n_b3;
     if (work == 0) {
         return true;
     }
 
-    n_threads = std::max(1, std::min<int>(n_threads, (int) work));
-
-    // The asic driver shares one chip across all wrappers in the process.
-    // Worker threads would interleave their per-cell command sequences
-    // (clear/ldw/lda/seed/start/status/rdp) and corrupt the chip state
-    // machine, since our per-X-frame mutex is finer-grained than a cell.
-    // Force serial execution for the real chip; sw-only drivers (cpu,
-    // verilator) parallelize fine because each instance owns its own state.
-    if (driver_kind == DriverKind::asic) {
-        n_threads = 1;
+    // Serial execution. The chip is shared across all backend instances in
+    // a process and the per-X-frame mutex is finer-grained than a cell, so
+    // parallel cells would interleave and corrupt chip state. The
+    // verilator transport could parallelize cleanly (its state is
+    // per-instance) but tests run on small inputs where the overhead is
+    // not worth the complexity. Add a Transport::clone() pattern here when
+    // a workload actually justifies it.
+    CellScratch scratch;
+    for (i64 i = 0; i < work; ++i) {
+        if (!run_cell(job, i, transport, scratch)) {
+            return false;
+        }
     }
 
-    const bool ok = (n_threads == 1)
-        ? run_serial(job, driver, work)
-        : run_threaded(job, driver, driver_kind, n_threads, work);
-
-    // run_tile drops per-tile error checks for batching speed, so sample the
-    // chip's error_latched bit once at end-of-matmul. Cheap (one X-frame).
-    return ok && !(driver.status() & status_error);
+    // Per-tile error checks were dropped from the transport for batching
+    // speed; sample the chip's error_latched bit once at end-of-matmul.
+    return !(transport.status() & status_error);
 }
 
 } // namespace bonsai

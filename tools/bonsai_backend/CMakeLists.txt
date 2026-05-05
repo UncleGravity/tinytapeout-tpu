@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(bonsai_backend LANGUAGES CXX)
 
-option(BONSAI_ENABLE_VERILATOR "Build the cycle-accurate Verilator driver" OFF)
-option(BONSAI_BUILD_SMOKE_TESTS "Build standalone smoke-test executables"  OFF)
+option(BONSAI_ENABLE_VERILATOR "Build the cycle-accurate Verilator driver as a test fixture" OFF)
+option(BONSAI_BUILD_SMOKE_TESTS "Build standalone smoke-test/diagnostic executables in test/"  OFF)
 
 # Paths into the llama.cpp checkout to build against. The build dir is expected
 # to already contain libggml-base from a prior llama.cpp build (see README).
@@ -19,10 +19,8 @@ set(BONSAI_RTL_SOURCES      ""                       CACHE STRING "")
 set(BONSAI_RTL_INCLUDE_DIRS ""                       CACHE STRING "")
 
 set(BONSAI_INTERNAL_SOURCES
-    "${CMAKE_CURRENT_LIST_DIR}/src/driver.cpp"
-    "${CMAKE_CURRENT_LIST_DIR}/src/driver-cpu.cpp"
-    "${CMAKE_CURRENT_LIST_DIR}/src/driver-verilator.cpp"
-    "${CMAKE_CURRENT_LIST_DIR}/src/driver-asic.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/protocol.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/transport-usb.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/matmul.cpp")
 
 find_library(GGML_BASE_LIBRARY ggml-base
@@ -31,6 +29,13 @@ find_library(GGML_BASE_LIBRARY ggml-base
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0)
+
+# Outputs land in subdirs of the build dir so production and test can share
+# one cmake configuration: build/backend/libggml-bonsai.so and build/test/<exe>.
+# RPATHs are relative to the binary's own directory (@loader_path / $ORIGIN),
+# so each subdir is independently runnable.
+set(BONSAI_BACKEND_OUTPUT_DIR "${CMAKE_BINARY_DIR}/backend")
+set(BONSAI_TEST_OUTPUT_DIR    "${CMAKE_BINARY_DIR}/test")
 
 if(APPLE)
     set(_bonsai_rpath "@loader_path;${LLAMA_CPP_BUILD_DIR}/bin;${LLAMA_CPP_BUILD_DIR}/lib")
@@ -45,6 +50,7 @@ add_library(bonsai_common INTERFACE)
 target_compile_features(bonsai_common INTERFACE cxx_std_17)
 target_include_directories(bonsai_common INTERFACE
     "${CMAKE_CURRENT_LIST_DIR}/include"
+    "${CMAKE_CURRENT_LIST_DIR}/src"
     "${LLAMA_CPP_DIR}/ggml/include"
     "${LLAMA_CPP_DIR}/ggml/src")
 target_link_libraries(bonsai_common INTERFACE "${GGML_BASE_LIBRARY}" PkgConfig::LIBUSB)
@@ -68,11 +74,16 @@ if(BONSAI_ENABLE_VERILATOR)
     endif()
 endif()
 
+# Verilator is a test-only fixture: the production .so does not link it.
+# Test/diagnostic targets that need RTL-driven execution pull in
+# test/driver-verilator.cpp via this helper.
 function(bonsai_link_verilator target)
     if(NOT BONSAI_ENABLE_VERILATOR)
         return()
     endif()
     target_compile_definitions(${target} PRIVATE BONSAI_HAVE_VERILATOR=1)
+    target_sources(${target} PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/test/transport-verilator.cpp")
     verilate(${target}
         PREFIX Vbonsai_rtl_top
         TOP_MODULE   "${BONSAI_RTL_TOP}"
@@ -82,6 +93,7 @@ function(bonsai_link_verilator target)
 endfunction()
 
 # The dynamic backend module loaded at runtime via GGML_BACKEND_PATH.
+# Production: asic only. No verilator, no cpu fallback.
 add_library(ggml-bonsai MODULE
     "${BONSAI_BACKEND_SOURCE}"
     ${BONSAI_INTERNAL_SOURCES})
@@ -89,27 +101,30 @@ target_link_libraries(ggml-bonsai PRIVATE bonsai_common)
 target_compile_definitions(ggml-bonsai PRIVATE
     GGML_BACKEND_DL GGML_BACKEND_BUILD GGML_BACKEND_SHARED)
 set_target_properties(ggml-bonsai PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    LIBRARY_OUTPUT_DIRECTORY "${BONSAI_BACKEND_OUTPUT_DIR}"
     BUILD_RPATH   "${_bonsai_rpath}"
     INSTALL_RPATH "${_bonsai_rpath}")
 if(APPLE)
     # ggml's dynamic loader looks for *.so even on macOS.
     set_target_properties(ggml-bonsai PROPERTIES SUFFIX ".so")
 endif()
-bonsai_link_verilator(ggml-bonsai)
 
 if(BONSAI_BUILD_SMOKE_TESTS)
     function(bonsai_add_test name source)
         add_executable(${name} EXCLUDE_FROM_ALL ${source} ${BONSAI_INTERNAL_SOURCES})
         target_link_libraries(${name} PRIVATE bonsai_common)
         set_target_properties(${name} PROPERTIES
-            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+            RUNTIME_OUTPUT_DIRECTORY "${BONSAI_TEST_OUTPUT_DIR}"
             BUILD_RPATH   "${_bonsai_rpath}"
             INSTALL_RPATH "${_bonsai_rpath}")
         bonsai_link_verilator(${name})
     endfunction()
 
-    bonsai_add_test(bonsai-matmul-smoke "${CMAKE_CURRENT_LIST_DIR}/src/matmul-smoke.cpp")
-    bonsai_add_test(bonsai-driver-bench "${CMAKE_CURRENT_LIST_DIR}/src/driver-bench.cpp")
-    bonsai_add_test(bonsai-asic-probe   "${CMAKE_CURRENT_LIST_DIR}/src/driver-asic-probe.cpp")
+    # matmul-smoke is the verilator-driven RTL parity test; requires verilator.
+    if(BONSAI_ENABLE_VERILATOR)
+        bonsai_add_test(bonsai-matmul-smoke "${CMAKE_CURRENT_LIST_DIR}/test/matmul-smoke.cpp")
+    endif()
+    # Hardware diagnostics: bench Transport.execute round-trip, probe a real chip.
+    bonsai_add_test(bonsai-bench      "${CMAKE_CURRENT_LIST_DIR}/test/bench.cpp")
+    bonsai_add_test(bonsai-asic-probe "${CMAKE_CURRENT_LIST_DIR}/test/asic-probe.cpp")
 endif()

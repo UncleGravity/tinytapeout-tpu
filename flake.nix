@@ -40,8 +40,19 @@
         in {
           test   = mkDevApp pkgs "test"   "cd test && make -B";
           harden = mkDevApp pkgs "harden" "./tt/tt_tool.py --create-user-config && ./tt/tt_tool.py --harden --no-docker";
-          fpga   = mkDevApp pkgs "fpga"   "./tt/tt_fpga.py harden";
           check  = mkDevApp pkgs "check"  "./tt/tt_tool.py --check-docs";
+
+          # FPGA specific
+          tt-firmware = mkDevApp pkgs "tt-firmware" ''
+            echo "Put TT PCB into BOOTSEL mode by powercycling while holding the BOOT button";
+            ./tools/rp_streamer/scripts/flash.sh
+          '';
+          fpga-harden = mkDevApp pkgs "fpga-harden"   "./tt/tt_fpga.py harden";
+          fpga-flash = mkDevApp pkgs "fpga-flash" ''
+            TOP=$(${pkgs.jq}/bin/jq -r '.DESIGN_NAME' src/config_merged.json)
+            python tools/rp_streamer/host/cli.py flash-bitstream "build/$TOP.bin"
+          '';
+
           llama-cli-bonsai = {
             type = "app";
             program = pkgs.lib.getExe bonsai-backend.packages.${system}.llama-cli-bonsai;
@@ -68,7 +79,9 @@
         let
           pkgs = nixpkgs.legacyPackages.${system}; # nixpkgs
           llPkgs = librelane.legacyPackages.${system}; # get librelane pkgs
-          python = llPkgs.python3.withPackages (ps: [ ps.cocotb ]); # use librelane python
+          # Use librelane's python; pyusb is for the rp_streamer host CLI
+          # (vendor-class libusb transport).
+          python = llPkgs.python3.withPackages (ps: [ ps.cocotb ps.pyusb ]);
         in {
           default = pkgs.mkShell {
 

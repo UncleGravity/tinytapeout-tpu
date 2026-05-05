@@ -18,6 +18,9 @@ pico_sdk_init()
 add_executable(rp_echo
     main.c
     usb_descriptors.c
+    ice40_loader.c
+    bitstream_flash.c
+    crc32.c
 )
 
 pico_generate_pio_header(rp_echo ${CMAKE_CURRENT_LIST_DIR}/chip_cycle.pio)
@@ -27,6 +30,9 @@ target_include_directories(rp_echo PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 target_link_libraries(rp_echo
     pico_stdlib
     hardware_pio
+    hardware_spi
+    hardware_flash
+    hardware_sync
     tinyusb_device
     tinyusb_board
 )

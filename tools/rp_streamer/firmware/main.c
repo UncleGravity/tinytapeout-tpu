@@ -7,27 +7,34 @@
 #include "tusb.h"
 
 #include "chip_cycle.pio.h"
+#include "ice40_loader.h"
+#include "bitstream_flash.h"
 
 // Protocol: host sends 5-byte header [mode][n_le_u32] per request.
 //
-// Throughput modes (no chip pin activity):
-//   'T' -> RP transmits N bytes
-//   'R' -> RP receives and drops N bytes
-//   'E' -> RP echoes N bytes
 //   'B' -> RP reboots into USB BOOTSEL (n ignored)
-//
-// Chip-control modes (drive the TT pins):
 //   'a' -> assert chip reset (rst_n LOW), n ignored
 //   'd' -> deassert chip reset (rst_n HIGH), n ignored
 //   'X' -> stream N transactions. Body: 2*N bytes [ui_in, uio_in]+. Reply: N
 //          bytes (uo_out sampled after each clock edge).
+//   'F' -> stream N bytes of iCE40 bitstream into RP2350 flash; on
+//          completion, also re-loads it into the FPGA. Reply: 1 byte
+//          status (0=ok, nonzero=error code from bitstream_flash_end).
+//   'L' -> re-load the bitstream currently stored in flash into the FPGA.
+//          Reply: 1 byte (0=ok, 1=no bitstream stored, 2=load failed).
 //
-// Pin map (ETR demoboard):
+// Pin map (ETR demoboard, chip side):
 //   rst_n      = GPIO14                 (bank 0, SIO)
 //   clk        = GPIO16                 (bank 0, PIO sideset)
 //   ui_in[0:7] = GPIO17:24              (bank 0, PIO OUT)
 //   uio[0:7]   = GPIO25:32              (uio[7]=GPIO32 is bank 1, PIO OUT)
 //   uo_out[0:7]= GPIO33:40              (bank 1, PIO IN)
+//
+// Pin map (FabricFox v2, iCE40 slave-SPI side — see ice40_loader.h):
+//   CRESET_B   = GPIO 1
+//   MOSI       = GPIO 3
+//   SS         = GPIO 5
+//   SCK        = GPIO 6
 //
 // One PIO SM with gpio_base=16 covers GPIOs 16-47 in a single 32-pin window,
 // so OUT/IN can drive across the bank-0/bank-1 boundary atomically.
@@ -84,9 +91,13 @@ static void usb_write_blocking(const uint8_t *p, uint32_t n) {
 int main(void) {
     tud_init(0);
     chip_pins_init();
+    ice40_pins_init();
 
-    static uint8_t buf[4096];
-    for (uint32_t i = 0; i < sizeof(buf); i++) buf[i] = (uint8_t) i;
+    // Auto-load the stored bitstream (if any) into the iCE40 before the
+    // host comes up. Lets the chip survive a power cycle without TT-MP.
+    if (bitstream_flash_present()) {
+        ice40_load_bitstream(bitstream_flash_data(), bitstream_flash_length());
+    }
 
     while (1) {
         uint8_t hdr[5];
@@ -101,42 +112,46 @@ int main(void) {
             tud_vendor_write_flush();
             sleep_ms(50);
             reset_usb_boot(0, 0);
-        } else if (mode == 'T') {
-            uint32_t sent = 0;
-            while (sent < n) {
-                uint32_t want = n - sent;
-                if (want > sizeof(buf)) want = sizeof(buf);
-                usb_write_blocking(buf, want);
-                sent += want;
-            }
-            tud_vendor_write_flush();
-        } else if (mode == 'R') {
-            uint32_t got = 0;
-            while (got < n) {
-                tud_task();
-                if (tud_vendor_available()) {
-                    uint32_t want = n - got;
-                    if (want > sizeof(buf)) want = sizeof(buf);
-                    got += tud_vendor_read(buf, want);
-                }
-            }
-        } else if (mode == 'E') {
-            uint32_t got = 0;
-            while (got < n) {
-                tud_task();
-                if (tud_vendor_available()) {
-                    uint32_t want = n - got;
-                    if (want > sizeof(buf)) want = sizeof(buf);
-                    uint32_t r = tud_vendor_read(buf, want);
-                    usb_write_blocking(buf, r);
-                    got += r;
-                }
-            }
-            tud_vendor_write_flush();
         } else if (mode == 'a') {
             sio_hw->gpio_clr = 1u << PIN_RESET;
         } else if (mode == 'd') {
             sio_hw->gpio_set = 1u << PIN_RESET;
+        } else if (mode == 'F') {
+            // Streaming flash write. Validate up front; reply once at end.
+            if (n == 0 || n > BITSTREAM_MAX_BYTES || !bitstream_flash_begin(n)) {
+                const uint8_t resp = 0xff;  // size invalid / erase failed
+                usb_write_blocking(&resp, 1);
+                tud_vendor_write_flush();
+                continue;
+            }
+            uint32_t remaining = n;
+            uint8_t  rx[1024];
+            while (remaining > 0) {
+                uint32_t want = remaining < sizeof(rx) ? remaining : sizeof(rx);
+                usb_read_blocking(rx, want);
+                bitstream_flash_append(rx, want);
+                remaining -= want;
+            }
+            const int rc = bitstream_flash_end();
+            if (rc == 0) {
+                // Re-load the freshly-written bitstream into the iCE40 so
+                // the chip is alive without a power cycle.
+                ice40_load_bitstream(bitstream_flash_data(),
+                                     bitstream_flash_length());
+            }
+            const uint8_t resp = (uint8_t) rc;
+            usb_write_blocking(&resp, 1);
+            tud_vendor_write_flush();
+        } else if (mode == 'L') {
+            uint8_t resp;
+            if (!bitstream_flash_present()) {
+                resp = 1;
+            } else {
+                resp = ice40_load_bitstream(bitstream_flash_data(),
+                                            bitstream_flash_length()) ? 0 : 2;
+            }
+            usb_write_blocking(&resp, 1);
+            tud_vendor_write_flush();
         } else if (mode == 'X') {
             // Process up to CHUNK cycles at a time: read 2*CHUNK pair bytes,
             // run CHUNK chip cycles into a local response buffer, write

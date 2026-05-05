@@ -1,15 +1,16 @@
 #pragma once
 
-#include "driver.h"
+#include "transport.h"
 
 #include "ggml.h"
 
 #include <cstddef>
 #include <cstdint>
 
-// Layer 2: Bonsai matmul lowering.
-// This layer translates GGML_OP_MUL_MAT tensor metadata into Bonsai tile
-// commands. It owns ggml shape/stride/quant details; drivers stay tensor-free.
+// Matmul lowering.
+// Translates GGML_OP_MUL_MAT tensor metadata into a Plan (a stream of
+// MatmulTile ops) and hands it to a Transport. Owns ggml shape/stride/quant
+// details; the transport stays tensor-free.
 
 namespace bonsai {
 
@@ -46,6 +47,6 @@ struct MatMulJob {
 
 bool make_matmul_job(ggml_tensor * dst, MatMulJob * job);
 bool supports_matmul(const ggml_tensor * op);
-bool run_bonsai_matmul(const MatMulJob & job, BonsaiDriver & driver, DriverKind driver_kind, int n_threads);
+bool run_bonsai_matmul(const MatMulJob & job, Transport & transport);
 
 } // namespace bonsai

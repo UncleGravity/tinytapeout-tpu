@@ -42,11 +42,38 @@ nix develop -c cmake -S tools/bonsai_backend \
 nix develop -c cmake --build tools/bonsai_backend/build
 ```
 
+Outputs:
+- `build/backend/libggml-bonsai.so` — production module loaded via `GGML_BACKEND_PATH`.
+- `build/test/<exe>` — only built when test targets are requested (see below).
+
+To also build the test/diagnostic executables in the same build dir, add
+`-DBONSAI_BUILD_SMOKE_TESTS=ON` (and `-DBONSAI_ENABLE_VERILATOR=ON` for the
+RTL-driven `bonsai-matmul-smoke` parity test):
+
+```sh
+nix develop -c cmake -S tools/bonsai_backend \
+  -B tools/bonsai_backend/build \
+  -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_CPP_BUILD_DIR=$PWD/tools/bonsai_backend/llama.cpp/build-dl \
+  -DBONSAI_BACKEND_SOURCE=$PWD/tools/bonsai_backend/src/ggml-bonsai.cpp \
+  -DBONSAI_BUILD_SMOKE_TESTS=ON \
+  -DBONSAI_ENABLE_VERILATOR=ON
+
+nix develop -c cmake --build tools/bonsai_backend/build \
+  --target ggml-bonsai bonsai-matmul-smoke bonsai-bench bonsai-asic-probe
+```
+
+Then:
+- `build/test/bonsai-matmul-smoke` — verilator-driven RTL parity test (no chip needed).
+- `build/test/bonsai-bench` — measures end-to-end Transport.execute(Plan) latency at varying batch sizes (USB transport; requires real hardware).
+- `build/test/bonsai-asic-probe` — opens the USB transport, times status() and Plan execution at varying batch sizes (requires real hardware).
+
 Verify the dynamic loader can see Bonsai:
 
 ```sh
 nix develop -c env \
-  GGML_BACKEND_PATH=$PWD/tools/bonsai_backend/build/bin/libggml-bonsai.so \
+  GGML_BACKEND_PATH=$PWD/tools/bonsai_backend/build/backend/libggml-bonsai.so \
   tools/bonsai_backend/llama.cpp/build-dl/bin/llama-cli --list-devices
 ```
 
@@ -62,7 +89,7 @@ Run a model with:
 
 ```sh
 nix develop -c env \
-  GGML_BACKEND_PATH=$PWD/tools/bonsai_backend/build/bin/libggml-bonsai.so \
+  GGML_BACKEND_PATH=$PWD/tools/bonsai_backend/build/backend/libggml-bonsai.so \
   BONSAI_TRACE_MATMUL=1 BONSAI_TRACE_LIMIT=8 \
   tools/bonsai_backend/llama.cpp/build-dl/bin/llama-cli \
   -m /Users/angel/Documents/asic/tt-tpu/models/Bonsai-1.7B/Bonsai-1.7B-Q1_0.gguf \

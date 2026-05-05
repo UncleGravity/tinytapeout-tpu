@@ -1,5 +1,5 @@
-#include "driver.h"
 #include "matmul.h"
+#include "transport.h"
 
 #include "ggml.h"
 
@@ -121,16 +121,17 @@ int main() {
         return 1;
     }
 
-    const bonsai::DriverKind kind = bonsai::driver_kind_from_env();
-    std::unique_ptr<bonsai::BonsaiDriver> driver = bonsai::create_bonsai_driver(kind);
-    if (driver == nullptr) {
-        std::fprintf(stderr, "bonsai-matmul-smoke: requested driver is not available\n");
+    // Verilator-driven RTL parity: lowering layer + actual gates, end-to-end.
+    std::unique_ptr<bonsai::Transport> transport = bonsai::create_verilator_transport();
+    if (transport == nullptr) {
+        std::fprintf(stderr, "bonsai-matmul-smoke: verilator transport unavailable "
+                             "(was the build configured with -DBONSAI_ENABLE_VERILATOR=ON?)\n");
         ggml_free(ctx);
         return 1;
     }
 
-    if (!bonsai::run_bonsai_matmul(job, *driver, kind, 1)) {
-        std::fprintf(stderr, "bonsai-matmul-smoke: run_bonsai_matmul failed via %s\n", driver->name());
+    if (!bonsai::run_bonsai_matmul(job, *transport)) {
+        std::fprintf(stderr, "bonsai-matmul-smoke: run_bonsai_matmul failed via %s\n", transport->name());
         ggml_free(ctx);
         return 1;
     }
@@ -155,7 +156,7 @@ int main() {
     }
 
     if (ok) {
-        std::printf("bonsai-matmul-smoke: driver=%s passed\n", driver->name());
+        std::printf("bonsai-matmul-smoke: transport=%s passed\n", transport->name());
     }
 
     ggml_free(ctx);

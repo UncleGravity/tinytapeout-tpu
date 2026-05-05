@@ -1,35 +1,34 @@
 # rp_streamer
 
-RP2350 firmware + host tooling for streaming weights and activations between the
-host (USB) and the TT chip on the ETR demoboard.
-
-Phase 1 (current): pure USB CDC echo for benchmarking the USB-side ceiling.
-Phase 2 (next): PIO-driven chip pin protocol mirroring `test/tt_protocol.py`.
+RP2350 firmware + host tooling for driving the TT chip from the host over USB
+on the ETR demoboard. The firmware exposes the chip's per-cycle (ui_in,
+uio_in) → uo_out interface as a streamed transaction protocol; the bonsai
+backend (tools/bonsai_backend/) is the production consumer.
 
 ## Layout
 
 ```
-firmware/          C + TinyUSB CDC firmware (pico-sdk, RP2350)
-host/bench.py      modal benchmark (T/R/E)
-scripts/flash.sh   flash any UF2; auto-BOOTSEL via 'B' or mpremote
-firmware_backup/   TT-MicroPython UF2 (needed to load FPGA bitstreams)
-shell.nix          dev shell: pico-sdk, arm-gcc, pyserial, mpremote
+firmware/                C + TinyUSB vendor firmware (pico-sdk, RP2350)
+host/protocol.py         shared chip-cycle constants + X-frame helpers
+host/cli.py              host CLI: subcommands `smoke`, `debug`
+host/scaffold/           FPGA bring-up via TT-MicroPython REPL (one-shot)
+scripts/flash.sh         flash any UF2; auto-BOOTSEL via 'B' or mpremote
+firmware_backup/         TT-MicroPython UF2 (needed to load FPGA bitstreams)
+shell.nix                dev shell: pico-sdk, arm-gcc, pyserial, mpremote
 ```
 
-## Findings (USB-only ceiling)
+## USB ceiling (historical — measured during firmware bring-up)
 
-RP2350 native USB is Full-Speed only (12 Mb/s). Numbers below were measured
-on an ETR demoboard at `/dev/tty.usbmodem*`, with the C+TinyUSB CDC firmware in
-this directory; 4 MiB per test, 4 KB chunks, 4 KB CDC FIFOs.
+RP2350 native USB is Full-Speed only (12 Mb/s). Earlier diagnostic firmware
+modes (T tx, R rx, E echo) measured the wire ceiling at ~0.98 MiB/s in each
+direction (4 KB chunks, 4 KB FIFOs). Those modes have been removed; the table
+below is kept as design context.
 
 | Test                            | Throughput     | Notes                       |
 |---------------------------------|----------------|-----------------------------|
 | TX-only (RP -> host)            | 0.794 MiB/s    | TinyUSB IN-EP scheduling    |
 | RX-only (host -> RP)            | 0.976 MiB/s    | ~98% of FS bulk theoretical |
 | Echo (concurrent both ways)     | 0.491 each way | aggregate ~0.98 MiB/s       |
-
-For comparison, MicroPython 1.28 (TT-MP) over raw REPL hit only 0.62 MiB/s TX
-and 0.15 MiB/s RX (windowed-ack overhead). C+TinyUSB removes that.
 
 **USB is the wall.** RP2350 has no built-in HS PHY; the ETR doesn't route an
 external ULPI. The chip itself runs at 2-50 MHz, well above what USB can feed
@@ -71,27 +70,53 @@ hold the BOOT button on the demoboard, tap RESET, release BOOT, then re-run.
 `cat`, not `cp`: macOS's fskit FAT16 mount of the BOOTSEL drive blocks `cp`'s
 metadata copy under sandboxing, but `cat <uf2> > /Volumes/RP2350/...` works.
 
-## Bench
-
-```sh
-python host/bench.py                       # auto-detects /dev/tty.usbmodem*
-python host/bench.py /dev/tty.usbmodem...  # explicit
-```
-
-Runs three tests in sequence: TX-only, RX-only, then concurrent echo.
-Each test sends a 5-byte header `[mode][n_le_u32]` and proceeds.
-
-## Modal protocol (firmware/main.c)
+## Wire protocol (firmware/main.c)
 
 ```
 Header: 5 bytes
-  mode : u8        'T' tx N bytes from RP, 'R' drop N from host,
-                   'E' echo N bytes both ways, 'B' reboot to BOOTSEL.
-  n    : u32 LE    payload length for this test (ignored for 'B').
+  mode : u8        'X' streamed transactions (body follows),
+                   'a' assert chip reset, 'd' deassert chip reset,
+                   'B' reboot RP into USB BOOTSEL,
+                   'F' upload N bytes of iCE40 bitstream into RP flash,
+                   'L' re-load the stored bitstream into the FPGA.
+  n    : u32 LE    payload length for 'X' / 'F'; ignored for a/d/B/L.
+
+'X' body:  2*n bytes [ui_in, uio_in]+; reply: n bytes (uo_out).
+'F' body:  n bytes of bitstream;       reply: 1 byte (0 = ok, nonzero = err).
+'L' body:  none;                       reply: 1 byte (0 = ok, 1 = no
+           bitstream stored, 2 = load failed).
 ```
 
-The firmware loops in mode-select forever, so multiple tests can run on a
-single CDC connection without rebooting between them.
+The firmware loops in mode-select forever; the host (bonsai backend or
+`host/` scripts) drives one or more frames on a single connection.
+
+### Bitstream auto-load on power-up
+
+On boot the firmware checks for a valid bitstream in the top 256 KB of
+flash (header magic `BTSB`); if present, it streams it into the iCE40 over
+slave-SPI before entering the mode loop. **Surviving a power cycle no
+longer needs TT-MicroPython** — flash the bitstream once via `'F'`, and
+every subsequent power-on auto-restores it.
+
+Pin map (FabricFox v2 SPI side, copied verbatim from
+`tt-micropython-firmware/src/ttboard/fpga/fabricfoxv2.py`):
+
+```
+CRESET_B = GPIO 1
+MOSI     = GPIO 3
+SS       = GPIO 5
+SCK      = GPIO 6   (hardware spi0)
+```
+
+Workflow:
+
+```sh
+nix run .#fpga                                                    # build/<top>.bin
+python tools/rp_streamer/host/cli.py flash-bitstream build/<top>.bin
+```
+
+The firmware writes to flash, re-loads the iCE40 immediately, and the
+chip is alive — no TT-MP, no soft-reboot dance.
 
 ## Dev loop with the FabricFox FPGA breakout
 
@@ -120,7 +145,7 @@ FPGA:
 5. **Don't unplug USB.** iCE40 SRAM keeps the bitstream across a subsequent
    RP2350 firmware swap to `rp_streamer`, as long as USB power stays.
 6. `./scripts/flash.sh` — rp_streamer takes over; bitstream is intact.
-7. `python host/bench.py` — bench (current) or stream (phase 2).
+7. `python host/cli.py smoke` — run hand-crafted matmul cases against the chip.
 
 To enable the project at all (no `--set-default`), in the REPL after step 4:
 ```

@@ -99,7 +99,7 @@ let
       runHook preInstall
 
       mkdir -p "$out/lib"
-      cp bin/libggml-bonsai.so "$out/lib/"
+      cp backend/libggml-bonsai.so "$out/lib/"
 
       runHook postInstall
     '';

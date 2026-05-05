@@ -29,7 +29,7 @@ nix run nixpkgs#gh -- api -X POST repos/{owner}/{repo}/pages -f build_type=workf
 nix develop                             # Enter dev shell with all dependencies
 ./tt/tt_tool.py --harden --no-docker    # Harden silicon
 ./tt/tt_fpga.py harden                  # Harden FPGA bitstream
-./tt/tt_fpga.py configure --port /dev/<your-tty> --upload --clockrate 12000000
+./tools/rp_streamer/host/cli.py flash-bitstream build/<top>.bin
 cd test && make -B                      # RTL test
 cd test && make -B GATES=yes            # gate-level test (needs prior harden)
 ```
