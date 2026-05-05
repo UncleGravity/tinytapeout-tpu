@@ -93,33 +93,62 @@ inline int16_t sign_extend_psum(uint16_t raw) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-tile X-frame body layout. A "tile" is one chip-side compute unit:
-//   clear+nop / ldw / lda × cols / seed × psum_bytes / start+nop /
-//   nop × tile_done_pad_cycles / rdp × psum_bytes
+// Per-tile X-frame body layout. Both array rows are always exercised
+// (uniform "fire shape" on the wire — see plan.h). A tile carries optional
+// CLEAR/SEED head and RDP tail, gated by its run flags:
+//
+//   [clear+nop]                 — only when starts_run
+//   ldw × ROWS
+//   lda × COLS
+//   [seed × ROWS × psum_bytes]  — only when starts_run
+//   start+nop
+//   nop × tile_done_pad_cycles
+//   [rdp  × ROWS × psum_bytes]  — only when ends_run
+//
+// Within a multi-tile run, intermediate tiles drop CLEAR/SEED/RDP — the
+// chip's acc_q persists across consecutive STARTs and accumulates each
+// fire's contribution. The acc_mem RTL preserves acc_q on start_pulse;
+// CLEAR (or SEED) at the run head re-zeros it.
 //
 // `tile_done_pad_cycles` covers the chip's compute latency from start_pulse
-// to acc_q being valid for read-back.
+// back to IDLE. RDP bytes are emitted row-major when present:
+// [row0_byte0, row0_byte1, row1_byte0, row1_byte1].
 
 constexpr int tile_done_pad_cycles = 6;
-constexpr int tile_cycles =
-    /* clear+nop  */ 2 +
-    /* ldw        */ 1 +
-    /* lda × cols */ Tile::cols +
-    /* seed bytes */ psum_bytes +
-    /* start+nop  */ 2 +
-    /* done pad   */ tile_done_pad_cycles +
-    /* rdp bytes  */ psum_bytes;
-constexpr int tile_rdp_offset_within_tile = tile_cycles - psum_bytes;
 
-// Fill `dst[2 * tile_cycles]` with one tile's (ui, uio) byte pairs. Caller
-// wraps N tiles in a single 5-byte X-frame header.
-void build_tile_pairs(uint8_t * dst,
-                      uint8_t packed_weights,
-                      const int8_t * acts,
-                      int16_t seed_value);
+// Cycle count at each phase, conditional on run flags.
+constexpr int tile_head_cycles_full     = 2 + Tile::rows * psum_bytes;  // clear+nop + seed
+constexpr int tile_head_cycles_skip     = 0;
+constexpr int tile_body_cycles          = Tile::rows + Tile::cols + 2 + tile_done_pad_cycles;
+constexpr int tile_tail_cycles_full     = Tile::rows * psum_bytes;      // rdp
+constexpr int tile_tail_cycles_skip     = 0;
 
-// Read the row-0 psum out of `rx[tile_index * tile_cycles ..]`. `rx` is the
-// raw uo_out byte stream returned by one X-frame.
-int16_t parse_tile_psum_at(const uint8_t * rx, int tile_index);
+constexpr int tile_cycles_for(bool starts_run, bool ends_run) {
+    return (starts_run ? tile_head_cycles_full : tile_head_cycles_skip)
+         + tile_body_cycles
+         + (ends_run   ? tile_tail_cycles_full : tile_tail_cycles_skip);
+}
+
+// Worst-case (standalone) tile cycle count, kept around so callers that
+// allocate a fixed-stride scratch buffer still have an upper bound.
+constexpr int tile_cycles_max = tile_cycles_for(true, true);
+
+// Fill `dst` with one tile's (ui, uio) byte pairs. `dst` must have room for
+// `2 * tile_cycles_for(starts_run, ends_run)` bytes. Returns the number of
+// chip cycles emitted (== tile_cycles_for(...)). RDP bytes (when present)
+// land at the end of the emitted span; `out_rdp_byte_offset` returns the
+// offset (in uo_out bytes from the start of this tile) of the first RDP
+// result byte, or -1 if the tile doesn't end a run.
+int build_tile_pairs(uint8_t * dst,
+                     const uint8_t * packed_weights,   // [Tile::rows]
+                     const int8_t * acts,              // [Tile::cols]
+                     const int16_t * seeds,            // [Tile::rows]
+                     bool starts_run,
+                     bool ends_run,
+                     int * out_rdp_byte_offset);
+
+// Read row `row` (0..Tile::rows-1) out of the rx byte stream at the given
+// absolute offset (returned by build_tile_pairs).
+int16_t parse_psum_at(const uint8_t * rx, size_t rdp_byte_offset, int row);
 
 } // namespace bonsai

@@ -50,7 +50,15 @@ public:
             // Today only MatmulTile exists; future op kinds will dispatch
             // here too.
             const MatmulTileAttrs & m = op.attrs.matmul_tile;
-            outputs[i] = run_one_matmul_tile(m);
+            int16_t * psum_slot = &outputs[i * (size_t) Tile::rows];
+            run_one_matmul_tile(m, op.starts_run, op.ends_run, psum_slot);
+            if (!op.ends_run) {
+                // Mid-run tiles don't have psums to read yet — match the
+                // USB transport's behavior of leaving zeros in their slot.
+                for (int row = 0; row < Tile::rows; ++row) {
+                    psum_slot[row] = 0;
+                }
+            }
         }
         return true;
     }
@@ -110,19 +118,34 @@ private:
     // Inline equivalent of the chip's per-tile sequence. Mirrors what
     // protocol::build_tile_pairs packs for the USB transport — the two
     // paths must produce the same result for any given tile, which is
-    // exactly what bonsai-matmul-smoke verifies.
-    int16_t run_one_matmul_tile(const MatmulTileAttrs & m) {
-        transact(cmd_clear);
-        transact(cmd_nop);
-        transact(cmd_ldw, m.packed_weights, encode_row_arg(0));
+    // exactly what bonsai-matmul-smoke verifies. When `starts_run` is
+    // false, CLEAR/SEED are skipped (the chip's acc_q persists from the
+    // previous tile in the run). When `ends_run` is false, RDP is skipped
+    // and `out_psums` is left untouched by this call — the run's tail
+    // tile reads them out for everyone.
+    void run_one_matmul_tile(const MatmulTileAttrs & m,
+                             bool starts_run,
+                             bool ends_run,
+                             int16_t * out_psums) {
+        if (starts_run) {
+            transact(cmd_clear);
+            transact(cmd_nop);
+        }
+        for (int row = 0; row < Tile::rows; ++row) {
+            transact(cmd_ldw, m.packed_weights[row], encode_row_arg(row));
+        }
         for (int lane = 0; lane < Tile::cols; ++lane) {
             transact(cmd_lda, (uint8_t) m.acts[lane], encode_col_arg(lane));
         }
-        const uint16_t seed_raw = (uint16_t) m.seed;
-        for (int byte = 0; byte < psum_bytes; ++byte) {
-            transact(cmd_seed,
-                     (uint8_t) ((seed_raw >> (byte * 8)) & 0xffu),
-                     encode_row_byte_arg(0, byte));
+        if (starts_run) {
+            for (int row = 0; row < Tile::rows; ++row) {
+                const uint16_t seed_raw = (uint16_t) m.seeds[row];
+                for (int byte = 0; byte < psum_bytes; ++byte) {
+                    transact(cmd_seed,
+                             (uint8_t) ((seed_raw >> (byte * 8)) & 0xffu),
+                             encode_row_byte_arg(row, byte));
+                }
+            }
         }
         transact(cmd_start);
         transact(cmd_nop);
@@ -130,18 +153,30 @@ private:
         // Wait for DONE. The chip's tile_done_pad_cycles bound is enough
         // for the X-frame path; here we poll defensively up to 128 cycles.
         constexpr int max_polls = 128;
+        bool errored = false;
         for (int i = 0; i < max_polls; ++i) {
             const uint8_t st = transact(cmd_status);
-            if (st & status_error) return 0;
+            if (st & status_error) { errored = true; break; }
             if (st & status_done)  break;
         }
 
-        uint16_t raw = 0;
-        for (int byte = 0; byte < psum_bytes; ++byte) {
-            raw |= (uint16_t) transact(cmd_rdp, 0, encode_row_byte_arg(0, byte))
-                   << (byte * 8);
+        if (!ends_run) {
+            // No RDP this tile — the run-tail tile reads the final acc_q.
+            return;
         }
-        return sign_extend_psum(raw);
+        for (int row = 0; row < Tile::rows; ++row) {
+            if (errored) {
+                out_psums[row] = 0;
+                continue;
+            }
+            uint16_t raw = 0;
+            for (int byte = 0; byte < psum_bytes; ++byte) {
+                raw |= (uint16_t) transact(cmd_rdp, 0,
+                                           encode_row_byte_arg(row, byte))
+                       << (byte * 8);
+            }
+            out_psums[row] = sign_extend_psum(raw);
+        }
     }
 };
 

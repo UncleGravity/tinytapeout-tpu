@@ -53,7 +53,7 @@ int main() {
     {
         constexpr int n = 100;
         bonsai::Plan plan;
-        std::vector<int16_t> outs(1);
+        std::vector<int16_t> outs((size_t) bonsai::Tile::rows);
         auto t0 = clock::now();
         int16_t sink = 0;
         for (int i = 0; i < n; ++i) {
@@ -79,7 +79,7 @@ int main() {
         const int n_batches = total_tiles / batch_size;
         bonsai::Plan plan;
         plan.ops.reserve((size_t) batch_size);
-        std::vector<int16_t> outs((size_t) batch_size);
+        std::vector<int16_t> outs((size_t) batch_size * (size_t) bonsai::Tile::rows);
         auto t0 = clock::now();
         int16_t sink = 0;
         for (int b = 0; b < n_batches; ++b) {

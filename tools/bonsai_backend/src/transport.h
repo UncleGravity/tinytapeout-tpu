@@ -27,10 +27,12 @@ public:
 
     virtual const char * name() const = 0;
 
-    // Execute `plan` and fill `outputs[0..plan.ops.size()-1]` with one
-    // int16 result per op (the row-0 psum for MatmulTile). Returns false
-    // if the underlying transport died mid-execute (USB error, chip
-    // dropped off the bus, etc.); on false, `outputs` is zeroed and any
+    // Execute `plan` and fill `outputs` with `Tile::rows` int16 results per
+    // op (one psum per array row), in row-major order:
+    //   outputs[op_index * Tile::rows + row]
+    // Caller allocates `plan.ops.size() * Tile::rows` int16s.
+    // Returns false if the underlying transport died mid-execute (USB error,
+    // chip dropped off the bus, etc.); on false, `outputs` is zeroed and any
     // future call will keep returning false / a dead status.
     virtual bool execute(const Plan & plan, int16_t * outputs) = 0;
 

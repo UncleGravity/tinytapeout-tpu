@@ -19,7 +19,7 @@ int main() {
         return 1;
     }
 
-    auto bench = [&](int n_tiles, int n_batches, const char * label) {
+    auto bench = [&](int n_tiles, int n_batches, bool one_run, const char * label) {
         bonsai::Plan plan;
         plan.ops.reserve((size_t) n_tiles);
         for (int i = 0; i < n_tiles; ++i) {
@@ -27,9 +27,16 @@ int main() {
                 (int8_t) (i & 0x7f),
                 (int8_t) ((i >> 1) & 0x7f),
             };
-            plan.add_matmul_tile((uint8_t) (i & 0xff), acts, /*seed=*/ 0);
+            const uint8_t weights[bonsai::Tile::rows] = {
+                (uint8_t) (i & 0xff),
+                (uint8_t) ((i * 7) & 0xff),
+            };
+            const int16_t seeds[bonsai::Tile::rows] = { 0, 0 };
+            const bool starts = one_run ? (i == 0)            : true;
+            const bool ends   = one_run ? (i == n_tiles - 1)  : true;
+            plan.add_matmul_tile_dual(weights, acts, seeds, starts, ends);
         }
-        std::vector<int16_t> outs((size_t) n_tiles);
+        std::vector<int16_t> outs((size_t) n_tiles * (size_t) bonsai::Tile::rows);
 
         const auto t0 = std::chrono::steady_clock::now();
         int16_t sink = 0;
@@ -41,18 +48,25 @@ int main() {
 
         const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         const int total = n_tiles * n_batches;
-        std::printf("bonsai-bench: %-12s  %4d tiles/batch  %5d batches  %.1f ms total  %.3f ms/tile  (sink=%d)\n",
+        std::printf("bonsai-bench: %-14s  %4d tiles/batch  %5d batches  %.1f ms total  %.3f ms/tile  (sink=%d)\n",
             label, n_tiles, n_batches, ms, ms / total, (int) sink);
     };
 
-    // Single-tile Plans amortize nothing — measures per-X-frame round-trip.
-    bench(1,   1024, "1/batch");
-    // Increasingly batched Plans — show how much per-tile cost we claw back
-    // by amortizing the USB round-trip.
-    bench(4,    256, "4/batch");
-    bench(16,    64, "16/batch");
-    bench(64,    16, "64/batch");
-    bench(256,    4, "256/batch");
+    // Standalone tiles (each tile is its own run — full CLEAR/SEED/RDP).
+    // Single-tile Plans amortize nothing; bigger batches claw back the USB
+    // round-trip cost.
+    bench(1,   1024, false, "solo  1/batch");
+    bench(4,    256, false, "solo  4/batch");
+    bench(16,    64, false, "solo 16/batch");
+    bench(64,    16, false, "solo 64/batch");
+    bench(256,    4, false, "solo 256/bat");
+
+    // Output-stationary runs. Tiles share the chip's accumulator across the
+    // whole batch — only the head clears, only the tail reads back. Apples-
+    // to-apples with the matching `solo N/batch` row above.
+    bench(16,    64, true,  "run  16/batch");
+    bench(64,    16, true,  "run  64/batch");
+    bench(256,    4, true,  "run 256/batch");
 
     return 0;
 }

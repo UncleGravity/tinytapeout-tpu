@@ -109,35 +109,47 @@ static void quantize_acts_q8_0(const float * a, i64 n, ActQuants & out) {
 }
 
 struct CellScratch {
-    std::vector<float>   w_floats;
+    // One float buffer per array row so a paired (row0, row1) cell can
+    // dequantize both weight rows without churning a single allocation.
+    std::vector<float>   w_floats[Tile::rows];
     std::vector<float>   a_floats;
     ActQuants            act_quants;
     // Reusable Plan + matching output buffer; cleared and re-filled per
     // Q8 sub-block so we keep their backing storage hot across cells.
+    // psums_buf is sized n_tiles * Tile::rows (row-major).
     Plan                 plan;
     std::vector<int16_t> psums_buf;
 };
 
-static bool run_cell(
+// Compute Tile::rows adjacent output rows in lockstep, exercising both rows
+// of the systolic array per chip fire. `row1_idx < 0` means the matmul has
+// an odd n_rows and this call processes only `row0_idx`; the second row's
+// weights/seeds go to zero and its psum is discarded.
+static bool run_cell_pair(
         const MatMulJob & job,
-        i64 linear_index,
+        i64 row0_idx,
+        i64 row1_idx,
+        i64 col,
+        i64 b2,
+        i64 b3,
         Transport & transport,
         CellScratch & scratch) {
-    const i64 row = linear_index % job.n_rows;
-    const i64 rem = linear_index / job.n_rows;
-
-    const i64 b3  = rem / (job.n_b2 * job.n_cols);
-    const i64 b2  = (rem - b3 * job.n_b2 * job.n_cols) / job.n_cols;
-    const i64 col = rem - b3 * job.n_b2 * job.n_cols - b2 * job.n_cols;
-
     const i64 src0_i3 = b3 / job.src0_b3;
     const i64 src0_i2 = b2 / job.src0_b2;
 
-    const void * src0_row =
-        (const char *) job.src0->data +
-        row * job.src0_nb1 +
-        src0_i2 * job.src0_nb2 +
-        src0_i3 * job.src0_nb3;
+    auto src0_row_ptr = [&](i64 row) {
+        return (const char *) job.src0->data +
+            row * job.src0_nb1 +
+            src0_i2 * job.src0_nb2 +
+            src0_i3 * job.src0_nb3;
+    };
+    auto dst_cell_ptr = [&](i64 row) {
+        return (float *) ((char *) job.dst->data +
+            row * job.dst_nb0 +
+            col * job.dst_nb1 +
+            b2 * job.dst_nb2 +
+            b3 * job.dst_nb3);
+    };
 
     const void * src1_row =
         (const char *) job.src1->data +
@@ -145,15 +157,13 @@ static bool run_cell(
         b2 * job.src1_nb2 +
         b3 * job.src1_nb3;
 
-    float * dst_cell =
-        (float *) ((char *) job.dst->data +
-        row * job.dst_nb0 +
-        col * job.dst_nb1 +
-        b2 * job.dst_nb2 +
-        b3 * job.dst_nb3);
-
-    const float * weights = row_to_float(job.src0, src0_row, job.k, scratch.w_floats);
-    const float * acts    = row_to_float(job.src1, src1_row, job.k, scratch.a_floats);
+    const float * weights0 =
+        row_to_float(job.src0, src0_row_ptr(row0_idx), job.k, scratch.w_floats[0]);
+    const float * weights1 = (row1_idx >= 0)
+        ? row_to_float(job.src0, src0_row_ptr(row1_idx), job.k, scratch.w_floats[1])
+        : nullptr;
+    const float * acts =
+        row_to_float(job.src1, src1_row, job.k, scratch.a_floats);
 
     quantize_acts_q8_0(acts, job.k, scratch.act_quants);
 
@@ -163,11 +173,15 @@ static bool run_cell(
     // 32 * 127 = 4064, fits in int16 already), then a single
     // `acc += d_w * d_a * sub_sum` fold per sub-block matches the reference
     // exactly modulo FP add-order across blocks.
-    float acc = 0.0f;
+    float acc[Tile::rows] = { 0.0f, 0.0f };
     for (i64 q1_start = 0; q1_start < job.k; q1_start += k_weight_group) {
         const i64 q1_end = std::min(q1_start + k_weight_group, job.k);
-        const float d_w = weight_group_scale(weights, q1_start, q1_end);
-        if (d_w == 0.0f) {
+
+        float d_w[Tile::rows];
+        d_w[0] = weight_group_scale(weights0, q1_start, q1_end);
+        d_w[1] = (weights1 != nullptr)
+            ? weight_group_scale(weights1, q1_start, q1_end) : 0.0f;
+        if (d_w[0] == 0.0f && d_w[1] == 0.0f) {
             continue;
         }
 
@@ -182,38 +196,63 @@ static bool run_cell(
             const int n_tiles = (int) ((q8_end - q8_start + Tile::cols - 1) / Tile::cols);
             scratch.plan.clear();
             scratch.plan.ops.reserve((size_t) n_tiles);
-            scratch.psums_buf.resize((size_t) n_tiles);
+            scratch.psums_buf.resize((size_t) n_tiles * Tile::rows);
 
+            // Output-stationary across the whole Q8 sub-block: the head
+            // tile zeros acc_q via CLEAR, intermediate tiles just LDW +
+            // LDA + START (no RDP), the tail tile reads the accumulated
+            // psum back. The per-Q8-block sum lands directly in the chip
+            // accumulator so we no longer fold psums on the host.
             for (int t = 0; t < n_tiles; ++t) {
                 const i64 k0 = q8_start + (i64) t * Tile::cols;
-                uint8_t packed_weights = 0;
-                int8_t acts_buf[Tile::cols];
+                uint8_t packed_weights[Tile::rows] = { 0, 0 };
+                int8_t  acts_buf[Tile::cols];
                 for (int lane = 0; lane < Tile::cols; ++lane) {
                     const i64 k = k0 + lane;
-                    const bool weight_bit = k < q8_end && weights[k] >= 0.0f;
-                    packed_weights |= (uint8_t) weight_bit << lane;
-                    acts_buf[lane] =
-                        k < q8_end ? scratch.act_quants.q[(size_t) k] : (int8_t) 0;
+                    if (k < q8_end) {
+                        if (weights0[k] >= 0.0f) {
+                            packed_weights[0] |= (uint8_t) 1 << lane;
+                        }
+                        if (weights1 != nullptr && weights1[k] >= 0.0f) {
+                            packed_weights[1] |= (uint8_t) 1 << lane;
+                        }
+                        acts_buf[lane] = scratch.act_quants.q[(size_t) k];
+                    } else {
+                        acts_buf[lane] = 0;
+                    }
                 }
-                // seed = 0: this Q8 sub-block accumulates fresh; the
-                // per-block partial sum is folded into FP outside the
-                // chip via `d_w * d_a * sub_sum` below.
-                scratch.plan.add_matmul_tile(packed_weights, acts_buf, 0);
+                // seeds = {0, 0}: only honored on the run head where the
+                // chip latches them as acc_q's initial value (CLEAR also
+                // zeros acc_q, so seeds=0 here is redundant but explicit).
+                const int16_t seeds[Tile::rows] = { 0, 0 };
+                const bool starts = (t == 0);
+                const bool ends   = (t == n_tiles - 1);
+                scratch.plan.add_matmul_tile_dual(packed_weights, acts_buf, seeds,
+                                                  starts, ends);
             }
 
             if (!transport.execute(scratch.plan, scratch.psums_buf.data())) {
                 return false;
             }
 
-            int32_t sub_sum = 0;
-            for (int t = 0; t < n_tiles; ++t) {
-                sub_sum += (int32_t) scratch.psums_buf[(size_t) t];
+            // Only the run-tail tile (n_tiles - 1) holds a real psum — the
+            // chip accumulated across the whole sub-block. Earlier slots
+            // were left zero by the transport.
+            const size_t tail = (size_t) (n_tiles - 1) * Tile::rows;
+            const int32_t sub_sum0 = (int32_t) scratch.psums_buf[tail + 0];
+            const int32_t sub_sum1 = (weights1 != nullptr)
+                ? (int32_t) scratch.psums_buf[tail + 1] : 0;
+            acc[0] += d_w[0] * d_a * (float) sub_sum0;
+            if (weights1 != nullptr) {
+                acc[1] += d_w[1] * d_a * (float) sub_sum1;
             }
-            acc += d_w * d_a * (float) sub_sum;
         }
     }
 
-    *dst_cell = acc;
+    *dst_cell_ptr(row0_idx) = acc[0];
+    if (row1_idx >= 0) {
+        *dst_cell_ptr(row1_idx) = acc[1];
+    }
     return true;
 }
 
@@ -300,8 +339,8 @@ bool supports_matmul(const ggml_tensor * op) {
 }
 
 bool run_bonsai_matmul(const MatMulJob & job, Transport & transport) {
-    const i64 work = job.n_rows * job.n_cols * job.n_b2 * job.n_b3;
-    if (work == 0) {
+    if (job.n_rows == 0 || job.n_cols == 0 ||
+            job.n_b2 == 0 || job.n_b3 == 0) {
         return true;
     }
 
@@ -312,10 +351,24 @@ bool run_bonsai_matmul(const MatMulJob & job, Transport & transport) {
     // per-instance) but tests run on small inputs where the overhead is
     // not worth the complexity. Add a Transport::clone() pattern here when
     // a workload actually justifies it.
+    //
+    // Output rows are processed in pairs to use both rows of the 2×2
+    // systolic array per chip fire. An odd `n_rows` falls through one
+    // unpaired tail call where row 1 of the array is fired with zero
+    // weights and its psum discarded.
     CellScratch scratch;
-    for (i64 i = 0; i < work; ++i) {
-        if (!run_cell(job, i, transport, scratch)) {
-            return false;
+    for (i64 b3 = 0; b3 < job.n_b3; ++b3) {
+        for (i64 b2 = 0; b2 < job.n_b2; ++b2) {
+            for (i64 col = 0; col < job.n_cols; ++col) {
+                for (i64 row = 0; row < job.n_rows; row += Tile::rows) {
+                    const i64 row1 = row + 1;
+                    const i64 row1_idx = (row1 < job.n_rows) ? row1 : -1;
+                    if (!run_cell_pair(job, row, row1_idx, col, b2, b3,
+                                       transport, scratch)) {
+                        return false;
+                    }
+                }
+            }
         }
     }
 
