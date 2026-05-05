@@ -6,7 +6,9 @@
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -31,6 +33,11 @@ struct BackendContext {
     uint64_t n_graphs = 0;
     uint64_t n_mul_mat = 0;
     int trace_limit = 0;
+    // -2 = no MUL_MAT seen yet, -1 = last weight wasn't a per-block tensor
+    // (e.g. token_embd / output / lm_head), 0..L-1 = transformer block index.
+    int last_layer_idx = -2;
+    std::chrono::steady_clock::time_point t_start =
+        std::chrono::steady_clock::now();
     std::unique_ptr<bonsai::Transport> transport;
 };
 
@@ -53,6 +60,52 @@ static int get_trace_limit() {
     return env_enabled("BONSAI_TRACE_MATMUL")
         ? env_positive_int("BONSAI_TRACE_LIMIT", 16)
         : 0;
+}
+
+// llama.cpp names per-block weights as "blk.<N>.foo.weight". Anything that
+// doesn't match (token_embd, output norm, lm_head, etc.) returns -1.
+static int parse_layer_idx(const char * name) {
+    if (name == nullptr) return -1;
+    constexpr char prefix[] = "blk.";
+    constexpr size_t prefix_len = sizeof(prefix) - 1;
+    if (std::strncmp(name, prefix, prefix_len) != 0) return -1;
+    const char * p = name + prefix_len;
+    if (*p < '0' || *p > '9') return -1;
+    int idx = 0;
+    while (*p >= '0' && *p <= '9') {
+        idx = idx * 10 + (*p - '0');
+        ++p;
+    }
+    return *p == '.' ? idx : -1;
+}
+
+// Emit one stderr line whenever the per-layer index changes, so a user
+// staring at a multi-hour forward pass can tell where they are. Uses
+// fprintf+fflush directly (rather than GGML_LOG_INFO) so it's not subject
+// to llama.cpp's --verbosity gating or any host-side log buffering.
+static void log_layer_progress(BackendContext & ctx, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const int layer_idx = parse_layer_idx(src0 ? src0->name : nullptr);
+    if (layer_idx == ctx.last_layer_idx) {
+        return;
+    }
+
+    const double elapsed_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - ctx.t_start).count();
+    const unsigned long long n_done = (unsigned long long) ctx.n_mul_mat;
+
+    if (layer_idx >= 0) {
+        std::fprintf(stderr,
+            "bonsai: starting layer %d (after %llu MUL_MAT, %.1fs elapsed)\n",
+            layer_idx, n_done, elapsed_s);
+    } else {
+        std::fprintf(stderr,
+            "bonsai: starting %s (after %llu MUL_MAT, %.1fs elapsed)\n",
+            (src0 && src0->name[0]) ? src0->name : "(unnamed)",
+            n_done, elapsed_s);
+    }
+    std::fflush(stderr);
+    ctx.last_layer_idx = layer_idx;
 }
 
 static bool is_metadata_op(ggml_op op) {
@@ -120,6 +173,7 @@ static enum ggml_status compute_graph(ggml_backend_t backend, ggml_cgraph * cgra
             return GGML_STATUS_FAILED;
         }
 
+        log_layer_progress(*ctx, node);
         ++ctx->n_mul_mat;
         trace_matmul(*ctx, node);
         if (!bonsai::run_bonsai_matmul(job, *ctx->transport)) {
