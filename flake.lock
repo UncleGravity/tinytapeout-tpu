@@ -195,11 +195,11 @@
         "nixpkgs": "nixpkgs_3"
       },
       "locked": {
-        "lastModified": 1777417152,
-        "narHash": "sha256-NN/ds7vdpfko4fvN48SkbI27ExTjL47WBY/4FwAoeBo=",
+        "lastModified": 1777526639,
+        "narHash": "sha256-bZS4apyf9Y32+lcqOXF/rEa0PWSOMwdYZtMjQcJWW4c=",
         "owner": "UncleGravity",
         "repo": "verilog-viewer",
-        "rev": "e862dfbad13375e6563c3a4b96704da863c59faf",
+        "rev": "9c51e4305cc193e025d93b528baab637ae5322d4",
         "type": "github"
       },
       "original": {

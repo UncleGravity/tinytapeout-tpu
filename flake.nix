@@ -38,10 +38,10 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
         in {
-          test   = mkDevApp pkgs "test"   "cd test && make -B";
-          test-gl   = mkDevApp pkgs "test"   "cd test && make -B GATES=yes";
+          test = mkDevApp pkgs "test" "cd test && make -B";
+          test-gl = mkDevApp pkgs "test-gl" "cd test && make -B GATES=yes";
           harden = mkDevApp pkgs "harden" "./tt/tt_tool.py --create-user-config && ./tt/tt_tool.py --harden --no-docker";
-          check  = mkDevApp pkgs "check"  "./tt/tt_tool.py --check-docs";
+          check  = mkDevApp pkgs "check" "./tt/tt_tool.py --check-docs";
 
           # FPGA specific
           tt-firmware = mkDevApp pkgs "tt-firmware" ''
@@ -67,7 +67,7 @@
               if [ -f src/config_merged.json ]; then
                 TOP=$(${pkgs.jq}/bin/jq -r '.DESIGN_NAME // empty' src/config_merged.json)
               fi
-              exec ${verilog-viewer.packages.${system}.default}/bin/verilog-viewer \
+              exec ${pkgs.lib.getExe verilog-viewer.packages.${system}.default} \
                 --rtl 'src/rtl/**/*.{v,sv}' \
                 ''${TOP:+--top "$TOP"} \
                 "$@"
@@ -112,7 +112,6 @@
 
               #
               pkgs.uv
-              pkgs.python314Packages.huggingface-hub
             ];
 
             # ------------------------------------------------------------------

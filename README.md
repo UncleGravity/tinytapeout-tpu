@@ -2,11 +2,15 @@
 
 # Tiny Tapeout 1-Bit TPU
 
-Simple 1-Bit Systolic Array for learning purposes.
+Simple 1-Bit Systolic Array.
 
-> Based on the [official TT Verilog template](https://github.com/TinyTapeout/tt10-verilog-template).
+Do you want your matrix multiplications to go faster? Look elsewhere.
 
-TODO: expand
+This project implements a 2x2 systolic array that computes INT1 weights with INT8 activations, in a single 1x1 tiny tapeout tile.
+
+Comes with custom llama-cpp backend to run the worlds slowest forward pass. An AI decelerator.
+
+Enjoy
 
 ## 2D Preview
 ![png](https://unclegravity.github.io/tt-tpu/gds_render.png)
@@ -26,23 +30,26 @@ nix run nixpkgs#cachix -- use librelane
 nix run nixpkgs#gh -- api -X POST repos/{owner}/{repo}/pages -f build_type=workflow
 
 # Start developing
-nix develop                             # Enter dev shell with all dependencies installed
+nix develop                 # Enter dev shell with all dependencies installed
 
 # RTL
-nix run .#harden                        # Harden silicon
-nix run .#test                          # RTL tests
-nix run .#test-gl                       # Gate level tests
+nix run .#harden            # Harden silicon
+nix run .#test              # RTL tests
+nix run .#test-gl           # Gate level tests
 
 # FPGA
-nix run .#tt-firmware                   # Flash custom RP2350 firmware
-nix run .#fpga-harden                   # Harden FPGA bitstream
-nix run .#fpga-flash                    # Upload bitstream to FPGA (needs custom RP2350 fw)
+nix run .#tt-firmware       # Flash custom RP2350 firmware
+nix run .#fpga-harden       # Harden FPGA bitstream
+nix run .#fpga-flash        # Upload bitstream to FPGA (needs custom RP2350 fw)
+
+# Optional
+nix run .#view              # View RTL digram (like vivado but worse)
 ```
 
 ## Inference
 You can run any 1-bit GGUF model using llama-cpp + a small custom backend made for this project.
 It will be SUPER slow because:
-- We're only using a single Tiny Tapeout tile, so the systolic array is 2x2
+- We're only using a single Tiny Tapeout tile, so the systolic array is 2x2.
 - Most importantly, we're using the RP2350 as the transport, which is limited to 1MB/s
 
 ```sh

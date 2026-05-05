@@ -1,11 +1,11 @@
 # Tiny Tapeout project information
 project:
-  title: "1-Bit TPU" # *Project title
-  author: "UncleGravity" # *Your name
-  discord: "" # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description: "Tiny Tapeout Binary Systolic Array" # *One line description of what your project does
-  language: "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
-  clock_hz: 0 # Clock frequency in Hz (or 0 if not applicable)
+  title: "1-Bit TPU"
+  author: "Angel Viera"
+  discord: "UncleGravity"
+  description: "Tiny Tapeout 1-Bit Systolic Array"
+  language: "SystemVerilog"
+  clock_hz: 50000000 # Clock frequency in Hz (or 0 if not applicable)
 
   # How many tiles your design occupies? A single tile is about 167x108 uM.
   tiles: "1x1" # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
@@ -31,29 +31,29 @@ project:
 # The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
 # This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
 pinout:
-  # Inputs
+  # Inputs: ui_in[2:0]=cmd, ui_in[7:3]=arg (layout depends on cmd)
   ui[0]: "cmd[0]"
   ui[1]: "cmd[1]"
   ui[2]: "cmd[2]"
-  ui[3]: "index[0]"
-  ui[4]: "index[1]"
-  ui[5]: "row"
-  ui[6]: "reserved"
-  ui[7]: "reserved"
+  ui[3]: "arg[0]"
+  ui[4]: "arg[1]"
+  ui[5]: "arg[2]"
+  ui[6]: "arg[3]"
+  ui[7]: "arg[4]"
 
-  # Outputs
-  uo[0]: "status/result[0]"
-  uo[1]: "status/result[1]"
-  uo[2]: "status/result[2]"
-  uo[3]: "status/result[3]"
-  uo[4]: "status/result[4]"
-  uo[5]: "status/result[5]"
-  uo[6]: "status/result[6]"
-  uo[7]: "status/result[7]"
+  # Outputs: status byte, or RDP result byte when cmd=RDP
+  uo[0]: "busy / result[0]"
+  uo[1]: "done / result[1]"
+  uo[2]: "wdone / result[2]"
+  uo[3]: "adone / result[3]"
+  uo[4]: "idle / result[4]"
+  uo[5]: "idle / result[5]"
+  uo[6]: "error / result[6]"
+  uo[7]: "result[7]"
 
-  # Bidirectional pins (used as inputs for the activation byte)
-  uio[0]: "data_in[0] / weight row0"
-  uio[1]: "data_in[1] / weight row1"
+  # Bidirectional pins (input-only): host data byte for LDW/LDA/SEED
+  uio[0]: "data_in[0]"
+  uio[1]: "data_in[1]"
   uio[2]: "data_in[2]"
   uio[3]: "data_in[3]"
   uio[4]: "data_in[4]"
