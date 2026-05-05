@@ -19,39 +19,46 @@ TODO: expand
 # Install Nix
 curl -fsSL https://install.determinate.systems/nix | sh -s -- install
 
-# Use librelane binary cache (will take forever to build otherwise)
+# Use librelane binary cache (makes librelane build much faster)
 nix run nixpkgs#cachix -- use librelane
 
 # Enable GitHub Pages with Actions deployment (docs workflow will fail otherwise)
 nix run nixpkgs#gh -- api -X POST repos/{owner}/{repo}/pages -f build_type=workflow
 
 # Start developing
-nix develop                             # Enter dev shell with all dependencies
-./tt/tt_tool.py --harden --no-docker    # Harden silicon
-./tt/tt_fpga.py harden                  # Harden FPGA bitstream
-./tools/rp_streamer/host/cli.py flash-bitstream build/<top>.bin
-cd test && make -B                      # RTL test
-cd test && make -B GATES=yes            # gate-level test (needs prior harden)
+nix develop                             # Enter dev shell with all dependencies installed
+
+# RTL
+nix run .#harden                        # Harden silicon
+nix run .#test                          # RTL tests
+nix run .#test-gl                       # Gate level tests
+
+# FPGA
+nix run .#tt-firmware                   # Flash custom RP2350 firmware
+nix run .#fpga-harden                   # Harden FPGA bitstream
+nix run .#fpga-flash                    # Upload bitstream to FPGA (needs custom RP2350 fw)
 ```
 
-## What you get
+## Inference
+You can run any 1-bit GGUF model using llama-cpp + a small custom backend made for this project.
+It will be SUPER slow because:
+- We're only using a single Tiny Tapeout tile, so the systolic array is 2x2
+- Most importantly, we're using the RP2350 as the transport, which is limited to 1MB/s
 
-- `nix develop` — full EDA toolchain (librelane, yosys, iverilog, klayout, openroad, magic, netgen, verilator, nextpnr, icestorm) plus `tt-support-tools` and the sky130A PDK, installed automatically on first enter.
-- `nix run .#test` / `.#harden` / `.#fpga` — the common workflows as one-liners.
-- Works on `aarch64-darwin`, `x86_64-linux`, `aarch64-linux`.
-
-| Command | What it does |
-|---|---|
-| `nix run .#test`   | RTL simulation (cocotb + icarus), equivalent to `cd test && make -B` |
-| `nix run .#harden` | ASIC harden flow for Tiny Tapeout (`tt/tt_tool.py --harden --no-docker`) |
-| `nix run .#fpga`   | FPGA bitstream build for the TT FPGA breakout (`tt/tt_fpga.py harden`) |
+```sh
+# After running all the commands in the TLDR
+uvx hf download prism-ml/Bonsai-1.7B-gguf --local-dir ./models/Bonsai-1.7B
+nix run .#llama-cli-bonsai -- \
+  --model models/Bonsai-1.7B/Bonsai-1.7B.gguf \
+  --device Bonsai \
+  --temp 0 --no-warmup
+  --prompt "One eternity later..."
+```
 
 ## CI
-
 The upstream GitHub Actions workflows (`.github/workflows/{gds,docs,test,fpga}.yaml`) are unchanged from Tiny Tapeout.
 
 ## Resources
-
 - [Tiny Tapeout](https://tinytapeout.com) · [FAQ](https://tinytapeout.com/faq/) · [Discord](https://tinytapeout.com/discord)
 - [Local hardening guide](https://www.tinytapeout.com/guides/local-hardening/) · [FPGA breakout guide](https://tinytapeout.com/guides/fpga-breakout/)
 - [LibreLane docs](https://librelane.readthedocs.io/en/stable/)

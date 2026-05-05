@@ -24,3 +24,17 @@ More Info:
 https://tinytapeout.com/guides/local-hardening/
 https://tinytapeout.com/guides/fpga-breakout/
 https://librelane.readthedocs.io/en/stable/
+
+# Verilog
+- Use always_ff @(posedge clk) for sequential logic. synthesis will complain if you accidentally create combinational paths inside it.
+- Use always_comb instead of always @(*) for combinational logic. Synthesis will complain about inferred latches.
+- Keep systemverilog features to a minimum to avoid yosys issues.
+
+# C++
+Use plain structs for data
+Use free functions for pure-ish transformations/checks
+Use OOP only when there is state, ownership, or a replaceable backend boundary
+
+# Tests
+Integration tests live in test/
+Unit tests live in test/unit/

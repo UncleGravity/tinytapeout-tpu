@@ -39,6 +39,7 @@
           pkgs = nixpkgs.legacyPackages.${system};
         in {
           test   = mkDevApp pkgs "test"   "cd test && make -B";
+          test-gl   = mkDevApp pkgs "test"   "cd test && make -B GATES=yes";
           harden = mkDevApp pkgs "harden" "./tt/tt_tool.py --create-user-config && ./tt/tt_tool.py --harden --no-docker";
           check  = mkDevApp pkgs "check"  "./tt/tt_tool.py --check-docs";
 
@@ -81,7 +82,11 @@
           llPkgs = librelane.legacyPackages.${system}; # get librelane pkgs
           # Use librelane's python; pyusb is for the rp_streamer host CLI
           # (vendor-class libusb transport).
-          python = llPkgs.python3.withPackages (ps: [ ps.cocotb ps.pyusb ]);
+          python = llPkgs.python3.withPackages (ps: [
+            ps.cocotb
+            ps.pyusb
+            ps.pytest
+          ]);
         in {
           default = pkgs.mkShell {
 
@@ -93,7 +98,7 @@
               pkgs.icestorm
               pkgs.pdk-ciel
 
-              # Tiny Tapeout tools dependencies
+              # Tiny Tapeout tool dependencies
               python
               pkgs.cairosvg
               pkgs.ggml
@@ -104,6 +109,10 @@
 
               # Testing
               pkgs.surfer
+
+              #
+              pkgs.uv
+              pkgs.python314Packages.huggingface-hub
             ];
 
             # ------------------------------------------------------------------
