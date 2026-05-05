@@ -17,11 +17,28 @@
 //   'd' -> deassert chip reset (rst_n HIGH), n ignored
 //   'X' -> stream N transactions. Body: 2*N bytes [ui_in, uio_in]+. Reply: N
 //          bytes (uo_out sampled after each clock edge).
+//   'M' -> matmul macro mode. Body: 5*N tile descriptors (see below). The
+//          firmware unrolls each descriptor into the chip-cycle stream
+//          locally, so the wire only carries the tile inputs (~5 bytes)
+//          instead of the full per-cycle stimulus (~36 bytes for an
+//          intermediate tile). Reply: 4 bytes per descriptor whose
+//          ends_run flag is set (psum row 0 LE u16, psum row 1 LE u16);
+//          mid-run tiles produce no bytes on the wire.
 //   'F' -> stream N bytes of iCE40 bitstream into RP2350 flash; on
 //          completion, also re-loads it into the FPGA. Reply: 1 byte
 //          status (0=ok, nonzero=error code from bitstream_flash_end).
 //   'L' -> re-load the bitstream currently stored in flash into the FPGA.
 //          Reply: 1 byte (0=ok, 1=no bitstream stored, 2=load failed).
+//
+// 'M' tile descriptor (5 bytes):
+//   byte[0] = flags (bit 0 = starts_run, bit 1 = ends_run)
+//   byte[1] = packed_weights[row 0]   (1 bit per col)
+//   byte[2] = packed_weights[row 1]
+//   byte[3] = acts[col 0] (int8 cast to u8)
+//   byte[4] = acts[col 1]
+// Seeds are always zero (CLEAR at the run head zeros acc_q anyway). If
+// non-zero seeds become needed, extend the protocol with a flag bit + 4
+// optional seed bytes per starts_run tile.
 //
 // Pin map (ETR demoboard, chip side):
 //   rst_n      = GPIO14                 (bank 0, SIO)
@@ -66,6 +83,82 @@ static inline uint8_t chip_cycle(uint8_t ui, uint8_t uio) {
     pio_sm_put_blocking(chip_pio, chip_sm,
                         ((uint32_t) uio << 8) | (uint32_t) ui);
     return (uint8_t) pio_sm_get_blocking(chip_pio, chip_sm);
+}
+
+// ---------------------------------------------------------------------------
+// 'M' mode: tile macro expansion (mirrors src/protocol.h on the host).
+//
+// Tile geometry. ROWS = 2, COLS = 2 are baked into the chip's RTL today so
+// they're hardcoded here too — bumping the array size means a new bitstream
+// AND a new firmware build, no point parameterizing one without the other.
+// ---------------------------------------------------------------------------
+
+#define TILE_ROWS       2
+#define TILE_COLS       2
+#define TILE_PSUM_BYTES 2  /* 16-bit psum, two bytes per row */
+#define TILE_DONE_PAD   6  /* matches src/protocol.h tile_done_pad_cycles */
+
+#define ROW_BITS        1  /* $clog2(TILE_ROWS) */
+
+// Command opcodes. Must match src/rtl/tpu_cmd_decode.v and src/protocol.h.
+enum {
+    CMD_STATUS = 0,
+    CMD_CLEAR  = 1,
+    CMD_LDW    = 2,
+    CMD_LDA    = 3,
+    CMD_SEED   = 4,
+    CMD_START  = 5,
+    CMD_RDP    = 6,
+    CMD_NOP    = 7,
+};
+
+#define TILE_FLAG_STARTS_RUN 0x01u
+#define TILE_FLAG_ENDS_RUN   0x02u
+
+static inline uint8_t pack_ui(uint8_t cmd, uint8_t arg) {
+    return (uint8_t) ((cmd & 0x7u) | ((arg & 0x1fu) << 3));
+}
+
+// Drive one tile's chip-cycle sequence. Mirrors host-side build_tile_pairs;
+// the chip can't tell whether the bytes were unrolled here or sent over USB
+// per cycle, so the verilator parity test still covers this path.
+static void run_tile_macro(uint8_t flags,
+                           uint8_t pw0, uint8_t pw1,
+                           uint8_t a0,  uint8_t a1,
+                           uint8_t * psum_out) {
+    const uint8_t starts_run = flags & TILE_FLAG_STARTS_RUN;
+    const uint8_t ends_run   = flags & TILE_FLAG_ENDS_RUN;
+
+    if (starts_run) {
+        chip_cycle(pack_ui(CMD_CLEAR, 0), 0);
+        chip_cycle(pack_ui(CMD_NOP,   0), 0);
+    }
+    chip_cycle(pack_ui(CMD_LDW, 0), pw0);
+    chip_cycle(pack_ui(CMD_LDW, 1), pw1);
+    chip_cycle(pack_ui(CMD_LDA, 0), a0);
+    chip_cycle(pack_ui(CMD_LDA, 1), a1);
+    if (starts_run) {
+        for (int r = 0; r < TILE_ROWS; r++) {
+            for (int b = 0; b < TILE_PSUM_BYTES; b++) {
+                const uint8_t arg = (uint8_t) ((r & 1) | ((b & 1) << ROW_BITS));
+                chip_cycle(pack_ui(CMD_SEED, arg), 0);
+            }
+        }
+    }
+    chip_cycle(pack_ui(CMD_START, 0), 0);
+    chip_cycle(pack_ui(CMD_NOP,   0), 0);
+    for (int i = 0; i < TILE_DONE_PAD; i++) {
+        chip_cycle(pack_ui(CMD_NOP, 0), 0);
+    }
+    if (ends_run && psum_out != NULL) {
+        for (int r = 0; r < TILE_ROWS; r++) {
+            for (int b = 0; b < TILE_PSUM_BYTES; b++) {
+                const uint8_t arg = (uint8_t) ((r & 1) | ((b & 1) << ROW_BITS));
+                psum_out[r * TILE_PSUM_BYTES + b] =
+                    chip_cycle(pack_ui(CMD_RDP, arg), 0);
+            }
+        }
+    }
 }
 
 static void usb_read_blocking(uint8_t *p, uint32_t n) {
@@ -170,6 +263,40 @@ int main(void) {
                     out_buf[i] = chip_cycle(in_buf[2 * i], in_buf[2 * i + 1]);
                 }
                 usb_write_blocking(out_buf, batch);
+                remaining -= batch;
+            }
+            tud_vendor_write_flush();
+        } else if (mode == 'M') {
+            // Tile macro mode. Each iteration reads up to CHUNK 5-byte tile
+            // descriptors, unrolls them into the chip-cycle stream, and
+            // sends back 4 bytes per ends_run tile. CHUNK is sized so the
+            // tightest inner loop (descriptors → chip_cycle calls) stays
+            // under ~1 ms wall time, which is well within tud_task()'s
+            // tolerance for not being called.
+            enum { CHUNK = 32 };
+            uint8_t in_buf [CHUNK * 5];
+            uint8_t out_buf[CHUNK * TILE_ROWS * TILE_PSUM_BYTES];
+            uint32_t remaining = n;
+            while (remaining > 0) {
+                const uint32_t batch = remaining < CHUNK ? remaining : CHUNK;
+                usb_read_blocking(in_buf, batch * 5);
+                uint32_t out_pos = 0;
+                for (uint32_t i = 0; i < batch; i++) {
+                    const uint8_t flags = in_buf[i * 5 + 0];
+                    const uint8_t pw0   = in_buf[i * 5 + 1];
+                    const uint8_t pw1   = in_buf[i * 5 + 2];
+                    const uint8_t a0    = in_buf[i * 5 + 3];
+                    const uint8_t a1    = in_buf[i * 5 + 4];
+                    uint8_t * slot = (flags & TILE_FLAG_ENDS_RUN)
+                        ? &out_buf[out_pos] : NULL;
+                    run_tile_macro(flags, pw0, pw1, a0, a1, slot);
+                    if (flags & TILE_FLAG_ENDS_RUN) {
+                        out_pos += TILE_ROWS * TILE_PSUM_BYTES;
+                    }
+                }
+                if (out_pos > 0) {
+                    usb_write_blocking(out_buf, out_pos);
+                }
                 remaining -= batch;
             }
             tud_vendor_write_flush();

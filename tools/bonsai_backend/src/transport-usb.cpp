@@ -166,75 +166,70 @@ public:
             return false;
         }
 
-        // Pass 1: compute total wire cycles. Tile size is variable now —
-        // run-internal tiles drop CLEAR/SEED/RDP, so each op contributes a
-        // different amount.
-        uint32_t total_cycles = 0;
-        for (size_t i = 0; i < n; ++i) {
-            total_cycles += (uint32_t) tile_cycles_for(plan.ops[i].starts_run,
-                                                       plan.ops[i].ends_run);
-        }
+        // 'M' (matmul macro) mode: send compact 5-byte tile descriptors and
+        // let the firmware unroll the per-cycle chip stimulus locally. The
+        // chip sees the same byte sequence either way; only the wire shape
+        // changes. ~7x fewer wire bytes per tile vs 'X'.
+        constexpr size_t bytes_per_desc = 5;
+        constexpr size_t bytes_per_psum_set =
+            (size_t) Tile::rows * (size_t) psum_bytes;
 
-        std::vector<uint8_t> tx(5 + 2 * (size_t) total_cycles);
-        std::vector<uint8_t> rx((size_t) total_cycles);
-        tx[0] = 'X';
-        tx[1] = (uint8_t) ( total_cycles        & 0xff);
-        tx[2] = (uint8_t) ((total_cycles >>  8) & 0xff);
-        tx[3] = (uint8_t) ((total_cycles >> 16) & 0xff);
-        tx[4] = (uint8_t) ((total_cycles >> 24) & 0xff);
+        std::vector<uint8_t> tx(5 + n * bytes_per_desc);
+        const uint32_t n_u32 = (uint32_t) n;
+        tx[0] = 'M';
+        tx[1] = (uint8_t) ( n_u32        & 0xff);
+        tx[2] = (uint8_t) ((n_u32 >>  8) & 0xff);
+        tx[3] = (uint8_t) ((n_u32 >> 16) & 0xff);
+        tx[4] = (uint8_t) ((n_u32 >> 24) & 0xff);
 
-        // Pass 2: pack tiles, remembering per-op rx offsets for RDP results.
-        // Ops that don't end a run leave their rdp_offset == SIZE_MAX, and
-        // their psums are filled in from the run-tail tile that follows.
-        std::vector<size_t> rdp_offset(n, (size_t) -1);
-        size_t cycle = 0;
-        size_t pending_run_start = (size_t) -1;
+        size_t expected_rx = 0;
         for (size_t i = 0; i < n; ++i) {
             const PlanOp & op = plan.ops[i];
             const MatmulTileAttrs & m = op.attrs.matmul_tile;
-            int rdp_within = -1;
-            const int tile_n = build_tile_pairs(
-                &tx[5 + 2 * cycle],
-                m.packed_weights, m.acts, m.seeds,
-                op.starts_run, op.ends_run,
-                &rdp_within);
-            if (op.starts_run) {
-                pending_run_start = i;
-            }
-            if (op.ends_run && rdp_within >= 0) {
-                // Every op since pending_run_start writes its psums from
-                // this tail tile's RDP. The chip's acc_q only holds the
-                // FINAL accumulated psum at the run tail, so non-tail ops
-                // in a multi-tile run get the same psum value (the run's
-                // total). matmul.cpp accumulates pre-run, so it only
-                // reads outputs[run_tail * rows + r] in practice.
-                rdp_offset[i] = cycle + (size_t) rdp_within;
-            }
-            cycle += (size_t) tile_n;
-            (void) pending_run_start;
+            uint8_t flags = 0;
+            if (op.starts_run) flags |= 0x01u;
+            if (op.ends_run)   flags |= 0x02u;
+            uint8_t * d = &tx[5 + i * bytes_per_desc];
+            d[0] = flags;
+            d[1] = m.packed_weights[0];
+            d[2] = m.packed_weights[1];
+            d[3] = (uint8_t) m.acts[0];
+            d[4] = (uint8_t) m.acts[1];
+            if (op.ends_run) expected_rx += bytes_per_psum_set;
         }
 
+        std::vector<uint8_t> rx(expected_rx);
+
         std::lock_guard<std::mutex> guard(conn->io_mutex);
-        if (!bulk_write(*conn, tx.data(), tx.size()) ||
-            !bulk_read (*conn, rx.data(), rx.size())) {
+        if (!bulk_write(*conn, tx.data(), tx.size())) {
+            dead = true;
+            std::memset(outputs, 0, out_count * sizeof(int16_t));
+            return false;
+        }
+        if (expected_rx > 0 &&
+                !bulk_read(*conn, rx.data(), rx.size())) {
             dead = true;
             std::memset(outputs, 0, out_count * sizeof(int16_t));
             return false;
         }
 
+        size_t rx_pos = 0;
         for (size_t i = 0; i < n; ++i) {
-            if (rdp_offset[i] == (size_t) -1) {
-                // Tile didn't end a run, no RDP results for it. Zero the
-                // outputs so callers reading these slots don't see junk.
-                for (int row = 0; row < Tile::rows; ++row) {
-                    outputs[i * (size_t) Tile::rows + row] = 0;
-                }
+            const PlanOp & op = plan.ops[i];
+            int16_t * slot = &outputs[i * (size_t) Tile::rows];
+            if (!op.ends_run) {
+                for (int row = 0; row < Tile::rows; ++row) slot[row] = 0;
                 continue;
             }
             for (int row = 0; row < Tile::rows; ++row) {
-                outputs[i * (size_t) Tile::rows + row] =
-                    parse_psum_at(rx.data(), rdp_offset[i], row);
+                const uint8_t * p = &rx[rx_pos + (size_t) row * psum_bytes];
+                uint16_t raw = 0;
+                for (int byte = 0; byte < psum_bytes; ++byte) {
+                    raw |= (uint16_t) p[byte] << (byte * 8);
+                }
+                slot[row] = sign_extend_psum(raw);
             }
+            rx_pos += bytes_per_psum_set;
         }
         return true;
     }
