@@ -127,4 +127,7 @@ if(BONSAI_BUILD_SMOKE_TESTS)
     # Hardware diagnostics: bench Transport.execute round-trip, probe a real chip.
     bonsai_add_test(bonsai-bench      "${CMAKE_CURRENT_LIST_DIR}/test/bench.cpp")
     bonsai_add_test(bonsai-asic-probe "${CMAKE_CURRENT_LIST_DIR}/test/asic-probe.cpp")
+    # End-to-end matmul timing: goes through matmul.cpp + USB so host-side
+    # overhead (quant, dequant, plan build, fold) shows up in the numbers.
+    bonsai_add_test(bonsai-matmul-bench "${CMAKE_CURRENT_LIST_DIR}/test/matmul-bench.cpp")
 endif()
