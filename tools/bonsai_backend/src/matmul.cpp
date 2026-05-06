@@ -135,6 +135,10 @@ struct CellScratch {
 // of the systolic array per chip fire. `row1_idx < 0` means the matmul has
 // an odd n_rows and this call processes only `row0_idx`; the second row's
 // weights/seeds go to zero and its psum is discarded.
+//
+// Activations are pre-quantized by the caller (one quant per (col, b2, b3),
+// reused across every row-pair in that column). The function reads from
+// `scratch.act_quants` directly instead of re-running quantize_acts_q8_0.
 static bool run_cell_pair(
         const MatMulJob & job,
         i64 row0_idx,
@@ -161,21 +165,11 @@ static bool run_cell_pair(
             b3 * job.dst_nb3);
     };
 
-    const void * src1_row =
-        (const char *) job.src1->data +
-        col * job.src1_nb1 +
-        b2 * job.src1_nb2 +
-        b3 * job.src1_nb3;
-
     const float * weights0 =
         row_to_float(job.src0, src0_row_ptr(row0_idx), job.k, scratch.w_floats[0]);
     const float * weights1 = (row1_idx >= 0)
         ? row_to_float(job.src0, src0_row_ptr(row1_idx), job.k, scratch.w_floats[1])
         : nullptr;
-    const float * acts =
-        row_to_float(job.src1, src1_row, job.k, scratch.a_floats);
-
-    quantize_acts_q8_0(acts, job.k, scratch.act_quants);
 
     // Build ONE Plan covering every Q8 sub-block for this cell-pair. The
     // chip resets acc_q at each sub-block's run-head (CLEAR) and reads it
@@ -384,10 +378,23 @@ bool run_bonsai_matmul(const MatMulJob & job, Transport & transport) {
     // systolic array per chip fire. An odd `n_rows` falls through one
     // unpaired tail call where row 1 of the array is fired with zero
     // weights and its psum discarded.
+    //
+    // Activations only depend on (col, b2, b3) — they're shared across the
+    // whole row loop — so dequant + Q8_0 quant is hoisted out of the row
+    // iteration.
     CellScratch scratch;
     for (i64 b3 = 0; b3 < job.n_b3; ++b3) {
         for (i64 b2 = 0; b2 < job.n_b2; ++b2) {
             for (i64 col = 0; col < job.n_cols; ++col) {
+                const void * src1_row =
+                    (const char *) job.src1->data +
+                    col * job.src1_nb1 +
+                    b2 * job.src1_nb2 +
+                    b3 * job.src1_nb3;
+                const float * acts = row_to_float(
+                    job.src1, src1_row, job.k, scratch.a_floats);
+                quantize_acts_q8_0(acts, job.k, scratch.act_quants);
+
                 for (i64 row = 0; row < job.n_rows; row += Tile::rows) {
                     const i64 row1 = row + 1;
                     const i64 row1_idx = (row1 < job.n_rows) ? row1 : -1;
