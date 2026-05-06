@@ -166,13 +166,19 @@ public:
             return false;
         }
 
-        // 'M' (matmul macro) mode: send compact 5-byte tile descriptors and
-        // let the firmware unroll the per-cycle chip stimulus locally. The
-        // chip sees the same byte sequence either way; only the wire shape
-        // changes. ~7x fewer wire bytes per tile vs 'X'.
-        constexpr size_t bytes_per_desc = 5;
+        // 'M' (matmul macro) mode: send compact 3-byte bit-packed tile
+        // descriptors and let the firmware unroll the per-cycle chip
+        // stimulus locally. The chip sees the same byte sequence either
+        // way; only the wire shape changes. The packing fits the 22 bits
+        // of useful state (16 act + 4 weight + 2 flags for ROWS=COLS=2)
+        // into 24 bits, ~40% less wire than the previous 5-byte format.
+        // See firmware/main.c for the byte layout.
+        constexpr size_t bytes_per_desc = 3;
         constexpr size_t bytes_per_psum_set =
             (size_t) Tile::rows * (size_t) psum_bytes;
+        static_assert(Tile::rows == 2 && Tile::cols == 2,
+            "Bit-packed 'M' descriptor layout assumes ROWS=2, COLS=2; "
+            "extend the encoding (and firmware unpacker) for other sizes.");
 
         std::vector<uint8_t> tx(5 + n * bytes_per_desc);
         const uint32_t n_u32 = (uint32_t) n;
@@ -190,11 +196,12 @@ public:
             if (op.starts_run) flags |= 0x01u;
             if (op.ends_run)   flags |= 0x02u;
             uint8_t * d = &tx[5 + i * bytes_per_desc];
-            d[0] = flags;
-            d[1] = m.packed_weights[0];
-            d[2] = m.packed_weights[1];
-            d[3] = (uint8_t) m.acts[0];
-            d[4] = (uint8_t) m.acts[1];
+            d[0] = (uint8_t) m.acts[0];
+            d[1] = (uint8_t) m.acts[1];
+            d[2] = (uint8_t) (
+                  ((uint8_t) m.packed_weights[0] & 0x03u)
+                | (((uint8_t) m.packed_weights[1] & 0x03u) << 2)
+                | ((flags & 0x03u) << 4));
             if (op.ends_run) expected_rx += bytes_per_psum_set;
         }
 

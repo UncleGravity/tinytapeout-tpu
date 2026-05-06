@@ -18,28 +18,33 @@
 //   'd' -> deassert chip reset (rst_n HIGH), n ignored
 //   'X' -> stream N transactions. Body: 2*N bytes [ui_in, uio_in]+. Reply: N
 //          bytes (uo_out sampled after each clock edge).
-//   'M' -> matmul macro mode. Body: 5*N tile descriptors (see below). The
+//   'M' -> matmul macro mode. Body: 3*N tile descriptors (see below). The
 //          firmware unrolls each descriptor into the chip-cycle stream
-//          locally, so the wire only carries the tile inputs (~5 bytes)
-//          instead of the full per-cycle stimulus (~36 bytes for an
-//          intermediate tile). Reply: 4 bytes per descriptor whose
-//          ends_run flag is set (psum row 0 LE u16, psum row 1 LE u16);
-//          mid-run tiles produce no bytes on the wire.
+//          locally, so the wire only carries the tile inputs instead of
+//          the full per-cycle stimulus (~36 bytes for an intermediate
+//          tile). Reply: 4 bytes per descriptor whose ends_run flag is
+//          set (psum row 0 LE u16, psum row 1 LE u16); mid-run tiles
+//          produce no bytes on the wire.
 //   'F' -> stream N bytes of iCE40 bitstream into RP2350 flash; on
 //          completion, also re-loads it into the FPGA. Reply: 1 byte
 //          status (0=ok, nonzero=error code from bitstream_flash_end).
 //   'L' -> re-load the bitstream currently stored in flash into the FPGA.
 //          Reply: 1 byte (0=ok, 1=no bitstream stored, 2=load failed).
 //
-// 'M' tile descriptor (5 bytes):
-//   byte[0] = flags (bit 0 = starts_run, bit 1 = ends_run)
-//   byte[1] = packed_weights[row 0]   (1 bit per col)
-//   byte[2] = packed_weights[row 1]
-//   byte[3] = acts[col 0] (int8 cast to u8)
-//   byte[4] = acts[col 1]
+// 'M' tile descriptor (3 bytes — bit-packed for ROWS=2, COLS=2):
+//   byte[0] = acts[col 0]   (int8 cast to u8)
+//   byte[1] = acts[col 1]
+//   byte[2] = packed bits:
+//             bits[0..1] = packed_weights[row 0] (one bit per col)
+//             bits[2..3] = packed_weights[row 1]
+//             bit [4]    = starts_run
+//             bit [5]    = ends_run
+//             bits[6..7] = reserved (must be 0)
 // Seeds are always zero (CLEAR at the run head zeros acc_q anyway). If
 // non-zero seeds become needed, extend the protocol with a flag bit + 4
-// optional seed bytes per starts_run tile.
+// optional seed bytes per starts_run tile. The previous 5-byte format
+// wasted ~45% of the wire (only 22 of 40 bits were meaningful per tile);
+// the 3-byte form preserves all useful state and cuts wire traffic ~40%.
 //
 // Pin map (ETR demoboard, chip side):
 //   rst_n      = GPIO14                 (bank 0, SIO)
@@ -276,26 +281,27 @@ int main(void) {
             }
             tud_vendor_write_flush();
         } else if (mode == 'M') {
-            // Tile macro mode. Each iteration reads up to CHUNK 5-byte tile
-            // descriptors, unrolls them into the chip-cycle stream, and
-            // sends back 4 bytes per ends_run tile. CHUNK is sized so the
-            // tightest inner loop (descriptors → chip_cycle calls) stays
-            // under ~1 ms wall time, which is well within tud_task()'s
-            // tolerance for not being called.
+            // Tile macro mode. Each iteration reads up to CHUNK 3-byte
+            // bit-packed tile descriptors, unrolls them into the chip-
+            // cycle stream, and sends back 4 bytes per ends_run tile.
+            // CHUNK is sized so the tightest inner loop (descriptors →
+            // chip_cycle calls) stays under ~1 ms wall time, which is
+            // well within tud_task()'s tolerance for not being called.
             enum { CHUNK = 32 };
-            uint8_t in_buf [CHUNK * 5];
+            uint8_t in_buf [CHUNK * 3];
             uint8_t out_buf[CHUNK * TILE_ROWS * TILE_PSUM_BYTES];
             uint32_t remaining = n;
             while (remaining > 0) {
                 const uint32_t batch = remaining < CHUNK ? remaining : CHUNK;
-                usb_read_blocking(in_buf, batch * 5);
+                usb_read_blocking(in_buf, batch * 3);
                 uint32_t out_pos = 0;
                 for (uint32_t i = 0; i < batch; i++) {
-                    const uint8_t flags = in_buf[i * 5 + 0];
-                    const uint8_t pw0   = in_buf[i * 5 + 1];
-                    const uint8_t pw1   = in_buf[i * 5 + 2];
-                    const uint8_t a0    = in_buf[i * 5 + 3];
-                    const uint8_t a1    = in_buf[i * 5 + 4];
+                    const uint8_t a0     = in_buf[i * 3 + 0];
+                    const uint8_t a1     = in_buf[i * 3 + 1];
+                    const uint8_t packed = in_buf[i * 3 + 2];
+                    const uint8_t pw0    = (uint8_t) ( packed       & 0x03u);
+                    const uint8_t pw1    = (uint8_t) ((packed >> 2) & 0x03u);
+                    const uint8_t flags  = (uint8_t) ((packed >> 4) & 0x03u);
                     uint8_t * slot = (flags & TILE_FLAG_ENDS_RUN)
                         ? &out_buf[out_pos] : NULL;
                     run_tile_macro(flags, pw0, pw1, a0, a1, slot);
