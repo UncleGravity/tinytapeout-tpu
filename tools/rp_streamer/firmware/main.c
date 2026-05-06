@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include "pico/stdlib.h"
 #include "pico/bootrom.h"
+#include "hardware/clocks.h"
 #include "hardware/gpio.h"
 #include "hardware/pio.h"
 #include "hardware/structs/sio.h"
@@ -182,6 +183,14 @@ static void usb_write_blocking(const uint8_t *p, uint32_t n) {
 }
 
 int main(void) {
+    // Overclock from the SDK's default 150 MHz to 180 MHz so the PIO can
+    // drive the chip at ~45 MHz (4-instruction loop × 5.56 ns ≈ 22 ns
+    // chip cycle). The FPGA bitstream is hardened at TT_FPGA_FREQ=45 with
+    // ~6 MHz timing margin (nextpnr Fmax ~51 MHz). RP2350's spec range
+    // covers this sysclk comfortably; if the chip flakes, drop to 150 MHz
+    // and `[1]` delays in chip_cycle.pio for ~30 MHz chip cycle.
+    set_sys_clock_khz(180000, true);
+
     tud_init(0);
     chip_pins_init();
     ice40_pins_init();

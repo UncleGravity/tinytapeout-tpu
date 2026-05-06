@@ -48,7 +48,7 @@
             echo "Put TT PCB into BOOTSEL mode by powercycling while holding the BOOT button";
             ./tools/rp_streamer/scripts/flash.sh
           '';
-          fpga-harden = mkDevApp pkgs "fpga-harden"   "./tt/tt_fpga.py harden";
+          fpga-harden = mkDevApp pkgs "fpga-harden"   "TT_FPGA_FREQ=\${TT_FPGA_FREQ:-45} ./tt/tt_fpga.py harden";
           fpga-flash = mkDevApp pkgs "fpga-flash" ''
             TOP=$(${pkgs.jq}/bin/jq -r '.DESIGN_NAME' src/config_merged.json)
             python tools/rp_streamer/host/cli.py flash-bitstream "build/$TOP.bin"

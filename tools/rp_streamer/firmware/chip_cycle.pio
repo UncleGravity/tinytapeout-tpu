@@ -4,11 +4,30 @@
 ;
 ; Wire format: TX FIFO low 16 bits = ui | (uio << 8). RX FIFO low byte = uo_out.
 ;
-; Timing at 150 MHz sysclk: 64+64 = ~427 ns setup + ~427 ns hold ≈ 854 ns per
-; chip cycle (1.17 M cycles/sec on the device side, well above the FS-USB host
-; ceiling). This matches the C version's delay_cycles(32) busy loop, which
-; was validated end-to-end by matmul_smoke. The 4 [15] NOPs per side land 64
-; cycles each because .side_set 1 caps the delay field at 4 bits ([15] max).
+; Timing at 180 MHz sysclk (overclock — see main.c set_sys_clock_khz):
+;   pull(1) + out[3](4) + nop[3](4) + in(1) = 10 sysclks = ~55 ns chip cycle
+;   = ~18 MHz on the chip. Conservative setting — nextpnr's worst-case
+;   FPGA delays force the floor; see analysis below.
+;
+; The TT_FPGA_FREQ=45 hardened bitstream reports two end-to-end delays
+; from nextpnr's timing analysis that constrain how fast we can drive
+; the chip from PIO regardless of the harden target:
+;
+;   async    -> posedge clk:  22.03 ns  (chip input setup time)
+;   posedge clk -> async   :  15.35 ns  (clock-to-output)
+;
+; So pins must be stable at the chip's input pads at least 22 ns before
+; the clk rising edge, and uo_out is only valid 15+ ns after the rising
+; edge. At 180 MHz sysclk (5.56 ns/cycle) those round up to 4 sysclks of
+; clk-low setup (out [3]) and 3 sysclks of clk-high settle (nop [2]).
+; The [3] each side here adds a sysclk of margin to absorb the gap
+; between nextpnr's model and the iCE40 part's actual delays.
+;
+; Walk-back ladder if the chip still flakes (sink != -150 on probe):
+;   [3] each side at 180 MHz sysclk      →  ~55 ns/cycle  (~18 MHz, this)
+;   [4] each side at 180 MHz             →  ~67 ns/cycle  (~15 MHz)
+;   [7] each side at 150 MHz             →  ~120 ns/cycle (~8 MHz)
+;   [15] each side at 150 MHz            →  ~227 ns/cycle (4.4 MHz, very safe)
 
 .pio_version 1
 .program chip_cycle
@@ -19,14 +38,8 @@
     ; binding. Autopull is "lazy" — the SM advances into the next OUT before
     ; stalling, shifting stale OSR onto the pins and producing a phantom IN.
     pull block     side 0
-    out pins, 16   side 0 [15]
-    nop            side 0 [15]
-    nop            side 0 [15]
-    nop            side 0 [15]
-    nop            side 1 [15]   ; clk hi — chip latches on rising edge
-    nop            side 1 [15]
-    nop            side 1 [15]
-    nop            side 1 [15]
+    out pins, 16   side 0 [3]
+    nop            side 1 [3]    ; clk hi — chip latches on rising edge
     in  pins, 8    side 0
 .wrap
 
