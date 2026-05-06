@@ -8,12 +8,12 @@ Do you want your matrix multiplications to go faster? Look elsewhere.
 
 This project implements a 2x2 systolic array that computes INT1 weights with INT8 activations, in a single 1x1 tiny tapeout tile.
 
-Comes with custom llama-cpp backend to run the worlds slowest forward pass. An AI decelerator.
+Comes with custom llama-cpp backend to run the worlds slowest forward pass. The first AI decelerator.
 
 Enjoy
 
 ## 2D Preview
-![png](https://unclegravity.github.io/tt-tpu/gds_render.png)
+![png](https://unclegravity.github.io/tinytapeout-tpu/gds_render.png)
 
 ## 3D Viewer
 [Open 3D viewer](https://gds-viewer.tinytapeout.com/?model=https://unclegravity.github.io/tt-tpu/tinytapeout.oas&pdk=sky130A)
