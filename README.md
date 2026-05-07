@@ -6,7 +6,7 @@ Simple 1-Bit Systolic Array.
 
 Do you want your matrix multiplications to go faster? Look elsewhere.
 
-This project implements a 2x2 weight stationary systolic array that computes matrices with binary {-1,+1} weights and INT8 activations. Designed to fit in a single 1x1 tiny tapeout tile.
+This project implements a 2x2 weight stationary systolic array that computes matrices with binary {-1,+1} weights and INT8 activations. Designed to fit in a single 1x1 [Tiny Tapeout](https://tinytapeout.com/) tile.
 
 Comes with custom llama-cpp backend to run the worlds slowest forward pass. The first AI decelerator.
 
