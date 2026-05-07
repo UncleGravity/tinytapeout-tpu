@@ -6,11 +6,14 @@ Simple 1-Bit Systolic Array.
 
 Do you want your matrix multiplications to go faster? Look elsewhere.
 
-This project implements a 2x2 systolic array that computes INT1 weights with INT8 activations, in a single 1x1 tiny tapeout tile.
+This project implements a 2x2 weight stationary systolic array that computes matrices with binary {-1,+1} weights and INT8 activations. Designed to fit in a single 1x1 tiny tapeout tile.
 
 Comes with custom llama-cpp backend to run the worlds slowest forward pass. The first AI decelerator.
 
-Enjoy
+Enjoy?
+
+Note:
+To prototype, requires [Tiny Tapeout FPGA Dev Kit](https://store.tinytapeout.com/products/FPGA-Development-Kit-p813805747)
 
 ## 2D Preview
 ![png](https://unclegravity.github.io/tinytapeout-tpu/gds_render.png)
@@ -26,9 +29,6 @@ curl -fsSL https://install.determinate.systems/nix | sh -s -- install
 # Use librelane binary cache (makes librelane build much faster)
 nix run nixpkgs#cachix -- use librelane
 
-# Enable GitHub Pages with Actions deployment (docs workflow will fail otherwise)
-nix run nixpkgs#gh -- api -X POST repos/{owner}/{repo}/pages -f build_type=workflow
-
 # Start developing
 nix develop                 # Enter dev shell with all dependencies installed
 
@@ -40,10 +40,15 @@ nix run .#test-gl           # Gate level tests
 # FPGA
 nix run .#tt-firmware       # Flash custom RP2350 firmware
 nix run .#fpga-harden       # Harden FPGA bitstream
-nix run .#fpga-flash        # Upload bitstream to FPGA (needs custom RP2350 fw)
+nix run .#fpga-flash        # Upload bitstream to FPGA (needs custom RP2350 fw mentioned above)
 
 # Optional
 nix run .#view              # View RTL digram (like vivado but worse)
+
+# Only if you want to fork it:
+# Enable GitHub Pages with Actions deployment
+# (docs workflow will fail otherwise)
+nix run nixpkgs#gh -- api -X POST repos/{owner}/{repo}/pages -f build_type=workflow
 ```
 
 ## Inference
