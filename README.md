@@ -19,7 +19,7 @@ To prototype, requires [Tiny Tapeout FPGA Dev Kit](https://store.tinytapeout.com
 ![png](https://unclegravity.github.io/tinytapeout-tpu/gds_render.png)
 
 ## 3D Viewer
-[Open 3D viewer](https://gds-viewer.tinytapeout.com/?model=https://unclegravity.github.io/tt-tpu/tinytapeout.oas&pdk=sky130A)
+[Open 3D viewer](https://gds-viewer.tinytapeout.com/?model=https://unclegravity.github.io/tinytapeout-tpu/tinytapeout.oas&pdk=sky130A)
 
 ## TLDR:
 ```sh
