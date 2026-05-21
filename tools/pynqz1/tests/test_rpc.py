@@ -1,0 +1,107 @@
+from __future__ import annotations
+
+import socket
+import threading
+
+import pytest
+
+from runtime.allocator import fake_allocator
+from runtime.bonsai_rpc import RpcClient, RpcRemoteError
+from runtime.bonsaid import BonsaiRpcServer, BonsaiRuntime
+
+
+@pytest.fixture
+def rpc_server():
+    allocator = fake_allocator(total_bytes=1024 * 1024, slab_bytes=128 * 1024)
+    runtime = BonsaiRuntime(allocator, overlay_id="test-overlay")
+    server = BonsaiRpcServer(("127.0.0.1", 0), runtime)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.fixture
+def client(rpc_server):
+    with socket.create_connection(rpc_server.server_address, timeout=2) as sock:
+        yield RpcClient(sock)
+
+
+def test_hello_reports_memory_and_capabilities(client):
+    response, payload = client.call("HELLO")
+
+    assert payload == b""
+    result = response["result"]
+    assert result["abi_version"] == 1
+    assert result["server"] == "bonsaid"
+    assert result["overlay_id"] == "test-overlay"
+    assert result["memory"]["total_bytes"] == 1024 * 1024
+    assert "ALLOC_TENSOR" in result["capabilities"]
+    assert "DOWNLOAD_TENSOR" in result["capabilities"]
+
+
+def test_allocate_upload_download_and_free_cross_slab_tensor(client):
+    nbytes = 300 * 1024
+    source = bytes((i * 17 + 3) % 251 for i in range(nbytes))
+
+    response, _ = client.call(
+        "ALLOC_TENSOR",
+        nbytes=nbytes,
+        shape=[1024, 300],
+        dtype="u8",
+        usage="activation",
+        layout="raw",
+    )
+    tensor = response["result"]["tensor"]
+    handle = tensor["handle"]
+
+    assert tensor["nbytes"] == nbytes
+    assert tensor["shape"] == [1024, 300]
+    assert tensor["extent_count"] >= 3
+
+    response, payload = client.call(
+        "UPLOAD_TENSOR",
+        payload=source,
+        handle=handle,
+        offset=0,
+    )
+    assert payload == b""
+    assert response["result"]["written"] == nbytes
+
+    response, payload = client.call(
+        "DOWNLOAD_TENSOR",
+        handle=handle,
+        offset=65531,
+        size=100_000,
+    )
+    assert response["result"]["read"] == 100_000
+    assert payload == source[65531 : 65531 + 100_000]
+
+    response, payload = client.call("FREE_TENSOR", handle=handle)
+    assert payload == b""
+    memory = response["result"]["memory"]
+    assert memory["free_bytes"] == memory["total_bytes"]
+    assert memory["tensor_count"] == 0
+
+
+def test_bounds_errors_are_reported(client):
+    response, _ = client.call("ALLOC_TENSOR", nbytes=16)
+    handle = response["result"]["tensor"]["handle"]
+
+    with pytest.raises(RpcRemoteError) as exc:
+        client.call("DOWNLOAD_TENSOR", handle=handle, offset=8, size=16)
+
+    assert exc.value.code == "out_of_bounds"
+
+
+def test_unknown_op_is_reported(client):
+    with pytest.raises(RpcRemoteError) as exc:
+        client.call("RUN_GRAPH", ops=[])
+
+    assert exc.value.code == "unsupported_op"
+
