@@ -1,0 +1,133 @@
+@startuml pynqz1_architecture_overview
+title PYNQ-Z1 Bonsai Accelerator - Architecture Overview
+scale max 1600 width
+
+skinparam shadowing false
+skinparam componentStyle rectangle
+skinparam packageStyle rectangle
+skinparam linetype ortho
+skinparam defaultFontName Monospaced
+skinparam defaultFontSize 11
+skinparam ArrowFontSize 10
+skinparam ArrowColor #555555
+skinparam ArrowThickness 1.1
+skinparam NoteBackgroundColor #FFFCE6
+skinparam NoteBorderColor #BFA800
+hide stereotype
+
+!$ours_lib = "#FFE6B0"
+!$ours_rt  = "#FFD085"
+!$upstream = "#EDEDED"
+!$host     = "#F7F7F7"
+!$board    = "#DCE7F3"
+!$ps       = "#C7D8EC"
+!$pl       = "#A9C8EB"
+!$ddr      = "#D9CEF0"
+
+node "Host" as HOST $host {
+  package "llama.cpp process" as LLCPP {
+    component "llama-cli / server\nsampling loop\nmodel load" as APP
+
+    package "upstream llama.cpp / ggml" as GGML $upstream;line.dashed {
+      component "libllama\ntokenizer, sampler, KV policy" as LIBLLAMA
+      component "libggml-base\ngraph, scheduler, allocator" as GGML_BASE
+      component "libggml-cpu.so\nfallback backend" as CPU
+    }
+
+    package "libggml-pynq.so\nout-of-tree backend (ours)" as BACKEND $ours_lib {
+      component "device API\nbackend registry\nop support" as DEV_API
+      component "device buffers\ntensor handles\nset/get/cpy hooks" as BUFFERS
+      component "lowering\nnode or fused region\n-> kernel command" as LOWER
+      component "transport client\nversioned TCP/RPC\nserializer" as TX
+    }
+  }
+}
+
+cloud "Ethernet\ncontrol RPC + explicit bulk copies" as NET
+
+node "PYNQ-Z1 board\nZynq XC7Z020 + 512 MB DDR3" as BOARD $board {
+  package "PS: ARM + PYNQ Linux" as PS $ps {
+    package "bonsaid runtime daemon (ours)" as DAEMON $ours_rt {
+      component "RPC server\nsessions, versioning,\nerror codes" as RPC
+      component "tensor registry\nhandle -> region,\nformat, layout" as REGISTRY
+      component "DDR arena allocator\nCMA buffers,\nalignment policy" as ALLOC
+      component "submission engine\nrings, flushes,\ndoorbells, fences" as SUBMIT
+      component "overlay + metrics\nbitstream load,\ncounters, traces" as OVERLAY
+    }
+
+    component "PYNQ / Linux access\nallocate, mmap, UIO/XRT,\ncache maintenance" as KSTACK $upstream;line.dashed
+  }
+
+  database "DDR3" as DDR $ddr {
+    component "weight arena\nresident board-native weights" as DDR_W
+    component "tensor arena\nactivations, outputs,\nKV, scratch" as DDR_T
+    component "control rings\ncommands, completions" as DDR_R
+  }
+
+  package "PL: FPGA overlay" as PL $pl {
+    component "AXI-Lite control\nregs, doorbell,\nstatus, counters" as AXIL
+    component "descriptor engine\nfetch, decode,\nschedule kernels" as DESC
+    component "memory engines\nAXI HP read/write,\nBRAM/FIFO staging" as MEM
+    component "W1A8 kernel\nmatmul/GEMV datapath\nscale + writeback" as KERNEL
+  }
+}
+
+APP --> GGML_BASE : build graph
+GGML_BASE --> CPU : unsupported ops
+GGML_BASE --> DEV_API : supported ops / buffers
+DEV_API --> BUFFERS
+BUFFERS --> LOWER : resident tensor ids
+LOWER --> TX : alloc/upload/run/download
+
+TX -down-> NET
+NET -down-> RPC
+
+RPC --> REGISTRY
+REGISTRY --> ALLOC
+ALLOC --> KSTACK
+RPC --> SUBMIT : run command
+SUBMIT --> KSTACK : flush/invalidate, mmap
+OVERLAY --> KSTACK : load/control/counters
+
+REGISTRY -down-> DDR_W
+REGISTRY -down-> DDR_T
+SUBMIT -down-> DDR_R
+
+SUBMIT -right-> AXIL : doorbell / fence poll
+AXIL --> DESC
+DESC -down-> DDR_R : descriptors / completions
+DESC --> MEM : kernel work
+MEM <--> DDR_W : weight bursts
+MEM <--> DDR_T : tensor bursts
+MEM --> KERNEL : staged operands
+KERNEL --> MEM : outputs
+KERNEL --> AXIL : counters / errors
+
+note right of BACKEND
+  Host-visible contract:
+  - tensor handles, not physical addresses
+  - versioned RPC
+  - board-native layouts prepared at upload time
+end note
+
+note right of DAEMON
+  Runtime contract:
+  - owns DDR allocation and physical addresses
+  - owns cache-maintenance ordering
+  - converts RPC commands into PL descriptors
+end note
+
+note right of PL
+  PL contract:
+  - consumes board-private descriptors
+  - moves tensors through AXI HP ports
+  - reports completion, errors, and counters
+end note
+
+note bottom of DDR
+  Design goal:
+  weights and intermediate tensors remain resident.
+  Host transfers happen at model load and unavoidable boundaries.
+end note
+
+@enduml

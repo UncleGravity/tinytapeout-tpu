@@ -1,0 +1,13 @@
+Vivado VM
+
+- Use commands through local nix: nix develop -c ssh 10.211.55.3 ...
+- Host verified: 10.211.55.3, hostname ANGELVIERA7B7F.
+- Vivado path: C:\AMDDesignTools\2025.2.1\Vivado\bin\vivado.bat
+- Version verified: Vivado 2025.2.1.
+- PYNQ-Z1 board part installed and visible:
+  www.digilentinc.com:pynq-z1:part0:1.0
+- Board files installed under:
+  C:\AMDDesignTools\2025.2.1\Vivado\data\xhub\boards\XilinxBoardStore\boards\Xilinx\pynq-z1
+
+Example version check:
+nix develop -c ssh 10.211.55.3 'powershell -NoProfile -Command "Invoke-Expression \"C:\\AMDDesignTools\\2025.2.1\\Vivado\\bin\\vivado.bat -version\""'

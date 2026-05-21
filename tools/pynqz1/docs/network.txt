@@ -1,0 +1,37 @@
+PYNQ-Z1 network notes
+
+Host-to-board network was measured with iperf3 from the Mac host to the PYNQ-Z1.
+
+Basic TCP test:
+  10 seconds
+  sender:   609 Mbit/s
+  receiver: 607 Mbit/s
+
+UDP test after cable swap:
+  requested: 1000 Mbit/s
+  sender:     966 Mbit/s
+  receiver:   413 Mbit/s
+  loss:       0%
+  jitter:     0.037 ms
+
+Rough upload times:
+  236 MiB weights at 72 MiB/s: about 3.3 seconds
+  296 MiB full DMA heap at 72 MiB/s: about 4.1 seconds
+
+Useful commands:
+  # Benchmarking
+  iperf3 -s # on FPGA
+  iperf3 -c 192.168.1.196 # on host
+  iperf3 -c 192.168.1.196 -u -b 1000M # on host
+
+  # Force ethernet to 1 Gigabit
+  sudo ethtool -s eth0 speed 1000 duplex full autoneg on
+
+  # View Eth stats
+  sudo ethtool eth0
+  sudo ethtool -r eth0 # force renegotiation
+
+If results fall back to about 94 Mbit/s:
+  Check the switch/router port, cable, USB/Ethernet adapter, and negotiated link
+  speed on both sides. That speed is exactly what a healthy 100 Mbit/s link
+  looks like.

@@ -1,0 +1,66 @@
+Objective
+
+Build a PYNQ-Z1 version of Bonsai that works as a real llama.cpp / ggml accelerator.
+
+The board should act like a device with its own memory:
+- llama.cpp loads an out-of-tree `libggml-pynq.so` backend.
+- Weights are uploaded to PYNQ DDR once at model load.
+- Intermediate tensors stay in PYNQ DDR whenever possible.
+- The host sends graph work and receives only status, counters, and final outputs such as logits.
+- PL handles the W1A8 matmul/GEMV work. PS can run simple glue ops when that avoids copying tensors back to the host.
+
+Architecture
+
+- Host: llama.cpp + ggml scheduler + `libggml-pynq.so`.
+- Backend: owns ggml device buffers, tensor handles, op support checks, lowering, and TCP/RPC transport.
+- Board runtime: `bonsaid` on PYNQ Linux. Owns overlay load, DDR allocation, tensor registry, cache maintenance, command submission, status, and counters.
+- PL overlay: AXI-Lite control, DDR command/completion rings, AXI HP memory engines, and a W1A8 compute core derived from `src/rtl`.
+- DDR: resident weights, activations, outputs, KV/scratch, command rings, and completion rings.
+
+Near-Term Plan
+
+1. Keep the DMA loopback benchmark as the bandwidth baseline.
+   Current 32 MiB result: about 742.6 MiB/s one-way payload on the 64-bit
+   100 MHz HP0 path.
+
+2. Verify llama.cpp graph shapes and op lists.
+   Use `export-graph-ops`, `GGML_SCHED_DEBUG`, and backend-side tracing to see
+   exactly which ops and scheduler splits happen for Bonsai-1.7B.
+
+3. Build the simplest real device model.
+   Implement `ALLOC_TENSOR`, `UPLOAD_TENSOR`, `RUN_GRAPH`, `DOWNLOAD_TENSOR`,
+   and `FREE_TENSOR`. Skip compiled plans at first. `RUN_GRAPH` should carry a
+   lowered PYNQ op list, not raw ggml structs and not per-tile commands.
+
+4. Make the ggml backend use real PYNQ buffers.
+   Implement a custom buffer type, `set_tensor_async`, `get_tensor_async`,
+   `cpy_tensor_async` where useful, real memory reporting, and tensor handle
+   tracking. Repack supported weights into board-native layout during upload.
+
+5. Bring up one correct PL kernel.
+   Start with one full `MATMUL_Q1A8` / GEMV command using DDR-resident weights
+   and activations. Match ggml reference output before optimizing.
+
+6. Avoid host-board ping-pong.
+   Add PS or PL implementations for the small ops that keep useful graph regions
+   resident: views/reshapes as metadata, add, mul, scale, RMSNorm, SiLU/SwiGLU,
+   RoPE, KV updates, and copies. Do not try to implement every ggml op.
+
+7. Grow command size carefully.
+   First target full matmul commands. Then FFN blocks. Then enough attention and
+   KV-cache work to keep whole transformer layers on the board. Long-term goal:
+   one host-visible run per prompt chunk or decode token, returning logits.
+
+8. Optimize after correctness.
+   Improve throughput with larger arrays, long bursts, double buffering, better
+   DDR layout, more HP ports if counters justify it, and custom AXI masters if
+   AXI DMA becomes the bottleneck.
+
+Future Repo Layout
+
+  fpga/       Vivado Tcl, RTL, overlays
+  runtime/    PYNQ daemon and protocol
+  backend/    ggml out-of-tree backend
+  tools/      upload, inspect, benchmark
+  tests/      golden vectors, Verilator, board smoke tests
+  docs/       diagrams, command ABI, memory layout

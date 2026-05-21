@@ -1,0 +1,28 @@
+PYNQ-Z1 Board
+
+- Board IP verified: 192.168.1.252.
+- SSH user: xilinx.
+- Default password, if needed: xilinx.
+- OS verified: PynqLinux 3.0, Ubuntu 22.04 based.
+- PYNQ package is in virtualenv:
+  /usr/local/share/pynq-venv/bin/python
+- PYNQ version verified: 3.1.1.
+- XRT sees device after adding xilinx to video/render groups.
+- Jupyter listens on ports 80 and 9090.
+
+Use this shape for SSH-driven PYNQ tests:
+nix develop -c ssh xilinx@192.168.1.252 'sudo env XILINX_XRT=/usr PYNQ_PYTHON=python3.10 /usr/local/share/pynq-venv/bin/python your_test.py'
+
+Smoke test passed: base.bit loaded, DDR-backed allocate() buffer worked.
+
+PS-side DDR bandwidth benchmark:
+tools/pynqz1/mem_bandwidth.py
+
+Copy/run from repo root:
+nix develop -c scp tools/pynqz1/mem_bandwidth.py xilinx@192.168.1.252:/home/xilinx/
+nix develop -c ssh xilinx@192.168.1.252 'sudo env XILINX_XRT=/usr PYNQ_PYTHON=python3.10 /usr/local/share/pynq-venv/bin/python /home/xilinx/mem_bandwidth.py'
+
+PL-DDR DMA loopback benchmark:
+tools/pynqz1/dma_loopback/
+
+Verified 32 MiB result: ~742.6 MiB/s one-way payload, ~1485.2 MiB/s total DDR traffic.

@@ -1,0 +1,178 @@
+@startuml pynqz1_architecture_overview
+title PYNQ-Z1 Bonsai Accelerator — Architecture Overview
+scale max 1600 width
+
+' ─── visual settings ──────────────────────────────────────────────────
+skinparam shadowing false
+skinparam componentStyle rectangle
+skinparam packageStyle rectangle
+skinparam linetype ortho
+skinparam defaultFontName Monospaced
+skinparam defaultFontSize 11
+skinparam ArrowFontSize 10
+skinparam ArrowColor #555555
+skinparam ArrowThickness 1.1
+skinparam NoteBackgroundColor #FFFCE6
+skinparam NoteBorderColor #BFA800
+hide stereotype
+
+' ─── palette  (semantic, not decorative) ──────────────────────────────
+'   warm  = code we own (backend lib + board daemon)
+'   gray  = upstream / external (we use, we don't change)
+'   cool  = hardware containers (PS / PL / DDR)
+!$ours_lib    = "#FFE6B0"
+!$ours_rt     = "#FFD085"
+!$upstream    = "#EDEDED"
+!$host        = "#F7F7F7"
+!$board       = "#DCE7F3"
+!$ps          = "#C7D8EC"
+!$pl          = "#A9C8EB"
+!$ddr         = "#D9CEF0"
+
+' ══════════════════════════════════════════════════════════════════════
+' HOST
+' ══════════════════════════════════════════════════════════════════════
+node "Host  (x86 / arm64)" as HOST $host {
+
+  package "llama.cpp process" as LLCPP {
+
+    component "llama-cli / server" as LLBIN
+
+    package "ggml upstream" as GGML_UP $upstream;line.dashed {
+      component "libllama\ntokenizer · kv · sampler" as LIBLLAMA
+      component "libggml-base\ngraph · scheduler · alloc" as GGML_BASE
+    }
+
+    component "libggml-cpu.so\nnon-matmul fallback" as GGML_CPU $upstream;line.dashed
+
+    package "libggml-pynq.so\nout-of-tree backend  (ours)" as BACKEND $ours_lib {
+      component "device API + lowering\nbuffer_type · graph_compute\nggml node → cmd descriptor\nQ1_0 → tile-layout repack" as LOWER
+      component "transport\nTCP client · cmd serializer\ncompletion poll" as TX
+    }
+  }
+}
+
+' ══════════════════════════════════════════════════════════════════════
+' LINK
+' ══════════════════════════════════════════════════════════════════════
+cloud "Ethernet  1 GbE\n~110 MB/s effective" as NET
+
+' ══════════════════════════════════════════════════════════════════════
+' BOARD
+'
+' Layout strategy:
+'   BOARD has exactly two sibling clusters: Compute and Memory.
+'   Dot will stack them top/bottom on its own because every edge that
+'   crosses the boundary (KSTACK→DDR, CTRL→DDR, WPATH/APATH/OPATH↔DDR)
+'   goes -down->.
+'
+'   Inside Compute, PS and PL are siblings; one horizontal edge
+'   (RPC -right-> CTRL) tells dot they're peers, not stacked.
+' ══════════════════════════════════════════════════════════════════════
+node "PYNQ-Z1   (Zynq XC7Z020 + 512 MB DDR3)" as BOARD $board {
+
+
+    package "PS — ARM Cortex-A9 · PYNQ Linux" as PS $ps {
+
+      package "bonsaid  (board daemon, ours)" as DAEMON $ours_rt {
+        component "RPC server\nTCP · session · versioned IDL" as RPC
+        component "arena allocator\n+ tensor handle table" as ALLOC
+        component "cmd-ring producer\n+ IRQ handler" as CRING
+        component "overlay loader\n+ perf counters" as OVL
+      }
+
+      component "PYNQ kernel layer\nallocate · mmap · UIO\ncache flush / invalidate" as KSTACK $upstream;line.dashed
+    }
+
+    package "PL — FPGA fabric" as PL $pl {
+
+      component "control\nAXI-Lite regs\ncmd reader (AXI-MM)\ntile dispatcher / FSM" as CTRL
+
+      package "data plane" as PL_DATA {
+        component "weight path   (HP0)\nw_dma + BRAM" as WPATH
+        component "act path        (HP1)\na_dma + BRAM" as APATH
+        component "output path   (HP2)\nout_dma + BRAM" as OPATH
+      }
+
+      package "compute core" as PL_COMPUTE {
+        component "W1A8 systolic array\n32 × 32 PEs · weight-stationary\n@ 100 MHz" as ARR
+        component "reduction tail\nscale × psum + FP32 acc\n→ fp16 / fp32" as REDUCE
+      }
+    }
+
+  database "DDR3   —   512 MB   ·   ~1.5 GB/s sustained" as DDR $ddr {
+    component "weight arena\n~236 MB (Bonsai-1.7B Q1_0, resident)" as DDR_W
+    component "tensor arenas\nactivation · output · KV · scratch" as DDR_AO
+    component "control rings\ncmd · completion" as DDR_CMD
+  }
+}
+
+' ══════════════════════════════════════════════════════════════════════
+' FLOWS  —  sparse spine; containment carries the rest
+' ══════════════════════════════════════════════════════════════════════
+
+' host internal
+LLBIN     --> GGML_UP
+GGML_UP   --> GGML_CPU : non-matmul
+GGML_UP   --> LOWER    : matmul / fused
+LOWER     --> TX
+
+' host ↔ board  (directional for layout stability)
+TX  -down-> NET  : cmds + bulk weight upload (once)
+NET -down-> RPC
+
+' daemon internal (PS-local)
+RPC    --> CRING
+CRING  --> KSTACK
+
+' PS ↔ PL  —  THE KEY EDGES: forced horizontal so PS and PL sit
+' side by side inside Compute instead of stacking.
+RPC -right-> CTRL : doorbell
+CTRL .left.> CRING : IRQ
+
+' PS → DDR  (vertical — pulls DDR below PS)
+KSTACK -down-> DDR_CMD : write descriptor
+
+' PL → DDR  (vertical — pulls DDR below PL)
+CTRL  -down-> DDR_CMD : fetch / completion
+WPATH <-down-> DDR_W
+APATH <-down-> DDR_AO
+OPATH  -down-> DDR_AO
+
+' PL internal compute spine (horizontal within PL — keep it short)
+CTRL  --> WPATH
+CTRL  --> APATH
+CTRL  --> OPATH
+WPATH  --> ARR
+APATH  --> ARR
+ARR    --> REDUCE
+REDUCE --> OPATH
+
+' ─── outer-stack pin (HOST above BOARD) ───────────────────────────────
+' Hidden edges between cluster names are weak hints (clusters have no
+' rank of their own in dot), but combined with the -down-> arrows on
+' real cross-node edges (TX→NET→RPC) they're enough at this level.
+HOST -[hidden]down- BOARD
+
+' ══════════════════════════════════════════════════════════════════════
+' NOTES
+' ══════════════════════════════════════════════════════════════════════
+
+note right of BACKEND
+  Host-visible ABI
+    tensor handles · versioned RPC
+    no physical addresses leak
+end note
+
+note top of CTRL
+  Board-private ABI
+    DDR phys addrs · packed descriptors
+    fences · perf counters
+end note
+
+note bottom of DDR
+  Weights uploaded **once** at model load.
+  Per-token wire = small int8 acts in, small fp16/fp32 result out.
+end note
+
+@enduml

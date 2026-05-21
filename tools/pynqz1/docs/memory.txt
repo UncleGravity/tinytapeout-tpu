@@ -1,0 +1,41 @@
+PYNQ-Z1 memory notes
+
+The board has 512 MiB of physical DDR, with about 491 MiB visible to Linux.
+PYNQ/XRT buffers come from CMA, which is a physically contiguous DMA pool reserved at boot.
+It cannot be grown at runtime.
+
+Default boot:
+  cma default: 128 MiB
+  practical PYNQ allocation: about 120-127 MiB
+  not enough for resident model weights
+
+Boot override:
+  /boot/uEnv.txt can override bootargs.
+  Current useful setting:
+    cma=320M
+
+Measured with cma=320M and base overlay:
+  CmaTotal:              320 MiB
+  max single allocation: 299 MiB
+  max chunked total:     296 MiB
+  Linux still had about 315 MiB MemAvailable after the probe
+
+For comparison:
+  cma=256M gave about 248 MiB usable
+  cma=288M gave about 264 MiB chunked usable, but only 114 MiB single-buffer
+  cma=320M was the best result so far
+
+Main thing to remember:
+  Full Bonsai Q1_0 weights are roughly 236 MiB, so cma=320M leaves around
+  60 MiB for activations, scratch, command rings, outputs, and maybe a small
+  KV cache. That is tight, but realistic enough to attempt resident weights.
+
+Runtime design takeaway:
+  Do not depend on one giant allocation always working. Allocate several
+  8-32 MiB slabs early after boot, then let the board daemon manage tensors
+  inside those slabs. PL commands can use physical addresses for each tile or
+  block, so tensors do not need to live in one huge contiguous buffer.
+
+If the board fails to boot after changing CMA:
+  Mount the SD card boot partition and edit or remove /boot/uEnv.txt.
+  Falling back to cma=256M is safer; cma=320M is the aggressive setting.
