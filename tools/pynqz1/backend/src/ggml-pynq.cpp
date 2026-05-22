@@ -29,6 +29,7 @@ constexpr const char * k_device_description = "PYNQ-Z1 bonsaid remote tensor bac
 constexpr size_t k_alignment = 64;
 constexpr size_t k_fill_chunk_size = 1 * 1024 * 1024;
 constexpr int k_runtime_abi_version = 1;
+constexpr int k_graph_version = 1;
 
 struct BackendContext {
     pynq::Endpoint endpoint;
@@ -161,6 +162,17 @@ static void pynq_buffer_free(ggml_backend_buffer_t buffer) {
 
 static void * pynq_buffer_get_base(ggml_backend_buffer_t buffer) {
     return buffer_ctx(buffer)->base;
+}
+
+static bool is_pynq_buffer(ggml_backend_buffer_t buffer) {
+    return buffer != nullptr && buffer->iface.get_base == pynq_buffer_get_base;
+}
+
+static const RemoteBinding * find_tensor_binding(const ggml_tensor * tensor) {
+    if (tensor == nullptr || !is_pynq_buffer(tensor->buffer)) {
+        return nullptr;
+    }
+    return find_binding(buffer_ctx(tensor->buffer), tensor);
 }
 
 static enum ggml_status pynq_buffer_init_tensor(
@@ -407,13 +419,113 @@ static void backend_free(ggml_backend_t backend) {
     delete backend;
 }
 
+static bool is_metadata_op(ggml_op op) {
+    switch (op) {
+        case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool supports_raw_copy(const ggml_tensor * op) {
+    if (op == nullptr || op->op != GGML_OP_CPY) {
+        return false;
+    }
+
+    const ggml_tensor * src = op->src[0];
+    const ggml_tensor * dst = op->src[1];
+    return src != nullptr &&
+        dst != nullptr &&
+        src->type == dst->type &&
+        ggml_is_contiguous(src) &&
+        ggml_is_contiguous(dst) &&
+        ggml_nbytes(src) == ggml_nbytes(dst);
+}
+
+static bool append_copy_op(
+    const ggml_tensor * node,
+    nlohmann::json * ops,
+    nlohmann::json * outputs) {
+    if (!supports_raw_copy(node)) {
+        GGML_LOG_ERROR("pynq: CPY node %s is not a contiguous same-type byte copy\n", node->name);
+        return false;
+    }
+
+    const ggml_tensor * src = node->src[0];
+    const ggml_tensor * dst = node->src[1];
+    const RemoteBinding * src_binding = find_tensor_binding(src);
+    const RemoteBinding * dst_binding = find_tensor_binding(dst);
+    const size_t nbytes = ggml_nbytes(src);
+    if (src_binding == nullptr || dst_binding == nullptr ||
+        !remote_range_is_valid(*src_binding, 0, nbytes) ||
+        !remote_range_is_valid(*dst_binding, 0, nbytes)) {
+        GGML_LOG_ERROR("pynq: CPY node %s is missing PYNQ tensor handles\n", node->name);
+        return false;
+    }
+
+    ops->push_back({
+        { "op", "COPY" },
+        { "src", src_binding->handle },
+        { "dst", dst_binding->handle },
+        { "nbytes", nbytes },
+        { "src_offset", src_binding->remote_offset },
+        { "dst_offset", dst_binding->remote_offset },
+    });
+    outputs->push_back(dst_binding->handle);
+    return true;
+}
+
 static enum ggml_status backend_graph_compute(
     ggml_backend_t backend,
     ggml_cgraph * cgraph) {
-    GGML_UNUSED(backend);
-    GGML_UNUSED(cgraph);
-    GGML_LOG_ERROR("pynq: graph compute is not implemented in the buffer-only backend\n");
-    return GGML_STATUS_FAILED;
+    nlohmann::json ops = nlohmann::json::array();
+    nlohmann::json outputs = nlohmann::json::array();
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+
+        if (is_metadata_op(node->op)) {
+            continue;
+        }
+
+        if (node->op != GGML_OP_CPY) {
+            GGML_LOG_ERROR("pynq: unsupported graph op %s in node %s\n",
+                ggml_op_name(node->op),
+                node->name);
+            return GGML_STATUS_FAILED;
+        }
+
+        if (!append_copy_op(node, &ops, &outputs)) {
+            return GGML_STATUS_FAILED;
+        }
+    }
+
+    if (ops.empty()) {
+        return GGML_STATUS_SUCCESS;
+    }
+
+    BackendContext * ctx = static_cast<BackendContext *>(backend->context);
+    try {
+        pynq::RpcClient rpc(ctx->endpoint);
+        rpc.call(
+            "RUN_GRAPH",
+            {
+                { "graph_version", k_graph_version },
+                { "ops", ops },
+                { "outputs", outputs },
+            });
+        return GGML_STATUS_SUCCESS;
+    } catch (const std::exception & exc) {
+        GGML_LOG_ERROR("pynq: RUN_GRAPH failed: %s\n", exc.what());
+        return GGML_STATUS_FAILED;
+    }
 }
 
 static const ggml_backend_i backend_i = {
@@ -533,8 +645,10 @@ static ggml_backend_buffer_type_t device_get_buffer_type(ggml_backend_dev_t dev)
 
 static bool device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
-    return false;
+    if (op != nullptr && is_metadata_op(op->op)) {
+        return true;
+    }
+    return supports_raw_copy(op);
 }
 
 static bool device_supports_buft(
@@ -591,7 +705,7 @@ static ggml_backend_dev_t reg_get_device(ggml_backend_reg_t reg, size_t index) {
 static ggml_backend_feature g_features[] = {
     { "transport", "bonsaid-tcp" },
     { "buffer", "remote-tensor-handles" },
-    { "graph_ops", "none" },
+    { "graph_ops", "copy" },
     { nullptr, nullptr },
 };
 

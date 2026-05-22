@@ -46,8 +46,11 @@ int main() {
         return 1;
     }
 
+    constexpr size_t graph_size = 8;
     const ggml_init_params params = {
-        /* .mem_size   = */ 4 * ggml_tensor_overhead() + 4096,
+        /* .mem_size   = */ 8 * ggml_tensor_overhead() +
+            ggml_graph_overhead_custom(graph_size, false) +
+            4096,
         /* .mem_buffer = */ nullptr,
         /* .no_alloc   = */ true,
     };
@@ -69,6 +72,23 @@ int main() {
         view_values,
         view_start * sizeof(float));
     ggml_set_name(view, "pynq-smoke-view");
+    ggml_tensor * copy_dst = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_values);
+    ggml_set_name(copy_dst, "pynq-smoke-copy-dst");
+    ggml_tensor * copy_dst_view = ggml_view_1d(
+        ctx,
+        copy_dst,
+        view_values,
+        view_start * sizeof(float));
+    ggml_set_name(copy_dst_view, "pynq-smoke-copy-dst-view");
+    ggml_tensor * copy = ggml_cpy(ctx, view, copy_dst_view);
+    ggml_set_name(copy, "pynq-smoke-copy");
+
+    if (!ggml_backend_supports_op(backend, copy)) {
+        std::fprintf(stderr, "pynq backend does not support byte COPY\n");
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(
         ctx,
@@ -103,12 +123,33 @@ int main() {
         return 1;
     }
 
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_size, false);
+    ggml_build_forward_expand(graph, copy);
+    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "pynq backend RUN_GRAPH COPY failed\n");
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    std::vector<float> copied(view_values, 0.0f);
+    ggml_backend_tensor_get(copy_dst_view, copied.data(), 0, copied.size() * sizeof(float));
+    if (!same_floats(patch, copied)) {
+        std::fprintf(stderr, "RUN_GRAPH COPY output did not round trip\n");
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
     std::printf(
-        "pynq backend smoke ok: total=%zu free=%zu root_bytes=%zu view_bytes=%zu\n",
+        "pynq backend smoke ok: total=%zu free=%zu root_bytes=%zu view_bytes=%zu copy_bytes=%zu\n",
         total_bytes,
         free_bytes,
         expected.size() * sizeof(float),
-        patch.size() * sizeof(float));
+        patch.size() * sizeof(float),
+        copied.size() * sizeof(float));
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);

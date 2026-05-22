@@ -9,7 +9,8 @@ The first backend version is buffer-only:
 - ggml buffer allocation creates daemon tensor handles;
 - tensor set/get/memset/clear use the runtime tensor RPCs;
 - tensor views share the remote allocation and carry an offset;
-- no graph operation is advertised to the scheduler yet.
+- contiguous same-type ggml `CPY` nodes lower to runtime graph version 1
+  `COPY` ops and keep output resident until tensor get.
 
 The daemon endpoint defaults to `127.0.0.1:50055`. Override it for a board
 runtime with:
@@ -21,7 +22,7 @@ export PYNQ_BONSAID_PORT=50055
 
 From `tools/pynqz1`, the packaged smoke test requires a running daemon and
 verifies `HELLO`, memory reporting, remote tensor allocation, upload/download,
-and a ggml view write:
+a ggml view write, and a ggml `CPY` graph lowered through `RUN_GRAPH`:
 
 ```sh
 nix run .#pynq-backend-smoke
