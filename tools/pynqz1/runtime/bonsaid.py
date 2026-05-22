@@ -18,6 +18,7 @@ from runtime.allocator import (  # noqa: E402
     pynq_allocator,
 )
 from runtime.bonsai_rpc import ProtocolError, recv_message, send_message  # noqa: E402
+from runtime.graph import run_graph  # noqa: E402
 
 
 ABI_VERSION = 1
@@ -92,7 +93,8 @@ class BonsaiRuntime:
             }, b""
 
         if op == "RUN_GRAPH":
-            raise AllocatorError("unsupported_op", "RUN_GRAPH is not implemented in v1")
+            with self._lock:
+                return run_graph(self.allocator, metadata), b""
 
         raise AllocatorError("unsupported_op", f"unsupported op {op}")
 
@@ -110,7 +112,9 @@ class BonsaiRuntime:
                 "UPLOAD_TENSOR",
                 "DOWNLOAD_TENSOR",
                 "FREE_TENSOR",
+                "RUN_GRAPH",
             ],
+            "graph_ops": ["COPY"],
         }
 
 

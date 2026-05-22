@@ -127,6 +127,7 @@
             "runtime/allocator.py"
             "runtime/bonsai_rpc.py"
             "runtime/bonsaid.py"
+            "runtime/graph.py"
             "tests/conftest.py"
             "tests/test_pynqctl.py"
             "tests/test_rpc.py"

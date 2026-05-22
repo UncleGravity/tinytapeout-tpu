@@ -74,8 +74,10 @@ Response result:
     "ALLOC_TENSOR",
     "UPLOAD_TENSOR",
     "DOWNLOAD_TENSOR",
-    "FREE_TENSOR"
-  ]
+    "FREE_TENSOR",
+    "RUN_GRAPH"
+  ],
+  "graph_ops": ["COPY"]
 }
 ```
 
@@ -161,9 +163,52 @@ Request:
 { "id": 6, "op": "FREE_TENSOR", "handle": 1 }
 ```
 
-## Not Implemented Yet
+### `RUN_GRAPH`
 
-`RUN_GRAPH` is deliberately reserved but returns `unsupported_op` in this
-first runtime. The next step is to add a lowered op-list schema that references
-tensor handles instead of ggml structs or physical addresses.
+Run a lowered device op list against board-resident tensors. Graphs reference
+tensor handles instead of ggml structs or physical addresses. The first graph
+version is PS-executed and only supports `COPY`.
 
+Request:
+
+```json
+{
+  "id": 7,
+  "op": "RUN_GRAPH",
+  "graph_version": 1,
+  "ops": [
+    {
+      "op": "COPY",
+      "src": 1,
+      "dst": 2,
+      "nbytes": 4096,
+      "src_offset": 0,
+      "dst_offset": 0
+    }
+  ],
+  "outputs": [2]
+}
+```
+
+`COPY` reads `nbytes` from `src` at optional `src_offset` and writes those
+bytes to `dst` at optional `dst_offset`. `bonsaid` validates handles and tensor
+ranges before copying.
+
+Response result:
+
+```json
+{
+  "graph_version": 1,
+  "op_count": 1,
+  "outputs": [2],
+  "counters": {
+    "ps_ops": 1,
+    "pl_ops": 0,
+    "bytes_read": 4096,
+    "bytes_written": 4096
+  }
+}
+```
+
+`RUN_GRAPH` does not implicitly download outputs. The backend or host tool
+chooses which output tensor bytes to retrieve with `DOWNLOAD_TENSOR`.

@@ -38,6 +38,25 @@ def test_smoke_round_trip(rpc_server, capsys):
     assert output["free"]["memory"]["tensor_count"] == 0
 
 
+def test_graph_copy_smoke_round_trip(rpc_server, capsys):
+    rc = pynqctl.main(cli_args(rpc_server, "graph-copy-smoke", "--bytes", "200k"))
+
+    assert rc == 0
+    output = read_json(capsys)
+    assert output["ok"] is True
+    assert output["nbytes"] == 200 * 1024
+    assert output["graph"]["op_count"] == 1
+    assert output["graph"]["outputs"] == [output["destination"]["tensor"]["handle"]]
+    assert output["graph"]["counters"] == {
+        "ps_ops": 1,
+        "pl_ops": 0,
+        "bytes_read": 200 * 1024,
+        "bytes_written": 200 * 1024,
+    }
+    assert output["download"]["read"] == 200 * 1024
+    assert output["free"][-1]["memory"]["tensor_count"] == 0
+
+
 def test_file_upload_download_free(rpc_server, tmp_path, capsys):
     source = bytes((index * 29 + 11) % 251 for index in range(4096))
     src_path = tmp_path / "input.bin"

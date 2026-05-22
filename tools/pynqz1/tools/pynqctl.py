@@ -214,6 +214,93 @@ def cmd_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_graph_copy_smoke(args: argparse.Namespace) -> int:
+    source = deterministic_bytes(args.nbytes)
+    handles: list[int] = []
+    free_results: list[dict[str, Any]] = []
+
+    src_result, _payload = call_runtime(
+        args,
+        "ALLOC_TENSOR",
+        nbytes=args.nbytes,
+        shape=[args.nbytes],
+        dtype="u8",
+        usage="graph-copy-src",
+        layout="raw",
+    )
+    src_handle = tensor_handle(src_result)
+    handles.append(src_handle)
+
+    try:
+        dst_result, _payload = call_runtime(
+            args,
+            "ALLOC_TENSOR",
+            nbytes=args.nbytes,
+            shape=[args.nbytes],
+            dtype="u8",
+            usage="graph-copy-dst",
+            layout="raw",
+        )
+        dst_handle = tensor_handle(dst_result)
+        handles.append(dst_handle)
+
+        upload_result, _payload = call_runtime(
+            args,
+            "UPLOAD_TENSOR",
+            payload=source,
+            handle=src_handle,
+            offset=0,
+        )
+        graph_result, _payload = call_runtime(
+            args,
+            "RUN_GRAPH",
+            graph_version=1,
+            ops=[
+                {
+                    "op": "COPY",
+                    "src": src_handle,
+                    "dst": dst_handle,
+                    "nbytes": args.nbytes,
+                }
+            ],
+            outputs=[dst_handle],
+        )
+        download_result, payload = call_runtime(
+            args,
+            "DOWNLOAD_TENSOR",
+            handle=dst_handle,
+            offset=0,
+            size=args.nbytes,
+        )
+        if payload != source:
+            raise CliError("graph COPY output does not match uploaded source")
+    finally:
+        for handle in reversed(handles):
+            result, _payload = call_runtime(args, "FREE_TENSOR", handle=handle)
+            free_results.append(result)
+
+    print_json(
+        {
+            "ok": True,
+            "nbytes": args.nbytes,
+            "source": src_result,
+            "destination": dst_result,
+            "upload": upload_result,
+            "graph": graph_result,
+            "download": download_result,
+            "free": free_results,
+        }
+    )
+    return 0
+
+
+def tensor_handle(alloc_result: dict[str, Any]) -> int:
+    tensor = alloc_result.get("tensor")
+    if not isinstance(tensor, dict):
+        raise ProtocolError("ALLOC_TENSOR response did not contain tensor object")
+    return int(tensor["handle"])
+
+
 def read_payload(path: str) -> bytes:
     if path == "-":
         return sys.stdin.buffer.read()
@@ -274,6 +361,15 @@ def build_parser() -> argparse.ArgumentParser:
     smoke = subparsers.add_parser("smoke", help="allocate/upload/download/free check")
     smoke.add_argument("--bytes", dest="nbytes", type=parse_size, default=64 * 1024)
     smoke.set_defaults(func=cmd_smoke)
+
+    graph_copy_smoke = subparsers.add_parser(
+        "graph-copy-smoke",
+        help="verify RUN_GRAPH COPY with board-resident source and destination tensors",
+    )
+    graph_copy_smoke.add_argument(
+        "--bytes", dest="nbytes", type=parse_size, default=64 * 1024
+    )
+    graph_copy_smoke.set_defaults(func=cmd_graph_copy_smoke)
 
     return parser
 
