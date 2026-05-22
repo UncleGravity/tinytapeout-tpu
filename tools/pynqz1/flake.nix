@@ -3,9 +3,13 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    llama-cpp-src = {
+      url = "github:ggml-org/llama.cpp/a95a11e5b834057e684712963f90bbb730f4745c";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, llama-cpp-src }:
     let
       systems = [
         "aarch64-darwin"
@@ -39,6 +43,7 @@
             pkgs.pkg-config
             pkgs.llvmPackages.clang
             pkgs.clang-tools
+            pkgs.nlohmann_json
             pkgs.ruff
           ];
 
@@ -87,6 +92,9 @@
             pkgs.openssh
             pkgs.rsync
           ];
+          pynqBackend = pkgs.callPackage ./backend/package.nix {
+            llamaCppSrc = llama-cpp-src;
+          };
 
           mkTool = name: script: toolInputs:
             pkgs.writeShellApplication {
@@ -100,6 +108,7 @@
         {
           pynqctl = mkTool "pynqctl" "tools/pynqctl.py" [ ];
           pynq-board = mkTool "pynq-board" "tools/pynq_board.py" boardTransportTools;
+          inherit (pynqBackend) llama-cpp-dl llama-cli-pynq pynq-backend;
           default = self.packages.${system}.pynqctl;
         });
 
@@ -117,6 +126,16 @@
             type = "app";
             program = "${self.packages.${system}.pynq-board}/bin/pynq-board";
             meta.description = "Deploy and exercise bonsaid on a PYNQ board";
+          };
+          llama-cli-pynq = {
+            type = "app";
+            program = "${self.packages.${system}.llama-cli-pynq}/bin/llama-cli-pynq";
+            meta.description = "Run llama-cli with libggml-pynq available";
+          };
+          pynq-backend-smoke = {
+            type = "app";
+            program = "${self.packages.${system}.pynq-backend}/bin/pynq-backend-smoke";
+            meta.description = "Round-trip ggml tensors through bonsaid";
           };
           default = self.apps.${system}.pynqctl;
         });
@@ -150,6 +169,9 @@
             pkgs.lib.concatMapStringsSep " \\\n                "
               (path: ''"$src/${path}"'')
               pythonFiles;
+          pynqBackend = pkgs.callPackage ./backend/package.nix {
+            llamaCppSrc = llama-cpp-src;
+          };
         in
         {
           python-syntax = pkgs.runCommand "pynqz1-python-syntax"
@@ -176,6 +198,41 @@
               export PYTHONPYCACHEPREFIX="$TMPDIR/pycache"
               export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
               python -m pytest -q tests
+              touch "$out"
+            '';
+
+          backend-smoke = pkgs.runCommand "pynqz1-backend-smoke"
+            {
+              src = ./.;
+              nativeBuildInputs = [
+                python
+                pynqBackend.pynq-backend
+              ];
+            }
+            ''
+              export PYTHONPYCACHEPREFIX="$TMPDIR/pycache"
+              export PYNQ_BONSAID_HOST=127.0.0.1
+              export PYNQ_BONSAID_PORT=50055
+              python "$src/runtime/bonsaid.py" \
+                --host "$PYNQ_BONSAID_HOST" \
+                --port "$PYNQ_BONSAID_PORT" \
+                --allocator fake \
+                --overlay none \
+                --overlay-id backend-smoke \
+                --heap-mib 8 \
+                --slab-mib 1 > "$TMPDIR/bonsaid.log" 2>&1 &
+              daemon_pid=$!
+              trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT
+
+              attempts=0
+              until pynq-backend-smoke; do
+                attempts=$((attempts + 1))
+                if [ "$attempts" -ge 30 ]; then
+                  cat "$TMPDIR/bonsaid.log" >&2
+                  exit 1
+                fi
+                sleep 0.1
+              done
               touch "$out"
             '';
         });
