@@ -29,8 +29,6 @@
           hostTools = [
             pkgs.git
             pkgs.gnumake
-            pkgs.openssh
-            pkgs.rsync
             pkgs.iperf3
             pkgs.tcl
           ];
@@ -55,6 +53,8 @@
 
           linuxOnlyTools = pkgs.lib.optionals pkgs.stdenv.isLinux [
             pkgs.ethtool
+            pkgs.openssh
+            pkgs.rsync
           ];
         in
         {
@@ -83,17 +83,23 @@
             ps.pytest
           ]);
 
-          mkTool = name: script:
+          boardTransportTools = pkgs.lib.optionals pkgs.stdenv.isLinux [
+            pkgs.openssh
+            pkgs.rsync
+          ];
+
+          mkTool = name: script: toolInputs:
             pkgs.writeShellApplication {
               inherit name;
-              runtimeInputs = [ python ];
+              runtimeInputs = [ python ] ++ toolInputs;
               text = ''
                 exec "${python}/bin/python" "${src}/${script}" "$@"
               '';
             };
         in
         {
-          pynqctl = mkTool "pynqctl" "tools/pynqctl.py";
+          pynqctl = mkTool "pynqctl" "tools/pynqctl.py" [ ];
+          pynq-board = mkTool "pynq-board" "tools/pynq_board.py" boardTransportTools;
           default = self.packages.${system}.pynqctl;
         });
 
@@ -106,6 +112,11 @@
             type = "app";
             program = "${self.packages.${system}.pynqctl}/bin/pynqctl";
             meta.description = "Control a PYNQ-Z1 bonsaid runtime";
+          };
+          pynq-board = {
+            type = "app";
+            program = "${self.packages.${system}.pynq-board}/bin/pynq-board";
+            meta.description = "Deploy and exercise bonsaid on a PYNQ board";
           };
           default = self.apps.${system}.pynqctl;
         });
@@ -121,6 +132,7 @@
             "tools/alloc_probe.py"
             "tools/__init__.py"
             "tools/mem_bandwidth.py"
+            "tools/pynq_board.py"
             "tools/pynqctl.py"
             "dma_loopback/dma_bandwidth.py"
             "runtime/__init__.py"
@@ -130,6 +142,7 @@
             "runtime/graph.py"
             "tests/conftest.py"
             "tests/test_pynqctl.py"
+            "tests/test_pynq_board.py"
             "tests/test_rpc.py"
           ];
 

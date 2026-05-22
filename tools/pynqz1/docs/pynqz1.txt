@@ -1,6 +1,6 @@
 PYNQ-Z1 Board
 
-- Board IP verified: 192.168.1.252.
+- Board hostname: pynq.
 - SSH user: xilinx.
 - Default password, if needed: xilinx.
 - OS verified: PynqLinux 3.0, Ubuntu 22.04 based.
@@ -11,7 +11,19 @@ PYNQ-Z1 Board
 - Jupyter listens on ports 80 and 9090.
 
 Use this shape for SSH-driven PYNQ tests:
-nix develop -c ssh xilinx@192.168.1.252 'sudo env XILINX_XRT=/usr PYNQ_PYTHON=python3.10 /usr/local/share/pynq-venv/bin/python your_test.py'
+nix develop -c ssh xilinx@pynq 'sudo env XILINX_XRT=/usr PYNQ_PYTHON=python3.10 /usr/local/share/pynq-venv/bin/python your_test.py'
+
+Board runtime workflow from tools/pynqz1:
+nix develop -c nix run .#pynq-board -- daemon
+
+In a second terminal:
+nix develop -c nix run .#pynq-board -- hello
+nix develop -c nix run .#pynq-board -- smoke --bytes 1536k
+nix develop -c nix run .#pynq-board -- graph-copy-smoke --bytes 1536k
+
+The daemon command syncs runtime/ to /home/xilinx/pynqz1-runtime before it
+starts bonsaid in the foreground. Use `pynq-board sync` for copy-only updates
+or `pynq-board daemon --no-sync` to run already-copied board files.
 
 Smoke test passed: base.bit loaded, DDR-backed allocate() buffer worked.
 
@@ -19,8 +31,8 @@ PS-side DDR bandwidth benchmark:
 tools/pynqz1/mem_bandwidth.py
 
 Copy/run from repo root:
-nix develop -c scp tools/pynqz1/mem_bandwidth.py xilinx@192.168.1.252:/home/xilinx/
-nix develop -c ssh xilinx@192.168.1.252 'sudo env XILINX_XRT=/usr PYNQ_PYTHON=python3.10 /usr/local/share/pynq-venv/bin/python /home/xilinx/mem_bandwidth.py'
+nix develop -c scp tools/pynqz1/mem_bandwidth.py xilinx@pynq:/home/xilinx/
+nix develop -c ssh xilinx@pynq 'sudo env XILINX_XRT=/usr PYNQ_PYTHON=python3.10 /usr/local/share/pynq-venv/bin/python /home/xilinx/mem_bandwidth.py'
 
 PL-DDR DMA loopback benchmark:
 tools/pynqz1/dma_loopback/
