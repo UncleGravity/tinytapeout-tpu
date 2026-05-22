@@ -58,10 +58,18 @@ if(APPLE)
 endif()
 
 if(PYNQ_BUILD_SMOKE_TESTS)
+    find_library(GGML_LIBRARY ggml
+        HINTS "${LLAMA_CPP_BUILD_DIR}/lib"
+        REQUIRED NO_DEFAULT_PATH)
     add_executable(pynq-backend-smoke
         "${CMAKE_CURRENT_LIST_DIR}/test/backend-smoke.cpp"
         "${CMAKE_CURRENT_LIST_DIR}/src/ggml-pynq.cpp")
-    target_link_libraries(pynq-backend-smoke PRIVATE pynq_backend_common pynq_rpc)
+    target_link_libraries(pynq-backend-smoke PRIVATE
+        pynq_backend_common
+        pynq_rpc
+        "${GGML_LIBRARY}")
+    target_compile_definitions(pynq-backend-smoke PRIVATE
+        PYNQ_GGML_BACKEND_DIR="${LLAMA_CPP_BUILD_DIR}/bin")
     set_target_properties(pynq-backend-smoke PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${PYNQ_TEST_OUTPUT_DIR}"
         BUILD_RPATH   "${_pynq_rpath}"

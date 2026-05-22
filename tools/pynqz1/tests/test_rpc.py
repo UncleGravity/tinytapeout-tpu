@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import struct
 import threading
 
 import pytest
@@ -44,7 +45,7 @@ def test_hello_reports_memory_and_capabilities(client):
     assert "ALLOC_TENSOR" in result["capabilities"]
     assert "DOWNLOAD_TENSOR" in result["capabilities"]
     assert "RUN_GRAPH" in result["capabilities"]
-    assert result["graph_ops"] == ["COPY"]
+    assert result["graph_ops"] == ["COPY", "MATMUL_Q1A8"]
 
 
 def test_allocate_upload_download_and_free_cross_slab_tensor(client):
@@ -133,6 +134,73 @@ def test_run_graph_copy_keeps_output_on_device_until_download(client):
     response, payload = client.call("DOWNLOAD_TENSOR", handle=dst, size=nbytes)
     assert response["result"]["read"] == nbytes
     assert payload == source
+
+
+def test_run_graph_matmul_q1a8_writes_f32_output(client):
+    rows = 2
+    cols = 2
+    k = 128
+    block_bytes = 18
+
+    row0_bits = bytes([0xFF] * 16)
+    row1_bits = bytes([0x55] * 16)
+    weights = struct.pack("<e", 1.0) + row0_bits
+    weights += struct.pack("<e", 1.0) + row1_bits
+    acts = struct.pack(f"<{cols * k}f", *([0.0] * k + [1.0] * k))
+
+    response, _ = client.call(
+        "ALLOC_TENSOR",
+        nbytes=rows * block_bytes,
+        dtype="Q1_0",
+        usage="weights",
+    )
+    weights_handle = response["result"]["tensor"]["handle"]
+    response, _ = client.call(
+        "ALLOC_TENSOR",
+        nbytes=len(acts),
+        dtype="F32",
+        usage="activation",
+    )
+    acts_handle = response["result"]["tensor"]["handle"]
+    response, _ = client.call(
+        "ALLOC_TENSOR",
+        nbytes=rows * cols * 4,
+        dtype="F32",
+        usage="output",
+    )
+    dst_handle = response["result"]["tensor"]["handle"]
+    client.call("UPLOAD_TENSOR", payload=weights, handle=weights_handle)
+    client.call("UPLOAD_TENSOR", payload=acts, handle=acts_handle)
+
+    response, payload = client.call(
+        "RUN_GRAPH",
+        graph_version=1,
+        ops=[
+            {
+                "op": "MATMUL_Q1A8",
+                "weights": weights_handle,
+                "acts": acts_handle,
+                "dst": dst_handle,
+                "rows": rows,
+                "cols": cols,
+                "k": k,
+            }
+        ],
+        outputs=[dst_handle],
+    )
+
+    assert payload == b""
+    assert response["result"]["counters"] == {
+        "ps_ops": 1,
+        "pl_ops": 0,
+        "bytes_read": len(weights) + len(acts),
+        "bytes_written": rows * cols * 4,
+    }
+
+    _, payload = client.call("DOWNLOAD_TENSOR", handle=dst_handle, size=16)
+    got = struct.unpack("<4f", payload)
+    q8_scale = struct.unpack("<e", struct.pack("<e", 1.0 / 127.0))[0]
+    assert got == pytest.approx((0.0, 0.0, 128.0 * 127.0 * q8_scale, 0.0))
 
 
 def test_unsupported_graph_op_is_reported(client):

@@ -6,8 +6,11 @@
 #include "ggml-impl.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -30,6 +33,11 @@ constexpr size_t k_alignment = 64;
 constexpr size_t k_fill_chunk_size = 1 * 1024 * 1024;
 constexpr int k_runtime_abi_version = 1;
 constexpr int k_graph_version = 1;
+
+static std::atomic<size_t> g_trace_allocated_bytes { 0 };
+static std::atomic<size_t> g_trace_uploaded_bytes { 0 };
+static std::atomic<size_t> g_trace_downloaded_bytes { 0 };
+static std::atomic<size_t> g_trace_graph_calls { 0 };
 
 struct BackendContext {
     pynq::Endpoint endpoint;
@@ -100,10 +108,40 @@ static nlohmann::json tensor_shape(const ggml_tensor * tensor) {
     return shape;
 }
 
+static bool trace_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("PYNQ_TRACE");
+        return value != nullptr &&
+            value[0] != '\0' &&
+            std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+static void tracef(const char * format, ...) {
+    if (!trace_enabled()) {
+        return;
+    }
+
+    va_list args;
+    va_start(args, format);
+    std::vfprintf(stderr, format, args);
+    va_end(args);
+    std::fflush(stderr);
+}
+
+static const char * tensor_name(const ggml_tensor * tensor) {
+    return tensor != nullptr && tensor->name[0] != '\0' ? tensor->name : "(unnamed)";
+}
+
+static double mib(size_t nbytes) {
+    return static_cast<double>(nbytes) / (1024.0 * 1024.0);
+}
+
 static void log_rpc_failure(const char * action, const ggml_tensor * tensor, const std::exception & exc) {
     GGML_LOG_ERROR("pynq: %s failed for tensor %s: %s\n",
         action,
-        tensor != nullptr && tensor->name[0] != '\0' ? tensor->name : "(unnamed)",
+        tensor_name(tensor),
         exc.what());
 }
 
@@ -128,6 +166,12 @@ static void free_allocations(BufferContext * ctx) {
     for (const RemoteAllocation & allocation : ctx->allocations) {
         try {
             ctx->rpc.call("FREE_TENSOR", { { "handle", allocation.handle } });
+            if (trace_enabled()) {
+                tracef(
+                    "pynq trace: free handle=%llu bytes=%zu\n",
+                    static_cast<unsigned long long>(allocation.handle),
+                    allocation.nbytes);
+            }
         } catch (const std::exception & exc) {
             GGML_LOG_WARN("pynq: FREE_TENSOR failed for handle %llu: %s\n",
                 static_cast<unsigned long long>(allocation.handle),
@@ -195,6 +239,15 @@ static enum ggml_status pynq_buffer_init_tensor(
                 return GGML_STATUS_FAILED;
             }
             ctx->bindings.emplace(tensor, binding);
+            if (trace_enabled()) {
+                tracef(
+                    "pynq trace: view name=%s type=%s bytes=%zu handle=%llu offset=%zu\n",
+                    tensor_name(tensor),
+                    ggml_type_name(tensor->type),
+                    binding.tensor_nbytes,
+                    static_cast<unsigned long long>(binding.handle),
+                    binding.remote_offset);
+            }
             return GGML_STATUS_SUCCESS;
         }
 
@@ -219,6 +272,23 @@ static enum ggml_status pynq_buffer_init_tensor(
             0,
         });
         ctx->allocations.push_back(RemoteAllocation { handle, remote_nbytes });
+        if (trace_enabled()) {
+            const size_t allocated_total =
+                g_trace_allocated_bytes.fetch_add(remote_nbytes) + remote_nbytes;
+            tracef(
+                "pynq trace: alloc name=%s type=%s shape=[%lld,%lld,%lld,%lld] "
+                "bytes=%zu handle=%llu remote_bytes=%zu allocated_total=%.2f MiB\n",
+                tensor_name(tensor),
+                ggml_type_name(tensor->type),
+                static_cast<long long>(tensor->ne[0]),
+                static_cast<long long>(tensor->ne[1]),
+                static_cast<long long>(tensor->ne[2]),
+                static_cast<long long>(tensor->ne[3]),
+                nbytes,
+                static_cast<unsigned long long>(handle),
+                remote_nbytes,
+                mib(allocated_total));
+        }
         return GGML_STATUS_SUCCESS;
     } catch (const std::exception & exc) {
         log_rpc_failure("tensor init", tensor, exc);
@@ -241,6 +311,19 @@ static void pynq_buffer_memset_tensor(
 
     try {
         upload_fill(ctx, binding->handle, add_checked(binding->remote_offset, offset), size, value);
+        if (trace_enabled()) {
+            const size_t uploaded_total =
+                g_trace_uploaded_bytes.fetch_add(size) + size;
+            tracef(
+                "pynq trace: memset name=%s handle=%llu offset=%zu bytes=%zu "
+                "value=%u uploaded_total=%.2f MiB\n",
+                tensor_name(tensor),
+                static_cast<unsigned long long>(binding->handle),
+                add_checked(binding->remote_offset, offset),
+                size,
+                static_cast<unsigned>(value),
+                mib(uploaded_total));
+        }
     } catch (const std::exception & exc) {
         log_rpc_failure("memset", tensor, exc);
     }
@@ -268,6 +351,19 @@ static void pynq_buffer_set_tensor(
             },
             data,
             size);
+        if (trace_enabled()) {
+            const size_t uploaded_total =
+                g_trace_uploaded_bytes.fetch_add(size) + size;
+            tracef(
+                "pynq trace: upload name=%s type=%s handle=%llu offset=%zu "
+                "bytes=%zu uploaded_total=%.2f MiB\n",
+                tensor_name(tensor),
+                ggml_type_name(tensor->type),
+                static_cast<unsigned long long>(binding->handle),
+                add_checked(binding->remote_offset, offset),
+                size,
+                mib(uploaded_total));
+        }
     } catch (const std::exception & exc) {
         log_rpc_failure("upload", tensor, exc);
     }
@@ -298,6 +394,19 @@ static void pynq_buffer_get_tensor(
             throw pynq::RpcError("DOWNLOAD_TENSOR returned an unexpected payload size");
         }
         std::memcpy(data, response.payload.data(), size);
+        if (trace_enabled()) {
+            const size_t downloaded_total =
+                g_trace_downloaded_bytes.fetch_add(size) + size;
+            tracef(
+                "pynq trace: download name=%s type=%s handle=%llu offset=%zu "
+                "bytes=%zu downloaded_total=%.2f MiB\n",
+                tensor_name(tensor),
+                ggml_type_name(tensor->type),
+                static_cast<unsigned long long>(binding->handle),
+                add_checked(binding->remote_offset, offset),
+                size,
+                mib(downloaded_total));
+        }
     } catch (const std::exception & exc) {
         log_rpc_failure("download", tensor, exc);
     }
@@ -318,6 +427,16 @@ static void pynq_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     for (const RemoteAllocation & allocation : ctx->allocations) {
         try {
             upload_fill(ctx, allocation.handle, 0, allocation.nbytes, value);
+            if (trace_enabled()) {
+                const size_t uploaded_total =
+                    g_trace_uploaded_bytes.fetch_add(allocation.nbytes) + allocation.nbytes;
+                tracef(
+                    "pynq trace: clear handle=%llu bytes=%zu value=%u uploaded_total=%.2f MiB\n",
+                    static_cast<unsigned long long>(allocation.handle),
+                    allocation.nbytes,
+                    static_cast<unsigned>(value),
+                    mib(uploaded_total));
+            }
         } catch (const std::exception & exc) {
             GGML_LOG_ERROR("pynq: clear failed for handle %llu: %s\n",
                 static_cast<unsigned long long>(allocation.handle),
@@ -361,6 +480,12 @@ static ggml_backend_buffer_t buffer_type_alloc_buffer(
             return nullptr;
         }
 
+        if (trace_enabled()) {
+            tracef(
+                "pynq trace: buffer reserve bytes=%zu fake_base=%p\n",
+                size,
+                ctx->base);
+        }
         return ggml_backend_buffer_init(buft, buffer_i, ctx.release(), size);
     } catch (const std::exception & exc) {
         GGML_LOG_ERROR("pynq: buffer allocation failed before tensor init: %s\n", exc.what());
@@ -380,10 +505,18 @@ static size_t memory_value(const nlohmann::json & result, const char * key) {
 static size_t buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
     try {
-        pynq::RpcClient rpc(pynq::endpoint_from_env());
+        const pynq::Endpoint endpoint = pynq::endpoint_from_env();
+        tracef(
+            "pynq trace: buffer max_size query endpoint=%s:%u\n",
+            endpoint.host.c_str(),
+            static_cast<unsigned>(endpoint.port));
+        pynq::RpcClient rpc(endpoint);
         const pynq::RpcResponse response = rpc.call("MEMORY");
-        return memory_value(response.result, "free_bytes");
-    } catch (const std::exception &) {
+        const size_t free_bytes = memory_value(response.result, "free_bytes");
+        tracef("pynq trace: buffer max_size free=%.2f MiB\n", mib(free_bytes));
+        return free_bytes;
+    } catch (const std::exception & exc) {
+        tracef("pynq trace: buffer max_size query failed: %s\n", exc.what());
         return std::numeric_limits<size_t>::max();
     }
 }
@@ -447,6 +580,36 @@ static bool supports_raw_copy(const ggml_tensor * op) {
         ggml_nbytes(src) == ggml_nbytes(dst);
 }
 
+static bool supports_matmul_q1a8(const ggml_tensor * op) {
+    if (op == nullptr || op->op != GGML_OP_MUL_MAT || op->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const ggml_tensor * weights = op->src[0];
+    const ggml_tensor * acts = op->src[1];
+    if (weights == nullptr ||
+        acts == nullptr ||
+        weights->type != GGML_TYPE_Q1_0 ||
+        acts->type != GGML_TYPE_F32 ||
+        weights->ne[0] != acts->ne[0] ||
+        weights->ne[0] <= 0 ||
+        weights->ne[0] % ggml_blck_size(GGML_TYPE_Q1_0) != 0 ||
+        op->ne[0] != weights->ne[1] ||
+        op->ne[1] != acts->ne[1]) {
+        return false;
+    }
+
+    for (int dim = 2; dim < GGML_MAX_DIMS; ++dim) {
+        if (weights->ne[dim] != 1 || acts->ne[dim] != 1 || op->ne[dim] != 1) {
+            return false;
+        }
+    }
+
+    return ggml_is_contiguous(weights) &&
+        ggml_is_contiguous(acts) &&
+        ggml_is_contiguous(op);
+}
+
 static bool append_copy_op(
     const ggml_tensor * node,
     nlohmann::json * ops,
@@ -477,6 +640,70 @@ static bool append_copy_op(
         { "dst_offset", dst_binding->remote_offset },
     });
     outputs->push_back(dst_binding->handle);
+    if (trace_enabled()) {
+        tracef(
+            "pynq trace: lower COPY node=%s src=%s/%llu dst=%s/%llu bytes=%zu\n",
+            tensor_name(node),
+            tensor_name(src),
+            static_cast<unsigned long long>(src_binding->handle),
+            tensor_name(dst),
+            static_cast<unsigned long long>(dst_binding->handle),
+            nbytes);
+    }
+    return true;
+}
+
+static bool append_matmul_q1a8_op(
+    const ggml_tensor * node,
+    nlohmann::json * ops,
+    nlohmann::json * outputs) {
+    if (!supports_matmul_q1a8(node)) {
+        GGML_LOG_ERROR("pynq: MUL_MAT node %s is not a supported Q1A8 matmul\n", node->name);
+        return false;
+    }
+
+    const ggml_tensor * weights = node->src[0];
+    const ggml_tensor * acts = node->src[1];
+    const RemoteBinding * weights_binding = find_tensor_binding(weights);
+    const RemoteBinding * acts_binding = find_tensor_binding(acts);
+    const RemoteBinding * dst_binding = find_tensor_binding(node);
+    if (weights_binding == nullptr ||
+        acts_binding == nullptr ||
+        dst_binding == nullptr ||
+        !remote_range_is_valid(*weights_binding, 0, ggml_nbytes(weights)) ||
+        !remote_range_is_valid(*acts_binding, 0, ggml_nbytes(acts)) ||
+        !remote_range_is_valid(*dst_binding, 0, ggml_nbytes(node))) {
+        GGML_LOG_ERROR("pynq: MUL_MAT node %s is missing PYNQ tensor handles\n", node->name);
+        return false;
+    }
+
+    ops->push_back({
+        { "op", "MATMUL_Q1A8" },
+        { "weights", weights_binding->handle },
+        { "acts", acts_binding->handle },
+        { "dst", dst_binding->handle },
+        { "rows", weights->ne[1] },
+        { "cols", acts->ne[1] },
+        { "k", weights->ne[0] },
+        { "weights_offset", weights_binding->remote_offset },
+        { "acts_offset", acts_binding->remote_offset },
+        { "dst_offset", dst_binding->remote_offset },
+    });
+    outputs->push_back(dst_binding->handle);
+    if (trace_enabled()) {
+        tracef(
+            "pynq trace: lower MATMUL_Q1A8 node=%s weights=%s/%llu "
+            "acts=%s/%llu dst=%llu rows=%lld cols=%lld k=%lld\n",
+            tensor_name(node),
+            tensor_name(weights),
+            static_cast<unsigned long long>(weights_binding->handle),
+            tensor_name(acts),
+            static_cast<unsigned long long>(acts_binding->handle),
+            static_cast<unsigned long long>(dst_binding->handle),
+            static_cast<long long>(weights->ne[1]),
+            static_cast<long long>(acts->ne[1]),
+            static_cast<long long>(weights->ne[0]));
+    }
     return true;
 }
 
@@ -495,15 +722,22 @@ static enum ggml_status backend_graph_compute(
             continue;
         }
 
-        if (node->op != GGML_OP_CPY) {
-            GGML_LOG_ERROR("pynq: unsupported graph op %s in node %s\n",
-                ggml_op_name(node->op),
-                node->name);
-            return GGML_STATUS_FAILED;
-        }
-
-        if (!append_copy_op(node, &ops, &outputs)) {
-            return GGML_STATUS_FAILED;
+        switch (node->op) {
+            case GGML_OP_CPY:
+                if (!append_copy_op(node, &ops, &outputs)) {
+                    return GGML_STATUS_FAILED;
+                }
+                break;
+            case GGML_OP_MUL_MAT:
+                if (!append_matmul_q1a8_op(node, &ops, &outputs)) {
+                    return GGML_STATUS_FAILED;
+                }
+                break;
+            default:
+                GGML_LOG_ERROR("pynq: unsupported graph op %s in node %s\n",
+                    ggml_op_name(node->op),
+                    node->name);
+                return GGML_STATUS_FAILED;
         }
     }
 
@@ -514,13 +748,27 @@ static enum ggml_status backend_graph_compute(
     BackendContext * ctx = static_cast<BackendContext *>(backend->context);
     try {
         pynq::RpcClient rpc(ctx->endpoint);
-        rpc.call(
+        const size_t graph_call = g_trace_graph_calls.fetch_add(1) + 1;
+        if (trace_enabled()) {
+            tracef(
+                "pynq trace: RUN_GRAPH #%zu submit ops=%zu outputs=%zu\n",
+                graph_call,
+                ops.size(),
+                outputs.size());
+        }
+        const pynq::RpcResponse response = rpc.call(
             "RUN_GRAPH",
             {
                 { "graph_version", k_graph_version },
                 { "ops", ops },
                 { "outputs", outputs },
             });
+        if (trace_enabled()) {
+            tracef(
+                "pynq trace: RUN_GRAPH #%zu complete result=%s\n",
+                graph_call,
+                response.result.dump().c_str());
+        }
         return GGML_STATUS_SUCCESS;
     } catch (const std::exception & exc) {
         GGML_LOG_ERROR("pynq: RUN_GRAPH failed: %s\n", exc.what());
@@ -562,6 +810,14 @@ static ggml_backend_t init_backend(ggml_backend_dev_t device) {
             GGML_LOG_ERROR("pynq: incompatible bonsaid HELLO response\n");
             return nullptr;
         }
+        if (trace_enabled()) {
+            tracef(
+                "pynq trace: HELLO endpoint=%s:%u memory=%s graph_ops=%s\n",
+                endpoint.host.c_str(),
+                static_cast<unsigned>(endpoint.port),
+                hello.result.value("memory", nlohmann::json::object()).dump().c_str(),
+                hello.result.value("graph_ops", nlohmann::json::array()).dump().c_str());
+        }
     } catch (const std::exception & exc) {
         GGML_LOG_ERROR("pynq: bonsaid HELLO failed: %s\n", exc.what());
         return nullptr;
@@ -601,11 +857,21 @@ static void device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * to
     *free = 0;
     *total = 0;
     try {
-        pynq::RpcClient rpc(pynq::endpoint_from_env());
+        const pynq::Endpoint endpoint = pynq::endpoint_from_env();
+        tracef(
+            "pynq trace: device memory query endpoint=%s:%u\n",
+            endpoint.host.c_str(),
+            static_cast<unsigned>(endpoint.port));
+        pynq::RpcClient rpc(endpoint);
         const pynq::RpcResponse response = rpc.call("MEMORY");
         *free = memory_value(response.result, "free_bytes");
         *total = memory_value(response.result, "total_bytes");
-    } catch (const std::exception &) {
+        tracef(
+            "pynq trace: device memory free=%.2f MiB total=%.2f MiB\n",
+            mib(*free),
+            mib(*total));
+    } catch (const std::exception & exc) {
+        tracef("pynq trace: device memory query failed: %s\n", exc.what());
     }
 }
 
@@ -648,7 +914,7 @@ static bool device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     if (op != nullptr && is_metadata_op(op->op)) {
         return true;
     }
-    return supports_raw_copy(op);
+    return supports_raw_copy(op) || supports_matmul_q1a8(op);
 }
 
 static bool device_supports_buft(
@@ -659,8 +925,7 @@ static bool device_supports_buft(
 
 static bool device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
-    return false;
+    return supports_matmul_q1a8(op);
 }
 
 static const ggml_backend_device_i device_i = {
@@ -705,7 +970,7 @@ static ggml_backend_dev_t reg_get_device(ggml_backend_reg_t reg, size_t index) {
 static ggml_backend_feature g_features[] = {
     { "transport", "bonsaid-tcp" },
     { "buffer", "remote-tensor-handles" },
-    { "graph_ops", "copy" },
+    { "graph_ops", "copy,matmul_q1a8" },
     { nullptr, nullptr },
 };
 

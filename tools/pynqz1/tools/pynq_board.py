@@ -11,8 +11,8 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from runtime.bonsaid import DEFAULT_PORT  # noqa: E402
-from tools import pynqctl  # noqa: E402
 
+from tools import pynqctl  # noqa: E402
 
 DEFAULT_BOARD_HOST = "pynq"
 DEFAULT_REMOTE_DIR = "/home/xilinx/pynqz1-runtime"

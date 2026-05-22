@@ -77,7 +77,7 @@ Response result:
     "FREE_TENSOR",
     "RUN_GRAPH"
   ],
-  "graph_ops": ["COPY"]
+  "graph_ops": ["COPY", "MATMUL_Q1A8"]
 }
 ```
 
@@ -167,7 +167,8 @@ Request:
 
 Run a lowered device op list against board-resident tensors. Graphs reference
 tensor handles instead of ggml structs or physical addresses. The first graph
-version is PS-executed and only supports `COPY`.
+version is PS-executed and supports `COPY` plus the reference form of the
+resident-weight matmul that the PL path will replace.
 
 Request:
 
@@ -193,6 +194,30 @@ Request:
 `COPY` reads `nbytes` from `src` at optional `src_offset` and writes those
 bytes to `dst` at optional `dst_offset`. `bonsaid` validates handles and tensor
 ranges before copying.
+
+`MATMUL_Q1A8` reads contiguous 2D ggml `Q1_0` weights and contiguous F32
+activations from resident tensor handles, quantizes each activation row with
+ggml Q8_0 block rules on the PS, and writes a contiguous F32 ggml `MUL_MAT`
+output. It is the first stable graph boundary for the PL W1A8 kernel:
+
+```json
+{
+  "op": "MATMUL_Q1A8",
+  "weights": 3,
+  "acts": 4,
+  "dst": 5,
+  "rows": 2048,
+  "cols": 1,
+  "k": 2048,
+  "weights_offset": 0,
+  "acts_offset": 0,
+  "dst_offset": 0
+}
+```
+
+`k` must be a positive multiple of the `Q1_0` block size, 128. `rows` is
+`src0.ne[1]`, `cols` is `src1.ne[1]`, and output cells are written in ggml
+order with rows contiguous inside each column.
 
 Response result:
 

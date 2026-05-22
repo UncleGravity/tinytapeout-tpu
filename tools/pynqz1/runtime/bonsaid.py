@@ -114,7 +114,7 @@ class BonsaiRuntime:
                 "FREE_TENSOR",
                 "RUN_GRAPH",
             ],
-            "graph_ops": ["COPY"],
+            "graph_ops": ["COPY", "MATMUL_Q1A8"],
         }
 
 
