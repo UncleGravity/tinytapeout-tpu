@@ -746,6 +746,17 @@ static bool supports_silu_f32(const ggml_tensor * op) {
         same_shape(op, op->src[0]);
 }
 
+static bool supports_swiglu_f32(const ggml_tensor * op) {
+    return op != nullptr &&
+        op->op == GGML_OP_GLU &&
+        ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU &&
+        is_contiguous_f32(op) &&
+        is_contiguous_f32(op->src[0]) &&
+        is_contiguous_f32(op->src[1]) &&
+        same_shape(op, op->src[0]) &&
+        same_shape(op, op->src[1]);
+}
+
 static bool supports_rms_norm_f32(const ggml_tensor * op) {
     return op != nullptr &&
         op->op == GGML_OP_RMS_NORM &&
@@ -969,6 +980,57 @@ static bool append_silu_f32_op(
     return true;
 }
 
+static bool append_swiglu_f32_op(
+    const ggml_tensor * node,
+    nlohmann::json * ops,
+    nlohmann::json * outputs) {
+    if (!supports_swiglu_f32(node)) {
+        GGML_LOG_ERROR("pynq: SWIGLU node %s is not a supported F32 split GLU op\n", node->name);
+        return false;
+    }
+
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    const RemoteBinding * src0_binding = find_tensor_binding(src0);
+    const RemoteBinding * src1_binding = find_tensor_binding(src1);
+    const RemoteBinding * dst_binding = find_tensor_binding(node);
+    const size_t nbytes = ggml_nbytes(node);
+    if (src0_binding == nullptr ||
+        src1_binding == nullptr ||
+        dst_binding == nullptr ||
+        !remote_range_is_valid(*src0_binding, 0, ggml_nbytes(src0)) ||
+        !remote_range_is_valid(*src1_binding, 0, ggml_nbytes(src1)) ||
+        !remote_range_is_valid(*dst_binding, 0, nbytes)) {
+        GGML_LOG_ERROR("pynq: SWIGLU node %s is missing PYNQ tensor handles\n", node->name);
+        return false;
+    }
+
+    ops->push_back({
+        { "op", "SWIGLU_F32" },
+        { "src0", src0_binding->handle },
+        { "src1", src1_binding->handle },
+        { "dst", dst_binding->handle },
+        { "elements", ggml_nelements(node) },
+        { "src0_offset", src0_binding->remote_offset },
+        { "src1_offset", src1_binding->remote_offset },
+        { "dst_offset", dst_binding->remote_offset },
+    });
+    outputs->push_back(dst_binding->handle);
+    if (trace_enabled()) {
+        tracef(
+            "pynq trace: lower SWIGLU_F32 node=%s src0=%s/%llu src1=%s/%llu "
+            "dst=%llu elements=%lld\n",
+            tensor_name(node),
+            tensor_name(src0),
+            static_cast<unsigned long long>(src0_binding->handle),
+            tensor_name(src1),
+            static_cast<unsigned long long>(src1_binding->handle),
+            static_cast<unsigned long long>(dst_binding->handle),
+            static_cast<long long>(ggml_nelements(node)));
+    }
+    return true;
+}
+
 static bool append_rms_norm_f32_op(
     const ggml_tensor * node,
     nlohmann::json * ops,
@@ -1107,6 +1169,11 @@ static enum ggml_status backend_graph_compute(
                 break;
             case GGML_OP_UNARY:
                 if (!append_silu_f32_op(node, &ops, &outputs)) {
+                    return GGML_STATUS_FAILED;
+                }
+                break;
+            case GGML_OP_GLU:
+                if (!append_swiglu_f32_op(node, &ops, &outputs)) {
                     return GGML_STATUS_FAILED;
                 }
                 break;
@@ -1300,6 +1367,7 @@ static bool device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
         supports_f32_binary(op) ||
         supports_scale_f32(op) ||
         supports_silu_f32(op) ||
+        supports_swiglu_f32(op) ||
         supports_rms_norm_f32(op) ||
         supports_matmul_q1a8(op);
 }
@@ -1315,6 +1383,7 @@ static bool device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     return supports_f32_binary(op) ||
         supports_scale_f32(op) ||
         supports_silu_f32(op) ||
+        supports_swiglu_f32(op) ||
         supports_rms_norm_f32(op) ||
         supports_matmul_q1a8(op);
 }
@@ -1361,7 +1430,7 @@ static ggml_backend_dev_t reg_get_device(ggml_backend_reg_t reg, size_t index) {
 static ggml_backend_feature g_features[] = {
     { "transport", "bonsaid-tcp" },
     { "buffer", "remote-tensor-handles" },
-    { "graph_ops", "copy,matmul_q1a8,add_f32,mul_f32,scale_f32,silu_f32,rms_norm_f32" },
+    { "graph_ops", "copy,matmul_q1a8,add_f32,mul_f32,scale_f32,silu_f32,swiglu_f32,rms_norm_f32" },
     { nullptr, nullptr },
 };
 

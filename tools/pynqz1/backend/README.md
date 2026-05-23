@@ -15,8 +15,9 @@ The first backend version owns remote buffers and the first graph ops:
 - contiguous 2D `Q1_0 x F32 -> F32` ggml `MUL_MAT` nodes lower to the
   runtime `MATMUL_Q1A8` op. The runtime executes that boundary on the PS
   until the PL W1A8 kernel replaces it.
-- contiguous F32 `ADD`, `MUL`, `SCALE`, `SiLU`, and `RMS_NORM` nodes lower
-  to PS glue ops so FFN/residual regions can stay resident between matmuls.
+- contiguous F32 `ADD`, `MUL`, `SCALE`, `SiLU`, `SwiGLU`, and `RMS_NORM`
+  nodes lower to PS glue ops so FFN/residual regions can stay resident
+  between matmuls.
 
 The daemon endpoint defaults to `127.0.0.1:50055`. Override it for a board
 runtime with:

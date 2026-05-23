@@ -55,6 +55,7 @@ def test_hello_reports_memory_and_capabilities(client):
         "MUL_F32",
         "SCALE_F32",
         "SILU_F32",
+        "SWIGLU_F32",
         "RMS_NORM_F32",
     ]
 
@@ -322,6 +323,55 @@ def test_run_graph_f32_glue_ops(client):
             expected.append(silu[col * rows + row] * bias[row])
 
     _, payload = client.call("DOWNLOAD_TENSOR", handle=mul_out, size=nbytes)
+    assert struct.unpack("<8f", payload) == pytest.approx(expected)
+
+
+def test_run_graph_swiglu_f32_can_alias_gate(client):
+    values = [0.5, -1.0, 2.0, -4.0, 1.5, -2.0, 3.0, -6.0]
+    up = [1.0, 0.5, -0.25, 2.0, 1.5, -0.5, 0.25, -2.0]
+    nbytes = len(values) * 4
+
+    response, _ = client.call("ALLOC_TENSOR", nbytes=2 * nbytes, dtype="F32")
+    arena = response["result"]["tensor"]["handle"]
+    client.call("UPLOAD_TENSOR", payload=struct.pack("<8f", *values), handle=arena)
+    client.call(
+        "UPLOAD_TENSOR",
+        payload=struct.pack("<8f", *up),
+        handle=arena,
+        offset=nbytes,
+    )
+
+    response, payload = client.call(
+        "RUN_GRAPH",
+        graph_version=1,
+        ops=[
+            {
+                "op": "SWIGLU_F32",
+                "src0": arena,
+                "src1": arena,
+                "dst": arena,
+                "elements": len(values),
+                "src0_offset": 0,
+                "src1_offset": nbytes,
+                "dst_offset": 0,
+            },
+        ],
+        outputs=[arena],
+    )
+
+    assert payload == b""
+    assert_counters(response["result"], {
+        "ps_ops": 1,
+        "pl_ops": 0,
+        "bytes_read": 2 * nbytes,
+        "bytes_written": nbytes,
+    })
+
+    _, payload = client.call("DOWNLOAD_TENSOR", handle=arena, size=nbytes)
+    expected = [
+        (value / (1.0 + math.exp(-value))) * up_value
+        for value, up_value in zip(values, up)
+    ]
     assert struct.unpack("<8f", payload) == pytest.approx(expected)
 
 

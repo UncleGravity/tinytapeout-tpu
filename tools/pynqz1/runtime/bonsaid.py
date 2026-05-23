@@ -121,6 +121,7 @@ class BonsaiRuntime:
                 "MUL_F32",
                 "SCALE_F32",
                 "SILU_F32",
+                "SWIGLU_F32",
                 "RMS_NORM_F32",
             ],
         }

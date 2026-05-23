@@ -152,6 +152,13 @@ std::vector<float> make_glue_bias() {
     return { 1.0f, 0.5f, -0.25f, 2.0f };
 }
 
+std::vector<float> make_swiglu_up() {
+    return {
+        1.0f, 0.5f, -0.25f, 2.0f,
+        1.5f, -0.5f, 0.25f, -2.0f,
+    };
+}
+
 std::vector<float> expected_glue_output(
     const std::vector<float> & input,
     const std::vector<float> & bias) {
@@ -178,6 +185,16 @@ std::vector<float> expected_glue_output(
             output[index] =
                 silu(scaled[index] * rms_scale) * bias[static_cast<size_t>(row)];
         }
+    }
+    return output;
+}
+
+std::vector<float> expected_swiglu_output(
+    const std::vector<float> & gate,
+    const std::vector<float> & up) {
+    std::vector<float> output(gate.size());
+    for (size_t index = 0; index < gate.size(); ++index) {
+        output[index] = silu(gate[index]) * up[index];
     }
     return output;
 }
@@ -269,6 +286,79 @@ bool scheduler_glue_smoke(
     const bool ok = same_floats(actual, expected, 1e-5f);
     if (!ok) {
         std::fprintf(stderr, "scheduler F32 glue output mismatch\n");
+    }
+    ggml_backend_sched_free(sched);
+    ggml_free(ctx);
+    return ok;
+}
+
+bool scheduler_swiglu_smoke(
+    ggml_backend_t backend,
+    ggml_backend_t cpu_backend,
+    const std::vector<float> & gate_data,
+    const std::vector<float> & up_data,
+    const std::vector<float> & expected,
+    int * split_count) {
+    constexpr size_t graph_size = 4;
+    const ggml_init_params params = {
+        /* .mem_size   = */ 4 * ggml_tensor_overhead() +
+            ggml_graph_overhead_custom(graph_size, false) +
+            4096,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        std::fprintf(stderr, "scheduler SwiGLU ggml_init failed\n");
+        return false;
+    }
+
+    ggml_tensor * gate =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_glue_rows, k_glue_cols);
+    ggml_tensor * up =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_glue_rows, k_glue_cols);
+    ggml_tensor * output = ggml_swiglu_split(ctx, gate, up);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_size, false);
+    ggml_build_forward_expand(graph, output);
+
+    ggml_backend_t backends[] = { backend, cpu_backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+        backends,
+        nullptr,
+        2,
+        graph_size,
+        false,
+        true);
+    if (sched == nullptr || !ggml_backend_sched_alloc_graph(sched, graph)) {
+        std::fprintf(stderr, "pynq scheduler SwiGLU allocation failed\n");
+        if (sched != nullptr) {
+            ggml_backend_sched_free(sched);
+        }
+        ggml_free(ctx);
+        return false;
+    }
+    if (ggml_backend_sched_get_tensor_backend(sched, output) != backend) {
+        std::fprintf(stderr, "pynq scheduler did not assign SwiGLU to PYNQ\n");
+        ggml_backend_sched_free(sched);
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_set(gate, gate_data.data(), 0, gate_data.size() * sizeof(float));
+    ggml_backend_tensor_set(up, up_data.data(), 0, up_data.size() * sizeof(float));
+    if (ggml_backend_sched_graph_compute(sched, graph) != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "pynq scheduler SwiGLU compute failed\n");
+        ggml_backend_sched_free(sched);
+        ggml_free(ctx);
+        return false;
+    }
+
+    std::vector<float> actual(expected.size(), 0.0f);
+    ggml_backend_tensor_get(output, actual.data(), 0, actual.size() * sizeof(float));
+    *split_count = ggml_backend_sched_get_n_splits(sched);
+    const bool ok = same_floats(actual, expected, 1e-5f);
+    if (!ok) {
+        std::fprintf(stderr, "scheduler SwiGLU output mismatch\n");
     }
     ggml_backend_sched_free(sched);
     ggml_free(ctx);
@@ -379,6 +469,8 @@ int main() {
     std::vector<float> glue_input = make_glue_input();
     std::vector<float> glue_bias = make_glue_bias();
     std::vector<float> glue_expected = expected_glue_output(glue_input, glue_bias);
+    std::vector<float> swiglu_up = make_swiglu_up();
+    std::vector<float> swiglu_expected = expected_swiglu_output(glue_input, swiglu_up);
     if (!quantize_matmul_weights(matmul_weights, &matmul_q1_weights)) {
         std::fprintf(stderr, "Q1_0 weight quantization failed\n");
         ggml_backend_free(backend);
@@ -387,7 +479,7 @@ int main() {
 
     constexpr size_t graph_size = 16;
     const ggml_init_params params = {
-        /* .mem_size   = */ 12 * ggml_tensor_overhead() +
+        /* .mem_size   = */ 16 * ggml_tensor_overhead() +
             2 * ggml_graph_overhead_custom(graph_size, false) +
             8192,
         /* .mem_buffer = */ nullptr,
@@ -429,6 +521,14 @@ int main() {
     ggml_set_name(matmul_src1, "pynq-smoke-matmul-acts");
     ggml_tensor * matmul = ggml_mul_mat(ctx, matmul_src0, matmul_src1);
     ggml_set_name(matmul, "pynq-smoke-matmul");
+    ggml_tensor * swiglu_gate =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_glue_rows, k_glue_cols);
+    ggml_set_name(swiglu_gate, "pynq-smoke-swiglu-gate");
+    ggml_tensor * swiglu_src1 =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_glue_rows, k_glue_cols);
+    ggml_set_name(swiglu_src1, "pynq-smoke-swiglu-up");
+    ggml_tensor * swiglu = ggml_swiglu_split(ctx, swiglu_gate, swiglu_src1);
+    ggml_set_name(swiglu, "pynq-smoke-swiglu");
 
     if (!ggml_backend_supports_op(backend, copy)) {
         std::fprintf(stderr, "pynq backend does not support byte COPY\n");
@@ -438,6 +538,12 @@ int main() {
     }
     if (!ggml_backend_supports_op(backend, matmul)) {
         std::fprintf(stderr, "pynq backend does not support Q1A8 MUL_MAT\n");
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+    if (!ggml_backend_supports_op(backend, swiglu)) {
+        std::fprintf(stderr, "pynq backend does not support split SwiGLU\n");
         ggml_free(ctx);
         ggml_backend_free(backend);
         return 1;
@@ -530,8 +636,43 @@ int main() {
         return 1;
     }
 
+    ggml_backend_tensor_set(
+        swiglu_gate,
+        glue_input.data(),
+        0,
+        glue_input.size() * sizeof(float));
+    ggml_backend_tensor_set(
+        swiglu_src1,
+        swiglu_up.data(),
+        0,
+        swiglu_up.size() * sizeof(float));
+    ggml_cgraph * swiglu_graph = ggml_new_graph_custom(ctx, graph_size, false);
+    ggml_build_forward_expand(swiglu_graph, swiglu);
+    if (ggml_backend_graph_compute(backend, swiglu_graph) != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "pynq backend RUN_GRAPH SWIGLU_F32 failed\n");
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    std::vector<float> swiglu_actual(swiglu_expected.size(), 0.0f);
+    ggml_backend_tensor_get(
+        swiglu,
+        swiglu_actual.data(),
+        0,
+        swiglu_actual.size() * sizeof(float));
+    if (!same_floats(swiglu_actual, swiglu_expected, 1e-5f)) {
+        std::fprintf(stderr, "RUN_GRAPH SWIGLU_F32 output mismatch\n");
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
     int scheduler_matmul_splits = 0;
     int scheduler_glue_splits = 0;
+    int scheduler_swiglu_splits = 0;
     ggml_backend_load_all_from_path(PYNQ_GGML_BACKEND_DIR);
     ggml_backend_t cpu_backend =
         ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -568,20 +709,36 @@ int main() {
         ggml_backend_free(backend);
         return 1;
     }
+    if (!scheduler_swiglu_smoke(
+            backend,
+            cpu_backend,
+            glue_input,
+            swiglu_up,
+            swiglu_expected,
+            &scheduler_swiglu_splits)) {
+        ggml_backend_free(cpu_backend);
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
     ggml_backend_free(cpu_backend);
 
     std::printf(
         "pynq backend smoke ok: total=%zu free=%zu root_bytes=%zu view_bytes=%zu "
-        "copy_bytes=%zu matmul_cells=%zu scheduler_matmul_splits=%d "
-        "scheduler_glue_splits=%d\n",
+        "copy_bytes=%zu matmul_cells=%zu swiglu_cells=%zu "
+        "scheduler_matmul_splits=%d scheduler_glue_splits=%d "
+        "scheduler_swiglu_splits=%d\n",
         total_bytes,
         free_bytes,
         expected.size() * sizeof(float),
         patch.size() * sizeof(float),
         copied.size() * sizeof(float),
         matmul_actual.size(),
+        swiglu_actual.size(),
         scheduler_matmul_splits,
-        scheduler_glue_splits);
+        scheduler_glue_splits,
+        scheduler_swiglu_splits);
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);

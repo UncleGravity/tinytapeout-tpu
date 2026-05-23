@@ -99,6 +99,10 @@ def _run_op(
         _run_silu_f32(allocator, op, counters)
         return
 
+    if op_name == "SWIGLU_F32":
+        _run_swiglu_f32(allocator, op, counters)
+        return
+
     if op_name == "RMS_NORM_F32":
         _run_rms_norm_f32(allocator, op, counters)
         return
@@ -285,6 +289,28 @@ def _run_silu_f32(
     _write_f32(allocator, dst, dst_offset, output)
     counters.ps_ops += 1
     counters.bytes_read += elements * F32_BYTES
+    counters.bytes_written += elements * F32_BYTES
+
+
+def _run_swiglu_f32(
+    allocator: TensorAllocator,
+    op: dict[str, Any],
+    counters: GraphCounters,
+) -> None:
+    src0 = _required_int(op, "src0")
+    src1 = _required_int(op, "src1")
+    dst = _required_int(op, "dst")
+    elements = _positive_int(op, "elements")
+    src0_offset = _optional_int(op, "src0_offset", 0)
+    src1_offset = _optional_int(op, "src1_offset", 0)
+    dst_offset = _optional_int(op, "dst_offset", 0)
+
+    gate_values = _read_f32(allocator, src0, src0_offset, elements)
+    up_values = _read_f32(allocator, src1, src1_offset, elements)
+    output = [_silu(gate) * up for gate, up in zip(gate_values, up_values)]
+    _write_f32(allocator, dst, dst_offset, output)
+    counters.ps_ops += 1
+    counters.bytes_read += 2 * elements * F32_BYTES
     counters.bytes_written += elements * F32_BYTES
 
 
