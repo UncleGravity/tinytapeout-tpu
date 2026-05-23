@@ -36,9 +36,9 @@ a ggml view write, a ggml `CPY` graph, direct `MUL_MAT` lowering, and
 nix run .#pynq-backend-smoke
 ```
 
-`bonsaid` can use a native PS shared library for `MATMUL_Q1A8` when
-`PYNQ_PS_LIB` points at `libbonsai_ps.so`. Build it on the board before
-starting the daemon:
+`bonsaid` can use a native PS shared library for `MATMUL_Q1A8` and the F32
+glue ops when `PYNQ_PS_LIB` points at `libbonsai_ps.so`. Build it on the board
+before starting the daemon:
 
 ```sh
 nix run .#pynq-board -- build-native
@@ -60,3 +60,10 @@ uploads/downloads with cumulative byte counts, and each lowered graph op or
 ```sh
 PYNQ_TRACE=1 nix run .#llama-cli-pynq -- --list-devices
 ```
+
+Set `PYNQ_PROFILE=1` on the board daemon to emit one compact JSON line per
+`RUN_GRAPH` with per-op `read_us`, `compute_us`, `write_us`, byte counts, and
+shape fields. Native PS calls also include `native_marshal_us` and
+`native_kernel_us`, so matmul/kernel time can be separated from ctypes buffer
+setup. This is intended for timing hot graph regions without the full host-side
+trace stream.

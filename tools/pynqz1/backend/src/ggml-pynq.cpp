@@ -818,6 +818,7 @@ static bool append_copy_op(
 
     ops->push_back({
         { "op", "COPY" },
+        { "name", tensor_name(node) },
         { "src", src_binding->handle },
         { "dst", dst_binding->handle },
         { "nbytes", nbytes },
@@ -867,6 +868,7 @@ static bool append_f32_binary_op(
     const char * op_name = node->op == GGML_OP_ADD ? "ADD_F32" : "MUL_F32";
     ops->push_back({
         { "op", op_name },
+        { "name", tensor_name(node) },
         { "src0", src0_binding->handle },
         { "src1", src1_binding->handle },
         { "dst", dst_binding->handle },
@@ -918,6 +920,7 @@ static bool append_scale_f32_op(
 
     ops->push_back({
         { "op", "SCALE_F32" },
+        { "name", tensor_name(node) },
         { "src", src_binding->handle },
         { "dst", dst_binding->handle },
         { "elements", ggml_nelements(node) },
@@ -961,6 +964,7 @@ static bool append_silu_f32_op(
 
     ops->push_back({
         { "op", "SILU_F32" },
+        { "name", tensor_name(node) },
         { "src", src_binding->handle },
         { "dst", dst_binding->handle },
         { "elements", ggml_nelements(node) },
@@ -1007,6 +1011,7 @@ static bool append_swiglu_f32_op(
 
     ops->push_back({
         { "op", "SWIGLU_F32" },
+        { "name", tensor_name(node) },
         { "src0", src0_binding->handle },
         { "src1", src1_binding->handle },
         { "dst", dst_binding->handle },
@@ -1053,6 +1058,7 @@ static bool append_rms_norm_f32_op(
 
     ops->push_back({
         { "op", "RMS_NORM_F32" },
+        { "name", tensor_name(node) },
         { "src", src_binding->handle },
         { "dst", dst_binding->handle },
         { "rows", node->ne[0] },
@@ -1102,6 +1108,7 @@ static bool append_matmul_q1a8_op(
 
     ops->push_back({
         { "op", "MATMUL_Q1A8" },
+        { "name", tensor_name(node) },
         { "weights", weights_binding->handle },
         { "acts", acts_binding->handle },
         { "dst", dst_binding->handle },

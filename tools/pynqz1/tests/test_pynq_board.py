@@ -54,14 +54,23 @@ def test_ssh_daemon_command_uses_board_python_overlay_and_heap():
     assert "--heap-mib 4 --slab-mib 1 --overlay base --overlay-id graph-copy" in remote
 
 
+def test_ssh_daemon_command_forwards_profile_env(monkeypatch):
+    monkeypatch.setenv("PYNQ_PROFILE", "1")
+
+    command = pynq_board.ssh_daemon_command(config())
+
+    assert "PYNQ_PROFILE=1" in command[3]
+
+
 def test_ssh_native_build_command_compiles_runtime_library():
     command = pynq_board.ssh_native_build_command(config(board_host="pynq.local"))
 
     assert command[:3] == ["ssh", "-tt", "xilinx@pynq.local"]
     remote = command[3]
     assert remote.startswith("cd /home/xilinx/pynqz1-runtime && ")
-    assert "gcc -O3 -std=c99 -fPIC -shared" in remote
-    assert "-o /tmp/libbonsai_ps.so runtime/native/bonsai_ps.c" in remote
+    assert "gcc -O3 -mcpu=cortex-a9 -mfpu=neon-vfpv3 -mfloat-abi=hard" in remote
+    assert "-std=c99 -fPIC -shared" in remote
+    assert "-o /tmp/libbonsai_ps.so runtime/native/bonsai_ps.c -lm" in remote
     assert "sudo install -m 0755 /tmp/libbonsai_ps.so runtime/native/libbonsai_ps.so" in remote
 
 

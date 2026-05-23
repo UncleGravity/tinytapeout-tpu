@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 import subprocess
 import sys
@@ -63,6 +64,7 @@ def remote_daemon_command(config: BoardConfig) -> str:
         "XILINX_XRT=/usr",
         "PYNQ_PYTHON=python3.10",
         f"PYNQ_PS_LIB={native_lib}",
+        *_forwarded_daemon_env(),
         config.board_python,
         "-m",
         "runtime.bonsaid",
@@ -84,18 +86,31 @@ def remote_daemon_command(config: BoardConfig) -> str:
     return f"cd {shlex.quote(config.remote_dir)} && exec {shlex.join(daemon)}"
 
 
+def _forwarded_daemon_env() -> list[str]:
+    forwarded = []
+    for name in ("PYNQ_PROFILE",):
+        value = os.environ.get(name)
+        if value is not None and value.lower() not in ("", "0", "false", "no", "off"):
+            forwarded.append(f"{name}={value}")
+    return forwarded
+
+
 def remote_native_build_command(config: BoardConfig) -> str:
     output = "runtime/native/libbonsai_ps.so"
     tmp_output = "/tmp/libbonsai_ps.so"
     build = [
         "gcc",
         "-O3",
+        "-mcpu=cortex-a9",
+        "-mfpu=neon-vfpv3",
+        "-mfloat-abi=hard",
         "-std=c99",
         "-fPIC",
         "-shared",
         "-o",
         tmp_output,
         "runtime/native/bonsai_ps.c",
+        "-lm",
     ]
     install = ["sudo", "install", "-m", "0755", tmp_output, output]
     cleanup = ["rm", "-f", tmp_output]

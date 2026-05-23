@@ -13,6 +13,15 @@ const char * bonsai_ps_version(void) {
     return "bonsai_ps_v1";
 }
 
+static float silu_f32(float value) {
+    if (value >= 0.0f) {
+        return value / (1.0f + expf(-value));
+    }
+
+    const float exp_value = expf(value);
+    return value * exp_value / (1.0f + exp_value);
+}
+
 static uint16_t read_le_u16(const uint8_t * ptr) {
     return (uint16_t) ptr[0] | ((uint16_t) ptr[1] << 8);
 }
@@ -223,5 +232,127 @@ int bonsai_matmul_q1a8(
 
     free(act_quants);
     free(act_scales);
+    return 0;
+}
+
+int bonsai_add_f32(
+    const float * src0,
+    const float * src1,
+    float * dst,
+    uint32_t rows,
+    uint32_t cols,
+    uint32_t src1_broadcast) {
+    if (src0 == NULL || src1 == NULL || dst == NULL || rows == 0 || cols == 0) {
+        return -1;
+    }
+
+    for (uint32_t col = 0; col < cols; ++col) {
+        const size_t col_offset = (size_t) col * rows;
+        for (uint32_t row = 0; row < rows; ++row) {
+            const size_t index = col_offset + row;
+            const size_t rhs_index = src1_broadcast != 0 ? row : index;
+            dst[index] = src0[index] + src1[rhs_index];
+        }
+    }
+
+    return 0;
+}
+
+int bonsai_mul_f32(
+    const float * src0,
+    const float * src1,
+    float * dst,
+    uint32_t rows,
+    uint32_t cols,
+    uint32_t src1_broadcast) {
+    if (src0 == NULL || src1 == NULL || dst == NULL || rows == 0 || cols == 0) {
+        return -1;
+    }
+
+    for (uint32_t col = 0; col < cols; ++col) {
+        const size_t col_offset = (size_t) col * rows;
+        for (uint32_t row = 0; row < rows; ++row) {
+            const size_t index = col_offset + row;
+            const size_t rhs_index = src1_broadcast != 0 ? row : index;
+            dst[index] = src0[index] * src1[rhs_index];
+        }
+    }
+
+    return 0;
+}
+
+int bonsai_scale_f32(
+    const float * src,
+    float * dst,
+    uint32_t elements,
+    float scale,
+    float bias) {
+    if (src == NULL || dst == NULL || elements == 0) {
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < elements; ++i) {
+        dst[i] = src[i] * scale + bias;
+    }
+
+    return 0;
+}
+
+int bonsai_silu_f32(
+    const float * src,
+    float * dst,
+    uint32_t elements) {
+    if (src == NULL || dst == NULL || elements == 0) {
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < elements; ++i) {
+        dst[i] = silu_f32(src[i]);
+    }
+
+    return 0;
+}
+
+int bonsai_swiglu_f32(
+    const float * gate,
+    const float * up,
+    float * dst,
+    uint32_t elements) {
+    if (gate == NULL || up == NULL || dst == NULL || elements == 0) {
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < elements; ++i) {
+        dst[i] = silu_f32(gate[i]) * up[i];
+    }
+
+    return 0;
+}
+
+int bonsai_rms_norm_f32(
+    const float * src,
+    float * dst,
+    uint32_t rows,
+    uint32_t cols,
+    float eps) {
+    if (src == NULL || dst == NULL || rows == 0 || cols == 0) {
+        return -1;
+    }
+
+    for (uint32_t col = 0; col < cols; ++col) {
+        const size_t col_offset = (size_t) col * rows;
+        float mean_square = 0.0f;
+        for (uint32_t row = 0; row < rows; ++row) {
+            const float value = src[col_offset + row];
+            mean_square += value * value;
+        }
+
+        const float scale = 1.0f / sqrtf(mean_square / (float) rows + eps);
+        for (uint32_t row = 0; row < rows; ++row) {
+            const size_t index = col_offset + row;
+            dst[index] = src[index] * scale;
+        }
+    }
+
     return 0;
 }

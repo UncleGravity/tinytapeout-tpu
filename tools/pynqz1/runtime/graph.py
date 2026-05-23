@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import math
+import os
 import struct
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -48,14 +51,23 @@ def run_graph(
     ops = _required_ops(metadata)
     outputs = _optional_int_list(metadata, "outputs")
     counters = GraphCounters()
+    profile_ops: list[dict[str, Any]] | None = [] if _profile_enabled() else None
     start_ns = time.perf_counter_ns()
 
     for index, op in enumerate(ops):
-        _run_op(allocator, op, index, counters)
-    counters.elapsed_us = max(0, (time.perf_counter_ns() - start_ns) // 1000)
+        op_profile = _new_op_profile(op, index) if profile_ops is not None else None
+        op_start_ns = time.perf_counter_ns() if op_profile is not None else 0
+        _run_op(allocator, op, index, counters, op_profile)
+        if op_profile is not None:
+            op_profile["total_us"] = _elapsed_us(op_start_ns)
+            profile_ops.append(op_profile)
+    counters.elapsed_us = _elapsed_us(start_ns)
 
     for handle in outputs:
         allocator.describe(handle)
+
+    if profile_ops is not None:
+        _emit_profile(counters.elapsed_us, profile_ops, counters)
 
     return {
         "graph_version": graph_version,
@@ -70,41 +82,56 @@ def _run_op(
     op: dict[str, Any],
     index: int,
     counters: GraphCounters,
+    profile: dict[str, Any] | None,
 ) -> None:
     op_name = str(op.get("op", ""))
     if not op_name:
         raise AllocatorError("invalid_request", f"graph op {index} is missing op")
 
     if op_name == "COPY":
-        _run_copy(allocator, op, counters)
+        _run_copy(allocator, op, counters, profile)
         return
 
     if op_name == "MATMUL_Q1A8":
-        _run_matmul_q1a8(allocator, op, counters)
+        _run_matmul_q1a8(allocator, op, counters, profile)
         return
 
     if op_name == "ADD_F32":
-        _run_binary_f32(allocator, op, counters, lambda lhs, rhs: lhs + rhs)
+        _run_binary_f32(
+            allocator,
+            op,
+            counters,
+            profile,
+            "add",
+            lambda lhs, rhs: lhs + rhs,
+        )
         return
 
     if op_name == "MUL_F32":
-        _run_binary_f32(allocator, op, counters, lambda lhs, rhs: lhs * rhs)
+        _run_binary_f32(
+            allocator,
+            op,
+            counters,
+            profile,
+            "mul",
+            lambda lhs, rhs: lhs * rhs,
+        )
         return
 
     if op_name == "SCALE_F32":
-        _run_scale_f32(allocator, op, counters)
+        _run_scale_f32(allocator, op, counters, profile)
         return
 
     if op_name == "SILU_F32":
-        _run_silu_f32(allocator, op, counters)
+        _run_silu_f32(allocator, op, counters, profile)
         return
 
     if op_name == "SWIGLU_F32":
-        _run_swiglu_f32(allocator, op, counters)
+        _run_swiglu_f32(allocator, op, counters, profile)
         return
 
     if op_name == "RMS_NORM_F32":
-        _run_rms_norm_f32(allocator, op, counters)
+        _run_rms_norm_f32(allocator, op, counters, profile)
         return
 
     raise AllocatorError(
@@ -117,6 +144,7 @@ def _run_copy(
     allocator: TensorAllocator,
     op: dict[str, Any],
     counters: GraphCounters,
+    profile: dict[str, Any] | None,
 ) -> None:
     src = _required_int(op, "src")
     dst = _required_int(op, "dst")
@@ -124,8 +152,20 @@ def _run_copy(
     src_offset = _optional_int(op, "src_offset", 0)
     dst_offset = _optional_int(op, "dst_offset", 0)
 
-    data = allocator.read(src, src_offset, nbytes)
-    allocator.write(dst, dst_offset, data)
+    if profile is None:
+        data = allocator.read(src, src_offset, nbytes)
+        allocator.write(dst, dst_offset, data)
+    else:
+        read_start_ns = time.perf_counter_ns()
+        data = allocator.read(src, src_offset, nbytes)
+        _add_elapsed_us(profile, "read_us", read_start_ns)
+
+        write_start_ns = time.perf_counter_ns()
+        allocator.write(dst, dst_offset, data)
+        _add_elapsed_us(profile, "write_us", write_start_ns)
+        profile["bytes_read"] = nbytes
+        profile["bytes_written"] = nbytes
+
     counters.ps_ops += 1
     counters.bytes_read += nbytes
     counters.bytes_written += nbytes
@@ -135,6 +175,7 @@ def _run_matmul_q1a8(
     allocator: TensorAllocator,
     op: dict[str, Any],
     counters: GraphCounters,
+    profile: dict[str, Any] | None,
 ) -> None:
     weights = _required_int(op, "weights")
     acts = _required_int(op, "acts")
@@ -158,12 +199,37 @@ def _run_matmul_q1a8(
     act_nbytes = cols * k * F32_BYTES
     dst_nbytes = rows * cols * F32_BYTES
 
-    weight_data = allocator.read(weights, weights_offset, weight_nbytes)
-    act_data = allocator.read(acts, acts_offset, act_nbytes)
-    output = bytearray(dst_nbytes)
+    if profile is None:
+        weight_data = allocator.read(weights, weights_offset, weight_nbytes)
+        act_data = allocator.read(acts, acts_offset, act_nbytes)
+    else:
+        weight_read_start_ns = time.perf_counter_ns()
+        weight_data = allocator.read(weights, weights_offset, weight_nbytes)
+        weight_read_us = _elapsed_us(weight_read_start_ns)
+        profile["weight_read_us"] = weight_read_us
+        profile["read_us"] += weight_read_us
+
+        act_read_start_ns = time.perf_counter_ns()
+        act_data = allocator.read(acts, acts_offset, act_nbytes)
+        act_read_us = _elapsed_us(act_read_start_ns)
+        profile["act_read_us"] = act_read_us
+        profile["read_us"] += act_read_us
+        profile["bytes_read"] = weight_nbytes + act_nbytes
+        profile["bytes_written"] = dst_nbytes
 
     native = get_native_kernels()
-    if not native.matmul_q1a8(weight_data, act_data, output, rows, cols, k):
+    compute_start_ns = time.perf_counter_ns() if profile is not None else 0
+    output = bytearray(dst_nbytes)
+    native_used = native.matmul_q1a8(
+        weight_data,
+        act_data,
+        output,
+        rows,
+        cols,
+        k,
+        profile,
+    )
+    if not native_used:
         _run_matmul_q1a8_python(
             weight_data,
             act_data,
@@ -174,8 +240,17 @@ def _run_matmul_q1a8(
             blocks_per_row,
             weight_row_bytes,
         )
+    if profile is not None:
+        _add_elapsed_us(profile, "compute_us", compute_start_ns)
+        profile["native"] = native_used
 
-    allocator.write(dst, dst_offset, output)
+    if profile is None:
+        allocator.write(dst, dst_offset, output)
+    else:
+        write_start_ns = time.perf_counter_ns()
+        allocator.write(dst, dst_offset, output)
+        _add_elapsed_us(profile, "write_us", write_start_ns)
+
     counters.ps_ops += 1
     counters.bytes_read += weight_nbytes + act_nbytes
     counters.bytes_written += dst_nbytes
@@ -221,6 +296,8 @@ def _run_binary_f32(
     allocator: TensorAllocator,
     op: dict[str, Any],
     counters: GraphCounters,
+    profile: dict[str, Any] | None,
+    native_op: str,
     fn,
 ) -> None:
     src0 = _required_int(op, "src0")
@@ -235,18 +312,47 @@ def _run_binary_f32(
 
     elements = rows * cols
     rhs_elements = rows if src1_broadcast else elements
-    src0_values = _read_f32(allocator, src0, src0_offset, elements)
-    src1_values = _read_f32(allocator, src1, src1_offset, rhs_elements)
+    src0_data = _read_bytes(allocator, src0, src0_offset, elements * F32_BYTES, profile)
+    src1_data = _read_bytes(
+        allocator,
+        src1,
+        src1_offset,
+        rhs_elements * F32_BYTES,
+        profile,
+    )
 
-    output = [0.0] * elements
-    for col in range(cols):
-        col_offset = col * rows
-        for row in range(rows):
-            index = col_offset + row
-            rhs_index = row if src1_broadcast else index
-            output[index] = fn(src0_values[index], src1_values[rhs_index])
+    compute_start_ns = time.perf_counter_ns() if profile is not None else 0
+    output = bytearray(elements * F32_BYTES)
+    native = get_native_kernels()
+    native_used = native.binary_f32(
+        native_op,
+        src0_data,
+        src1_data,
+        output,
+        rows,
+        cols,
+        src1_broadcast,
+        profile,
+    )
+    if not native_used:
+        src0_values = _unpack_f32(src0_data, elements)
+        src1_values = _unpack_f32(src1_data, rhs_elements)
+        output_values = [0.0] * elements
+        for col in range(cols):
+            col_offset = col * rows
+            for row in range(rows):
+                index = col_offset + row
+                rhs_index = row if src1_broadcast else index
+                output_values[index] = fn(src0_values[index], src1_values[rhs_index])
+        output = bytearray(struct.pack(f"<{elements}f", *output_values))
+    if profile is not None:
+        _add_elapsed_us(profile, "compute_us", compute_start_ns)
+        profile["native"] = native_used
 
-    _write_f32(allocator, dst, dst_offset, output)
+    _write_bytes(allocator, dst, dst_offset, output, profile)
+    if profile is not None:
+        profile["bytes_read"] = (elements + rhs_elements) * F32_BYTES
+        profile["bytes_written"] = elements * F32_BYTES
     counters.ps_ops += 1
     counters.bytes_read += (elements + rhs_elements) * F32_BYTES
     counters.bytes_written += elements * F32_BYTES
@@ -256,6 +362,7 @@ def _run_scale_f32(
     allocator: TensorAllocator,
     op: dict[str, Any],
     counters: GraphCounters,
+    profile: dict[str, Any] | None,
 ) -> None:
     src = _required_int(op, "src")
     dst = _required_int(op, "dst")
@@ -265,9 +372,23 @@ def _run_scale_f32(
     src_offset = _optional_int(op, "src_offset", 0)
     dst_offset = _optional_int(op, "dst_offset", 0)
 
-    values = _read_f32(allocator, src, src_offset, elements)
-    output = [(value * scale) + bias for value in values]
-    _write_f32(allocator, dst, dst_offset, output)
+    data = _read_bytes(allocator, src, src_offset, elements * F32_BYTES, profile)
+    compute_start_ns = time.perf_counter_ns() if profile is not None else 0
+    output = bytearray(elements * F32_BYTES)
+    native = get_native_kernels()
+    native_used = native.scale_f32(data, output, elements, scale, bias, profile)
+    if not native_used:
+        values = _unpack_f32(data, elements)
+        output = bytearray(
+            struct.pack(f"<{elements}f", *((value * scale) + bias for value in values))
+        )
+    if profile is not None:
+        _add_elapsed_us(profile, "compute_us", compute_start_ns)
+        profile["native"] = native_used
+    _write_bytes(allocator, dst, dst_offset, output, profile)
+    if profile is not None:
+        profile["bytes_read"] = elements * F32_BYTES
+        profile["bytes_written"] = elements * F32_BYTES
     counters.ps_ops += 1
     counters.bytes_read += elements * F32_BYTES
     counters.bytes_written += elements * F32_BYTES
@@ -277,6 +398,7 @@ def _run_silu_f32(
     allocator: TensorAllocator,
     op: dict[str, Any],
     counters: GraphCounters,
+    profile: dict[str, Any] | None,
 ) -> None:
     src = _required_int(op, "src")
     dst = _required_int(op, "dst")
@@ -284,9 +406,21 @@ def _run_silu_f32(
     src_offset = _optional_int(op, "src_offset", 0)
     dst_offset = _optional_int(op, "dst_offset", 0)
 
-    values = _read_f32(allocator, src, src_offset, elements)
-    output = [_silu(value) for value in values]
-    _write_f32(allocator, dst, dst_offset, output)
+    data = _read_bytes(allocator, src, src_offset, elements * F32_BYTES, profile)
+    compute_start_ns = time.perf_counter_ns() if profile is not None else 0
+    output = bytearray(elements * F32_BYTES)
+    native = get_native_kernels()
+    native_used = native.silu_f32(data, output, elements, profile)
+    if not native_used:
+        values = _unpack_f32(data, elements)
+        output = bytearray(struct.pack(f"<{elements}f", *(_silu(value) for value in values)))
+    if profile is not None:
+        _add_elapsed_us(profile, "compute_us", compute_start_ns)
+        profile["native"] = native_used
+    _write_bytes(allocator, dst, dst_offset, output, profile)
+    if profile is not None:
+        profile["bytes_read"] = elements * F32_BYTES
+        profile["bytes_written"] = elements * F32_BYTES
     counters.ps_ops += 1
     counters.bytes_read += elements * F32_BYTES
     counters.bytes_written += elements * F32_BYTES
@@ -296,6 +430,7 @@ def _run_swiglu_f32(
     allocator: TensorAllocator,
     op: dict[str, Any],
     counters: GraphCounters,
+    profile: dict[str, Any] | None,
 ) -> None:
     src0 = _required_int(op, "src0")
     src1 = _required_int(op, "src1")
@@ -305,10 +440,28 @@ def _run_swiglu_f32(
     src1_offset = _optional_int(op, "src1_offset", 0)
     dst_offset = _optional_int(op, "dst_offset", 0)
 
-    gate_values = _read_f32(allocator, src0, src0_offset, elements)
-    up_values = _read_f32(allocator, src1, src1_offset, elements)
-    output = [_silu(gate) * up for gate, up in zip(gate_values, up_values)]
-    _write_f32(allocator, dst, dst_offset, output)
+    gate_data = _read_bytes(allocator, src0, src0_offset, elements * F32_BYTES, profile)
+    up_data = _read_bytes(allocator, src1, src1_offset, elements * F32_BYTES, profile)
+    compute_start_ns = time.perf_counter_ns() if profile is not None else 0
+    output = bytearray(elements * F32_BYTES)
+    native = get_native_kernels()
+    native_used = native.swiglu_f32(gate_data, up_data, output, elements, profile)
+    if not native_used:
+        gate_values = _unpack_f32(gate_data, elements)
+        up_values = _unpack_f32(up_data, elements)
+        output = bytearray(
+            struct.pack(
+                f"<{elements}f",
+                *(_silu(gate) * up for gate, up in zip(gate_values, up_values)),
+            )
+        )
+    if profile is not None:
+        _add_elapsed_us(profile, "compute_us", compute_start_ns)
+        profile["native"] = native_used
+    _write_bytes(allocator, dst, dst_offset, output, profile)
+    if profile is not None:
+        profile["bytes_read"] = 2 * elements * F32_BYTES
+        profile["bytes_written"] = elements * F32_BYTES
     counters.ps_ops += 1
     counters.bytes_read += 2 * elements * F32_BYTES
     counters.bytes_written += elements * F32_BYTES
@@ -318,6 +471,7 @@ def _run_rms_norm_f32(
     allocator: TensorAllocator,
     op: dict[str, Any],
     counters: GraphCounters,
+    profile: dict[str, Any] | None,
 ) -> None:
     src = _required_int(op, "src")
     dst = _required_int(op, "dst")
@@ -328,17 +482,30 @@ def _run_rms_norm_f32(
     dst_offset = _optional_int(op, "dst_offset", 0)
 
     elements = rows * cols
-    values = _read_f32(allocator, src, src_offset, elements)
-    output = [0.0] * elements
-    for col in range(cols):
-        col_offset = col * rows
-        row_values = values[col_offset : col_offset + rows]
-        mean_square = sum(value * value for value in row_values) / rows
-        scale = 1.0 / math.sqrt(mean_square + eps)
-        for row, value in enumerate(row_values):
-            output[col_offset + row] = value * scale
+    data = _read_bytes(allocator, src, src_offset, elements * F32_BYTES, profile)
+    compute_start_ns = time.perf_counter_ns() if profile is not None else 0
+    output = bytearray(elements * F32_BYTES)
+    native = get_native_kernels()
+    native_used = native.rms_norm_f32(data, output, rows, cols, eps, profile)
+    if not native_used:
+        values = _unpack_f32(data, elements)
+        output_values = [0.0] * elements
+        for col in range(cols):
+            col_offset = col * rows
+            row_values = values[col_offset : col_offset + rows]
+            mean_square = sum(value * value for value in row_values) / rows
+            scale = 1.0 / math.sqrt(mean_square + eps)
+            for row, value in enumerate(row_values):
+                output_values[col_offset + row] = value * scale
+        output = bytearray(struct.pack(f"<{elements}f", *output_values))
+    if profile is not None:
+        _add_elapsed_us(profile, "compute_us", compute_start_ns)
+        profile["native"] = native_used
 
-    _write_f32(allocator, dst, dst_offset, output)
+    _write_bytes(allocator, dst, dst_offset, output, profile)
+    if profile is not None:
+        profile["bytes_read"] = elements * F32_BYTES
+        profile["bytes_written"] = elements * F32_BYTES
     counters.ps_ops += 1
     counters.bytes_read += elements * F32_BYTES
     counters.bytes_written += elements * F32_BYTES
@@ -349,9 +516,10 @@ def _read_f32(
     handle: int,
     offset: int,
     elements: int,
+    profile: dict[str, Any] | None = None,
 ) -> tuple[float, ...]:
-    data = allocator.read(handle, offset, elements * F32_BYTES)
-    return struct.unpack(f"<{elements}f", data)
+    data = _read_bytes(allocator, handle, offset, elements * F32_BYTES, profile)
+    return _unpack_f32(data, elements)
 
 
 def _write_f32(
@@ -359,8 +527,96 @@ def _write_f32(
     handle: int,
     offset: int,
     values: list[float],
+    profile: dict[str, Any] | None = None,
 ) -> None:
-    allocator.write(handle, offset, struct.pack(f"<{len(values)}f", *values))
+    _write_bytes(
+        allocator,
+        handle,
+        offset,
+        struct.pack(f"<{len(values)}f", *values),
+        profile,
+    )
+
+
+def _read_bytes(
+    allocator: TensorAllocator,
+    handle: int,
+    offset: int,
+    nbytes: int,
+    profile: dict[str, Any] | None = None,
+) -> bytes:
+    start_ns = time.perf_counter_ns() if profile is not None else 0
+    data = allocator.read(handle, offset, nbytes)
+    if profile is not None:
+        _add_elapsed_us(profile, "read_us", start_ns)
+    return data
+
+
+def _write_bytes(
+    allocator: TensorAllocator,
+    handle: int,
+    offset: int,
+    data: bytes | bytearray,
+    profile: dict[str, Any] | None = None,
+) -> None:
+    start_ns = time.perf_counter_ns() if profile is not None else 0
+    allocator.write(handle, offset, data)
+    if profile is not None:
+        _add_elapsed_us(profile, "write_us", start_ns)
+
+
+def _unpack_f32(data: bytes, elements: int) -> tuple[float, ...]:
+    return struct.unpack(f"<{elements}f", data)
+
+
+def _profile_enabled() -> bool:
+    value = os.environ.get("PYNQ_PROFILE")
+    return value is not None and value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _new_op_profile(op: dict[str, Any], index: int) -> dict[str, Any]:
+    profile: dict[str, Any] = {
+        "index": index,
+        "op": str(op.get("op", "")),
+        "read_us": 0,
+        "compute_us": 0,
+        "write_us": 0,
+        "total_us": 0,
+        "bytes_read": 0,
+        "bytes_written": 0,
+    }
+    name = op.get("name")
+    if isinstance(name, str) and name:
+        profile["name"] = name
+    for key in ("rows", "cols", "k", "elements", "nbytes"):
+        if key in op:
+            profile[key] = int(op[key])
+    return profile
+
+
+def _emit_profile(
+    graph_us: int,
+    ops: list[dict[str, Any]],
+    counters: GraphCounters,
+) -> None:
+    payload = {
+        "graph_us": graph_us,
+        "counters": counters.describe(),
+        "ops": ops,
+    }
+    print(
+        "pynq profile: " + json.dumps(payload, separators=(",", ":")),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _elapsed_us(start_ns: int) -> int:
+    return max(0, (time.perf_counter_ns() - start_ns) // 1000)
+
+
+def _add_elapsed_us(profile: dict[str, Any], key: str, start_ns: int) -> None:
+    profile[key] = int(profile.get(key, 0)) + _elapsed_us(start_ns)
 
 
 def _silu(value: float) -> float:

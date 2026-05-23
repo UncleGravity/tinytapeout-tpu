@@ -107,7 +107,7 @@
               ''
                 runHook preBuild
                 $CC -O3 -std=c99 -fPIC ${sharedFlag} \
-                  -o libbonsai_ps.so bonsai_ps.c
+                  -o libbonsai_ps.so bonsai_ps.c -lm
                 runHook postBuild
               '';
             installPhase = ''

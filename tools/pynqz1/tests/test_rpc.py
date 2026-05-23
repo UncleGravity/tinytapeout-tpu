@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import socket
@@ -11,6 +12,7 @@ import pytest
 from runtime.allocator import fake_allocator
 from runtime.bonsai_rpc import RpcClient, RpcRemoteError
 from runtime.bonsaid import BonsaiRpcServer, BonsaiRuntime
+from runtime.graph import run_graph
 from runtime.ps_native import get_native_kernels
 
 
@@ -373,6 +375,59 @@ def test_run_graph_swiglu_f32_can_alias_gate(client):
         for value, up_value in zip(values, up)
     ]
     assert struct.unpack("<8f", payload) == pytest.approx(expected)
+
+
+def test_run_graph_profile_emits_per_op_json(monkeypatch, capsys):
+    allocator = fake_allocator(total_bytes=4096, slab_bytes=4096)
+    src = allocator.allocate(16, usage="profile-src").handle
+    dst = allocator.allocate(16, usage="profile-dst").handle
+    allocator.write(src, 0, b"0123456789abcdef")
+    monkeypatch.setenv("PYNQ_PROFILE", "1")
+
+    result = run_graph(
+        allocator,
+        {
+            "graph_version": 1,
+            "ops": [
+                {
+                    "op": "COPY",
+                    "name": "copy-profile",
+                    "src": src,
+                    "dst": dst,
+                    "nbytes": 16,
+                },
+            ],
+            "outputs": [dst],
+        },
+    )
+
+    assert result["counters"]["bytes_read"] == 16
+    captured = capsys.readouterr()
+    lines = [
+        line.removeprefix("pynq profile: ")
+        for line in captured.err.splitlines()
+        if line.startswith("pynq profile: ")
+    ]
+    assert len(lines) == 1
+
+    profile = json.loads(lines[0])
+    assert profile["graph_us"] >= 0
+    assert profile["counters"]["bytes_read"] == 16
+    assert profile["counters"]["bytes_written"] == 16
+    assert profile["ops"] == [
+        {
+            "index": 0,
+            "op": "COPY",
+            "read_us": profile["ops"][0]["read_us"],
+            "compute_us": 0,
+            "write_us": profile["ops"][0]["write_us"],
+            "total_us": profile["ops"][0]["total_us"],
+            "bytes_read": 16,
+            "bytes_written": 16,
+            "name": "copy-profile",
+            "nbytes": 16,
+        },
+    ]
 
 
 def test_unsupported_graph_op_is_reported(client):
