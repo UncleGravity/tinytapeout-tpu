@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from runtime.allocator import AllocatorError, TensorAllocator
+from runtime.ps_native import get_native_kernels
 
 
 GRAPH_VERSION = 1
@@ -157,8 +158,37 @@ def _run_matmul_q1a8(
     act_data = allocator.read(acts, acts_offset, act_nbytes)
     output = bytearray(dst_nbytes)
 
+    native = get_native_kernels()
+    if not native.matmul_q1a8(weight_data, act_data, output, rows, cols, k):
+        _run_matmul_q1a8_python(
+            weight_data,
+            act_data,
+            output,
+            rows,
+            cols,
+            k,
+            blocks_per_row,
+            weight_row_bytes,
+        )
+
+    allocator.write(dst, dst_offset, output)
+    counters.ps_ops += 1
+    counters.bytes_read += weight_nbytes + act_nbytes
+    counters.bytes_written += dst_nbytes
+
+
+def _run_matmul_q1a8_python(
+    weight_data: bytes,
+    act_data: bytes,
+    output: bytearray,
+    rows: int,
+    cols: int,
+    k: int,
+    blocks_per_row: int,
+    weight_row_bytes: int,
+) -> None:
     for col in range(cols):
-        act_row_offset = col * k * struct.calcsize("<f")
+        act_row_offset = col * k * F32_BYTES
         act_row = struct.unpack_from(f"<{k}f", act_data, act_row_offset)
         act_quants, act_scales = _quantize_acts_q8_0(act_row)
         for row in range(rows):
@@ -180,12 +210,7 @@ def _run_matmul_q1a8(
                         act_quants,
                     )
                     acc += weight_scale * act_scale * sub_sum
-            struct.pack_into("<f", output, (col * rows + row) * 4, acc)
-
-    allocator.write(dst, dst_offset, output)
-    counters.ps_ops += 1
-    counters.bytes_read += weight_nbytes + act_nbytes
-    counters.bytes_written += dst_nbytes
+            struct.pack_into("<f", output, (col * rows + row) * F32_BYTES, acc)
 
 
 def _run_binary_f32(

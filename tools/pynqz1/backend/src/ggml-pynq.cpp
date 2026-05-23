@@ -50,11 +50,6 @@ struct RemoteBinding {
     size_t remote_offset = 0;
 };
 
-struct RemoteAllocation {
-    uint64_t handle = 0;
-    size_t nbytes = 0;
-};
-
 struct F32BinaryLowering {
     const ggml_tensor * src0 = nullptr;
     const ggml_tensor * src1 = nullptr;
@@ -68,8 +63,9 @@ struct BufferContext {
     pynq::RpcClient rpc;
     void * base = nullptr;
     size_t size = 0;
+    uint64_t remote_handle = 0;
+    size_t remote_nbytes = 0;
     std::unordered_map<const ggml_tensor *, RemoteBinding> bindings;
-    std::vector<RemoteAllocation> allocations;
 };
 
 static ggml_guid_t backend_guid() {
@@ -104,14 +100,6 @@ static BufferContext * buffer_ctx(ggml_backend_buffer_t buffer) {
 static const RemoteBinding * find_binding(BufferContext * ctx, const ggml_tensor * tensor) {
     const auto it = ctx->bindings.find(tensor);
     return it == ctx->bindings.end() ? nullptr : &it->second;
-}
-
-static nlohmann::json tensor_shape(const ggml_tensor * tensor) {
-    nlohmann::json shape = nlohmann::json::array();
-    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-        shape.push_back(tensor->ne[i]);
-    }
-    return shape;
 }
 
 static bool trace_enabled() {
@@ -168,23 +156,56 @@ static void upload_fill(BufferContext * ctx, uint64_t handle, size_t offset, siz
     }
 }
 
-static void free_allocations(BufferContext * ctx) {
-    for (const RemoteAllocation & allocation : ctx->allocations) {
+static bool tensor_buffer_offset(
+    const BufferContext * ctx,
+    const ggml_tensor * tensor,
+    size_t * offset) {
+    if (ctx->size == 0) {
+        *offset = 0;
+        return ggml_nbytes(tensor) == 0;
+    }
+    if (ctx->base == nullptr || tensor->data == nullptr) {
+        return false;
+    }
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(ctx->base);
+    const uintptr_t data = reinterpret_cast<uintptr_t>(tensor->data);
+    if (data < base) {
+        return false;
+    }
+
+    const size_t local_offset = static_cast<size_t>(data - base);
+    const size_t nbytes = ggml_nbytes(tensor);
+    try {
+        if (add_checked(local_offset, nbytes) > ctx->size) {
+            return false;
+        }
+    } catch (const pynq::RpcError &) {
+        return false;
+    }
+
+    *offset = local_offset;
+    return true;
+}
+
+static void free_buffer_allocation(BufferContext * ctx) {
+    if (ctx->remote_handle != 0) {
         try {
-            ctx->rpc.call("FREE_TENSOR", { { "handle", allocation.handle } });
+            ctx->rpc.call("FREE_TENSOR", { { "handle", ctx->remote_handle } });
             if (trace_enabled()) {
                 tracef(
                     "pynq trace: free handle=%llu bytes=%zu\n",
-                    static_cast<unsigned long long>(allocation.handle),
-                    allocation.nbytes);
+                    static_cast<unsigned long long>(ctx->remote_handle),
+                    ctx->remote_nbytes);
             }
         } catch (const std::exception & exc) {
             GGML_LOG_WARN("pynq: FREE_TENSOR failed for handle %llu: %s\n",
-                static_cast<unsigned long long>(allocation.handle),
+                static_cast<unsigned long long>(ctx->remote_handle),
                 exc.what());
         }
+        ctx->remote_handle = 0;
+        ctx->remote_nbytes = 0;
     }
-    ctx->allocations.clear();
     ctx->bindings.clear();
 }
 
@@ -205,7 +226,7 @@ static void release_fake_base(void * base, size_t size) {
 
 static void pynq_buffer_free(ggml_backend_buffer_t buffer) {
     BufferContext * ctx = buffer_ctx(buffer);
-    free_allocations(ctx);
+    free_buffer_allocation(ctx);
     release_fake_base(ctx->base, ctx->size);
     delete ctx;
 }
@@ -258,32 +279,31 @@ static enum ggml_status pynq_buffer_init_tensor(
         }
 
         const size_t nbytes = ggml_nbytes(tensor);
-        const pynq::RpcResponse response = ctx->rpc.call(
-            "ALLOC_TENSOR",
-            {
-                { "nbytes", nbytes },
-                { "shape", tensor_shape(tensor) },
-                { "dtype", ggml_type_name(tensor->type) },
-                { "usage", "ggml" },
-                { "layout", "ggml" },
-                { "alignment", k_alignment },
-            });
-        const nlohmann::json & remote = response.result.at("tensor");
-        const uint64_t handle = remote.at("handle").get<uint64_t>();
-        const size_t remote_nbytes = remote.at("nbytes").get<size_t>();
-        ctx->bindings.emplace(tensor, RemoteBinding {
-            handle,
-            remote_nbytes,
+        size_t remote_offset = 0;
+        if (!tensor_buffer_offset(ctx, tensor, &remote_offset)) {
+            GGML_LOG_ERROR("pynq: tensor %s is outside its PYNQ buffer arena\n", tensor->name);
+            return GGML_STATUS_FAILED;
+        }
+        if (nbytes != 0 && ctx->remote_handle == 0) {
+            GGML_LOG_ERROR("pynq: tensor %s has no backing PYNQ buffer allocation\n", tensor->name);
+            return GGML_STATUS_FAILED;
+        }
+
+        RemoteBinding binding {
+            ctx->remote_handle,
+            ctx->remote_nbytes,
             nbytes,
-            0,
-        });
-        ctx->allocations.push_back(RemoteAllocation { handle, remote_nbytes });
+            remote_offset,
+        };
+        if (!remote_range_is_valid(binding, 0, nbytes)) {
+            GGML_LOG_ERROR("pynq: tensor %s exceeds its PYNQ buffer allocation\n", tensor->name);
+            return GGML_STATUS_FAILED;
+        }
+        ctx->bindings.emplace(tensor, binding);
         if (trace_enabled()) {
-            const size_t allocated_total =
-                g_trace_allocated_bytes.fetch_add(remote_nbytes) + remote_nbytes;
             tracef(
-                "pynq trace: alloc name=%s type=%s shape=[%lld,%lld,%lld,%lld] "
-                "bytes=%zu handle=%llu remote_bytes=%zu allocated_total=%.2f MiB\n",
+                "pynq trace: bind name=%s type=%s shape=[%lld,%lld,%lld,%lld] "
+                "bytes=%zu handle=%llu offset=%zu buffer_bytes=%zu\n",
                 tensor_name(tensor),
                 ggml_type_name(tensor->type),
                 static_cast<long long>(tensor->ne[0]),
@@ -291,9 +311,9 @@ static enum ggml_status pynq_buffer_init_tensor(
                 static_cast<long long>(tensor->ne[2]),
                 static_cast<long long>(tensor->ne[3]),
                 nbytes,
-                static_cast<unsigned long long>(handle),
-                remote_nbytes,
-                mib(allocated_total));
+                static_cast<unsigned long long>(ctx->remote_handle),
+                remote_offset,
+                ctx->remote_nbytes);
         }
         return GGML_STATUS_SUCCESS;
     } catch (const std::exception & exc) {
@@ -430,29 +450,31 @@ static bool pynq_buffer_cpy_tensor(
 
 static void pynq_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     BufferContext * ctx = buffer_ctx(buffer);
-    for (const RemoteAllocation & allocation : ctx->allocations) {
-        try {
-            upload_fill(ctx, allocation.handle, 0, allocation.nbytes, value);
-            if (trace_enabled()) {
-                const size_t uploaded_total =
-                    g_trace_uploaded_bytes.fetch_add(allocation.nbytes) + allocation.nbytes;
-                tracef(
-                    "pynq trace: clear handle=%llu bytes=%zu value=%u uploaded_total=%.2f MiB\n",
-                    static_cast<unsigned long long>(allocation.handle),
-                    allocation.nbytes,
-                    static_cast<unsigned>(value),
-                    mib(uploaded_total));
-            }
-        } catch (const std::exception & exc) {
-            GGML_LOG_ERROR("pynq: clear failed for handle %llu: %s\n",
-                static_cast<unsigned long long>(allocation.handle),
-                exc.what());
+    if (ctx->remote_handle == 0 || ctx->remote_nbytes == 0) {
+        return;
+    }
+
+    try {
+        upload_fill(ctx, ctx->remote_handle, 0, ctx->remote_nbytes, value);
+        if (trace_enabled()) {
+            const size_t uploaded_total =
+                g_trace_uploaded_bytes.fetch_add(ctx->remote_nbytes) + ctx->remote_nbytes;
+            tracef(
+                "pynq trace: clear handle=%llu bytes=%zu value=%u uploaded_total=%.2f MiB\n",
+                static_cast<unsigned long long>(ctx->remote_handle),
+                ctx->remote_nbytes,
+                static_cast<unsigned>(value),
+                mib(uploaded_total));
         }
+    } catch (const std::exception & exc) {
+        GGML_LOG_ERROR("pynq: clear failed for handle %llu: %s\n",
+            static_cast<unsigned long long>(ctx->remote_handle),
+            exc.what());
     }
 }
 
 static void pynq_buffer_reset(ggml_backend_buffer_t buffer) {
-    free_allocations(buffer_ctx(buffer));
+    buffer_ctx(buffer)->bindings.clear();
 }
 
 static const ggml_backend_buffer_i buffer_i = {
@@ -477,8 +499,9 @@ static const char * buffer_type_get_name(ggml_backend_buffer_type_t buft) {
 static ggml_backend_buffer_t buffer_type_alloc_buffer(
     ggml_backend_buffer_type_t buft,
     size_t size) {
+    std::unique_ptr<BufferContext> ctx;
     try {
-        std::unique_ptr<BufferContext> ctx(new BufferContext(pynq::endpoint_from_env()));
+        ctx.reset(new BufferContext(pynq::endpoint_from_env()));
         ctx->base = reserve_fake_base(size);
         ctx->size = size;
         if (size != 0 && ctx->base == nullptr) {
@@ -486,14 +509,47 @@ static ggml_backend_buffer_t buffer_type_alloc_buffer(
             return nullptr;
         }
 
-        if (trace_enabled()) {
-            tracef(
-                "pynq trace: buffer reserve bytes=%zu fake_base=%p\n",
-                size,
-                ctx->base);
+        if (size != 0) {
+            const pynq::RpcResponse response = ctx->rpc.call(
+                "ALLOC_TENSOR",
+                {
+                    { "nbytes", size },
+                    { "shape", nlohmann::json::array({ size }) },
+                    { "dtype", "u8" },
+                    { "usage", "ggml-buffer" },
+                    { "layout", "ggml-buffer" },
+                    { "alignment", k_alignment },
+                });
+            const nlohmann::json & remote = response.result.at("tensor");
+            ctx->remote_handle = remote.at("handle").get<uint64_t>();
+            ctx->remote_nbytes = remote.at("nbytes").get<size_t>();
         }
-        return ggml_backend_buffer_init(buft, buffer_i, ctx.release(), size);
+
+        if (trace_enabled()) {
+            const size_t allocated_total =
+                g_trace_allocated_bytes.fetch_add(ctx->remote_nbytes) + ctx->remote_nbytes;
+            tracef(
+                "pynq trace: buffer reserve bytes=%zu fake_base=%p handle=%llu "
+                "remote_bytes=%zu allocated_total=%.2f MiB\n",
+                size,
+                ctx->base,
+                static_cast<unsigned long long>(ctx->remote_handle),
+                ctx->remote_nbytes,
+                mib(allocated_total));
+        }
+        ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft, buffer_i, ctx.get(), size);
+        if (buffer == nullptr) {
+            free_buffer_allocation(ctx.get());
+            release_fake_base(ctx->base, ctx->size);
+            return nullptr;
+        }
+        ctx.release();
+        return buffer;
     } catch (const std::exception & exc) {
+        if (ctx != nullptr) {
+            free_buffer_allocation(ctx.get());
+            release_fake_base(ctx->base, ctx->size);
+        }
         GGML_LOG_ERROR("pynq: buffer allocation failed before tensor init: %s\n", exc.what());
         return nullptr;
     }

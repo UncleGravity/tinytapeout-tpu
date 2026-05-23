@@ -95,6 +95,28 @@
           pynqBackend = pkgs.callPackage ./backend/package.nix {
             llamaCppSrc = llama-cpp-src;
           };
+          bonsaiPsNative = pkgs.stdenv.mkDerivation {
+            pname = "bonsai-ps-native";
+            version = "0.1.0";
+            src = ./runtime/native;
+            dontConfigure = true;
+            buildPhase =
+              let
+                sharedFlag = if pkgs.stdenv.isDarwin then "-dynamiclib" else "-shared";
+              in
+              ''
+                runHook preBuild
+                $CC -O3 -std=c99 -fPIC ${sharedFlag} \
+                  -o libbonsai_ps.so bonsai_ps.c
+                runHook postBuild
+              '';
+            installPhase = ''
+              runHook preInstall
+              mkdir -p "$out/lib"
+              cp libbonsai_ps.so "$out/lib/"
+              runHook postInstall
+            '';
+          };
 
           mkTool = name: script: toolInputs:
             pkgs.writeShellApplication {
@@ -108,6 +130,7 @@
         {
           pynqctl = mkTool "pynqctl" "tools/pynqctl.py" [ ];
           pynq-board = mkTool "pynq-board" "tools/pynq_board.py" boardTransportTools;
+          bonsai-ps-native = bonsaiPsNative;
           inherit (pynqBackend) llama-cpp-dl llama-cli-pynq pynq-backend;
           default = self.packages.${system}.pynqctl;
         });
@@ -142,6 +165,7 @@
 
       checks = forAllSystems (pkgs:
         let
+          system = pkgs.stdenv.hostPlatform.system;
           python = pkgs.python3.withPackages (ps: [
             ps.numpy
             ps.pytest
@@ -159,6 +183,7 @@
             "runtime/bonsai_rpc.py"
             "runtime/bonsaid.py"
             "runtime/graph.py"
+            "runtime/ps_native.py"
             "tests/conftest.py"
             "tests/test_pynqctl.py"
             "tests/test_pynq_board.py"
@@ -172,6 +197,7 @@
           pynqBackend = pkgs.callPackage ./backend/package.nix {
             llamaCppSrc = llama-cpp-src;
           };
+          bonsaiPsNative = self.packages.${system}.bonsai-ps-native;
         in
         {
           python-syntax = pkgs.runCommand "pynqz1-python-syntax"
@@ -189,7 +215,7 @@
           runtime-tests = pkgs.runCommand "pynqz1-runtime-tests"
             {
               src = ./.;
-              nativeBuildInputs = [ python ];
+              nativeBuildInputs = [ python bonsaiPsNative ];
             }
             ''
               cp -R "$src" source
@@ -197,6 +223,7 @@
               cd source
               export PYTHONPYCACHEPREFIX="$TMPDIR/pycache"
               export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+              export PYNQ_PS_LIB="${bonsaiPsNative}/lib/libbonsai_ps.so"
               python -m pytest -q tests
               touch "$out"
             '';
@@ -213,6 +240,7 @@
               export PYTHONPYCACHEPREFIX="$TMPDIR/pycache"
               export PYNQ_BONSAID_HOST=127.0.0.1
               export PYNQ_BONSAID_PORT=50055
+              export PYNQ_PS_LIB="${bonsaiPsNative}/lib/libbonsai_ps.so"
               python "$src/runtime/bonsaid.py" \
                 --host "$PYNQ_BONSAID_HOST" \
                 --port "$PYNQ_BONSAID_PORT" \

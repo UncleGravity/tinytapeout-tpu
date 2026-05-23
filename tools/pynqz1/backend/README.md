@@ -6,7 +6,8 @@ The first backend version owns remote buffers and the first graph ops:
 
 - it registers one PYNQ accelerator device;
 - `ggml_backend_dev_memory()` reports the daemon allocator memory;
-- ggml buffer allocation creates daemon tensor handles;
+- ggml buffer allocation creates one daemon tensor handle per ggml buffer arena;
+- tensor init binds each ggml tensor to an offset inside its arena handle;
 - tensor set/get/memset/clear use the runtime tensor RPCs;
 - tensor views share the remote allocation and carry an offset;
 - contiguous same-type ggml `CPY` nodes lower to runtime graph version 1
@@ -34,6 +35,15 @@ a ggml view write, a ggml `CPY` graph, direct `MUL_MAT` lowering, and
 nix run .#pynq-backend-smoke
 ```
 
+`bonsaid` can use a native PS shared library for `MATMUL_Q1A8` when
+`PYNQ_PS_LIB` points at `libbonsai_ps.so`. Build it on the board before
+starting the daemon:
+
+```sh
+nix run .#pynq-board -- build-native
+nix run .#pynq-board -- daemon
+```
+
 For llama.cpp dynamic loading, use the packaged wrapper:
 
 ```sh
@@ -42,7 +52,7 @@ nix run .#llama-cli-pynq -- --help
 
 Set `PYNQ_TRACE=1` on the host process when diagnosing model load or graph
 placement. The backend writes flushed trace lines to stderr for device memory
-queries, remote buffer reservations, tensor handle allocations,
+queries, remote buffer reservations, tensor arena bindings,
 uploads/downloads with cumulative byte counts, and each lowered graph op or
 `RUN_GRAPH` call:
 

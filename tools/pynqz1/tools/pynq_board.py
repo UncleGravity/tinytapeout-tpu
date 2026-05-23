@@ -56,11 +56,13 @@ def rsync_runtime_command(config: BoardConfig, root: Path | None = None) -> list
 
 
 def remote_daemon_command(config: BoardConfig) -> str:
+    native_lib = f"{config.remote_dir}/runtime/native/libbonsai_ps.so"
     daemon = [
         "sudo",
         "env",
         "XILINX_XRT=/usr",
         "PYNQ_PYTHON=python3.10",
+        f"PYNQ_PS_LIB={native_lib}",
         config.board_python,
         "-m",
         "runtime.bonsaid",
@@ -82,8 +84,35 @@ def remote_daemon_command(config: BoardConfig) -> str:
     return f"cd {shlex.quote(config.remote_dir)} && exec {shlex.join(daemon)}"
 
 
+def remote_native_build_command(config: BoardConfig) -> str:
+    output = "runtime/native/libbonsai_ps.so"
+    tmp_output = "/tmp/libbonsai_ps.so"
+    build = [
+        "gcc",
+        "-O3",
+        "-std=c99",
+        "-fPIC",
+        "-shared",
+        "-o",
+        tmp_output,
+        "runtime/native/bonsai_ps.c",
+    ]
+    install = ["sudo", "install", "-m", "0755", tmp_output, output]
+    cleanup = ["rm", "-f", tmp_output]
+    return (
+        f"cd {shlex.quote(config.remote_dir)} && "
+        f"{shlex.join(build)} && "
+        f"{shlex.join(install)} && "
+        f"{shlex.join(cleanup)}"
+    )
+
+
 def ssh_daemon_command(config: BoardConfig) -> list[str]:
     return ["ssh", "-tt", config.ssh_target, remote_daemon_command(config)]
+
+
+def ssh_native_build_command(config: BoardConfig) -> list[str]:
+    return ["ssh", "-tt", config.ssh_target, remote_native_build_command(config)]
 
 
 def pynqctl_args(config: BoardConfig, command: list[str]) -> list[str]:
@@ -107,6 +136,15 @@ def cmd_daemon(args: argparse.Namespace) -> int:
         if rc != 0:
             return rc
     return run_command(ssh_daemon_command(config))
+
+
+def cmd_build_native(args: argparse.Namespace) -> int:
+    config = config_from_args(args)
+    if not args.no_sync:
+        rc = run_command(rsync_runtime_command(config))
+        if rc != 0:
+            return rc
+    return run_command(ssh_native_build_command(config))
 
 
 def cmd_hello(args: argparse.Namespace) -> int:
@@ -184,6 +222,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="run the daemon from already-copied board files",
     )
     daemon.set_defaults(func=cmd_daemon)
+
+    build_native = subparsers.add_parser(
+        "build-native",
+        help="sync runtime and compile the PS native shared library on the board",
+    )
+    build_native.add_argument(
+        "--no-sync",
+        action="store_true",
+        help="build from already-copied board files",
+    )
+    build_native.set_defaults(func=cmd_build_native)
 
     hello = subparsers.add_parser("hello", help="query board bonsaid over RPC")
     hello.set_defaults(func=cmd_hello)

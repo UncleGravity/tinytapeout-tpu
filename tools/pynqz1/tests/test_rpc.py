@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import socket
 import struct
 import threading
@@ -10,6 +11,7 @@ import pytest
 from runtime.allocator import fake_allocator
 from runtime.bonsai_rpc import RpcClient, RpcRemoteError
 from runtime.bonsaid import BonsaiRpcServer, BonsaiRuntime
+from runtime.ps_native import get_native_kernels
 
 
 @pytest.fixture
@@ -55,6 +57,14 @@ def test_hello_reports_memory_and_capabilities(client):
         "SILU_F32",
         "RMS_NORM_F32",
     ]
+
+
+def test_native_kernel_loads_when_configured():
+    if "PYNQ_PS_LIB" not in os.environ:
+        pytest.skip("PYNQ_PS_LIB is not configured")
+
+    native = get_native_kernels()
+    assert native.available
 
 
 def assert_counters(result, expected):
