@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import struct
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +13,7 @@ GRAPH_VERSION = 1
 Q1_BLOCK = 128
 Q1_BLOCK_BYTES = 18
 Q8_BLOCK = 32
+F32_BYTES = struct.calcsize("<f")
 
 
 @dataclass
@@ -20,6 +22,7 @@ class GraphCounters:
     pl_ops: int = 0
     bytes_read: int = 0
     bytes_written: int = 0
+    elapsed_us: int = 0
 
     def describe(self) -> dict[str, int]:
         return {
@@ -27,6 +30,7 @@ class GraphCounters:
             "pl_ops": self.pl_ops,
             "bytes_read": self.bytes_read,
             "bytes_written": self.bytes_written,
+            "elapsed_us": self.elapsed_us,
         }
 
 
@@ -43,9 +47,11 @@ def run_graph(
     ops = _required_ops(metadata)
     outputs = _optional_int_list(metadata, "outputs")
     counters = GraphCounters()
+    start_ns = time.perf_counter_ns()
 
     for index, op in enumerate(ops):
         _run_op(allocator, op, index, counters)
+    counters.elapsed_us = max(0, (time.perf_counter_ns() - start_ns) // 1000)
 
     for handle in outputs:
         allocator.describe(handle)
@@ -74,6 +80,26 @@ def _run_op(
 
     if op_name == "MATMUL_Q1A8":
         _run_matmul_q1a8(allocator, op, counters)
+        return
+
+    if op_name == "ADD_F32":
+        _run_binary_f32(allocator, op, counters, lambda lhs, rhs: lhs + rhs)
+        return
+
+    if op_name == "MUL_F32":
+        _run_binary_f32(allocator, op, counters, lambda lhs, rhs: lhs * rhs)
+        return
+
+    if op_name == "SCALE_F32":
+        _run_scale_f32(allocator, op, counters)
+        return
+
+    if op_name == "SILU_F32":
+        _run_silu_f32(allocator, op, counters)
+        return
+
+    if op_name == "RMS_NORM_F32":
+        _run_rms_norm_f32(allocator, op, counters)
         return
 
     raise AllocatorError(
@@ -124,8 +150,8 @@ def _run_matmul_q1a8(
     blocks_per_row = k // Q1_BLOCK
     weight_row_bytes = blocks_per_row * Q1_BLOCK_BYTES
     weight_nbytes = rows * weight_row_bytes
-    act_nbytes = cols * k * struct.calcsize("<f")
-    dst_nbytes = rows * cols * struct.calcsize("<f")
+    act_nbytes = cols * k * F32_BYTES
+    dst_nbytes = rows * cols * F32_BYTES
 
     weight_data = allocator.read(weights, weights_offset, weight_nbytes)
     act_data = allocator.read(acts, acts_offset, act_nbytes)
@@ -160,6 +186,137 @@ def _run_matmul_q1a8(
     counters.ps_ops += 1
     counters.bytes_read += weight_nbytes + act_nbytes
     counters.bytes_written += dst_nbytes
+
+
+def _run_binary_f32(
+    allocator: TensorAllocator,
+    op: dict[str, Any],
+    counters: GraphCounters,
+    fn,
+) -> None:
+    src0 = _required_int(op, "src0")
+    src1 = _required_int(op, "src1")
+    dst = _required_int(op, "dst")
+    rows = _positive_int(op, "rows")
+    cols = _positive_int(op, "cols")
+    src0_offset = _optional_int(op, "src0_offset", 0)
+    src1_offset = _optional_int(op, "src1_offset", 0)
+    dst_offset = _optional_int(op, "dst_offset", 0)
+    src1_broadcast = _optional_bool(op, "src1_broadcast", False)
+
+    elements = rows * cols
+    rhs_elements = rows if src1_broadcast else elements
+    src0_values = _read_f32(allocator, src0, src0_offset, elements)
+    src1_values = _read_f32(allocator, src1, src1_offset, rhs_elements)
+
+    output = [0.0] * elements
+    for col in range(cols):
+        col_offset = col * rows
+        for row in range(rows):
+            index = col_offset + row
+            rhs_index = row if src1_broadcast else index
+            output[index] = fn(src0_values[index], src1_values[rhs_index])
+
+    _write_f32(allocator, dst, dst_offset, output)
+    counters.ps_ops += 1
+    counters.bytes_read += (elements + rhs_elements) * F32_BYTES
+    counters.bytes_written += elements * F32_BYTES
+
+
+def _run_scale_f32(
+    allocator: TensorAllocator,
+    op: dict[str, Any],
+    counters: GraphCounters,
+) -> None:
+    src = _required_int(op, "src")
+    dst = _required_int(op, "dst")
+    elements = _positive_int(op, "elements")
+    scale = _required_float(op, "scale")
+    bias = _optional_float(op, "bias", 0.0)
+    src_offset = _optional_int(op, "src_offset", 0)
+    dst_offset = _optional_int(op, "dst_offset", 0)
+
+    values = _read_f32(allocator, src, src_offset, elements)
+    output = [(value * scale) + bias for value in values]
+    _write_f32(allocator, dst, dst_offset, output)
+    counters.ps_ops += 1
+    counters.bytes_read += elements * F32_BYTES
+    counters.bytes_written += elements * F32_BYTES
+
+
+def _run_silu_f32(
+    allocator: TensorAllocator,
+    op: dict[str, Any],
+    counters: GraphCounters,
+) -> None:
+    src = _required_int(op, "src")
+    dst = _required_int(op, "dst")
+    elements = _positive_int(op, "elements")
+    src_offset = _optional_int(op, "src_offset", 0)
+    dst_offset = _optional_int(op, "dst_offset", 0)
+
+    values = _read_f32(allocator, src, src_offset, elements)
+    output = [_silu(value) for value in values]
+    _write_f32(allocator, dst, dst_offset, output)
+    counters.ps_ops += 1
+    counters.bytes_read += elements * F32_BYTES
+    counters.bytes_written += elements * F32_BYTES
+
+
+def _run_rms_norm_f32(
+    allocator: TensorAllocator,
+    op: dict[str, Any],
+    counters: GraphCounters,
+) -> None:
+    src = _required_int(op, "src")
+    dst = _required_int(op, "dst")
+    rows = _positive_int(op, "rows")
+    cols = _positive_int(op, "cols")
+    eps = _required_float(op, "eps")
+    src_offset = _optional_int(op, "src_offset", 0)
+    dst_offset = _optional_int(op, "dst_offset", 0)
+
+    elements = rows * cols
+    values = _read_f32(allocator, src, src_offset, elements)
+    output = [0.0] * elements
+    for col in range(cols):
+        col_offset = col * rows
+        row_values = values[col_offset : col_offset + rows]
+        mean_square = sum(value * value for value in row_values) / rows
+        scale = 1.0 / math.sqrt(mean_square + eps)
+        for row, value in enumerate(row_values):
+            output[col_offset + row] = value * scale
+
+    _write_f32(allocator, dst, dst_offset, output)
+    counters.ps_ops += 1
+    counters.bytes_read += elements * F32_BYTES
+    counters.bytes_written += elements * F32_BYTES
+
+
+def _read_f32(
+    allocator: TensorAllocator,
+    handle: int,
+    offset: int,
+    elements: int,
+) -> tuple[float, ...]:
+    data = allocator.read(handle, offset, elements * F32_BYTES)
+    return struct.unpack(f"<{elements}f", data)
+
+
+def _write_f32(
+    allocator: TensorAllocator,
+    handle: int,
+    offset: int,
+    values: list[float],
+) -> None:
+    allocator.write(handle, offset, struct.pack(f"<{len(values)}f", *values))
+
+
+def _silu(value: float) -> float:
+    if value >= 0.0:
+        return value / (1.0 + math.exp(-value))
+    exp_value = math.exp(value)
+    return value * exp_value / (1.0 + exp_value)
 
 
 def _quantize_acts_q8_0(values: tuple[float, ...]) -> tuple[list[int], list[float]]:
@@ -235,6 +392,34 @@ def _optional_int(metadata: dict[str, Any], key: str, default: int) -> int:
     if key not in metadata:
         return default
     return _non_negative_int(metadata[key], key)
+
+
+def _positive_int(metadata: dict[str, Any], key: str) -> int:
+    parsed = _required_int(metadata, key)
+    if parsed <= 0:
+        raise AllocatorError("invalid_request", f"{key} must be positive")
+    return parsed
+
+
+def _required_float(metadata: dict[str, Any], key: str) -> float:
+    if key not in metadata:
+        raise AllocatorError("invalid_request", f"missing {key}")
+    return float(metadata[key])
+
+
+def _optional_float(metadata: dict[str, Any], key: str, default: float) -> float:
+    if key not in metadata:
+        return default
+    return float(metadata[key])
+
+
+def _optional_bool(metadata: dict[str, Any], key: str, default: bool) -> bool:
+    if key not in metadata:
+        return default
+    value = metadata[key]
+    if not isinstance(value, bool):
+        raise AllocatorError("invalid_request", f"{key} must be boolean")
+    return value
 
 
 def _non_negative_int(value: object, name: str) -> int:

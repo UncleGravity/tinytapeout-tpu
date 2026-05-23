@@ -15,6 +15,8 @@ namespace {
 constexpr int64_t k_matmul_k = 128;
 constexpr int64_t k_matmul_rows = 3;
 constexpr int64_t k_matmul_cols = 2;
+constexpr int64_t k_glue_rows = 4;
+constexpr int64_t k_glue_cols = 2;
 
 float fp16_roundtrip(float value) {
     return ggml_fp16_to_fp32(ggml_fp32_to_fp16(value));
@@ -131,6 +133,55 @@ std::vector<float> expected_matmul(
     return output;
 }
 
+float silu(float value) {
+    if (value >= 0.0f) {
+        return value / (1.0f + std::exp(-value));
+    }
+    const float exp_value = std::exp(value);
+    return value * exp_value / (1.0f + exp_value);
+}
+
+std::vector<float> make_glue_input() {
+    return {
+        0.5f, -1.0f, 2.0f, -4.0f,
+        1.5f, -2.0f, 3.0f, -6.0f,
+    };
+}
+
+std::vector<float> make_glue_bias() {
+    return { 1.0f, 0.5f, -0.25f, 2.0f };
+}
+
+std::vector<float> expected_glue_output(
+    const std::vector<float> & input,
+    const std::vector<float> & bias) {
+    std::vector<float> scaled(input.size());
+    for (int64_t col = 0; col < k_glue_cols; ++col) {
+        for (int64_t row = 0; row < k_glue_rows; ++row) {
+            const size_t index = static_cast<size_t>(col * k_glue_rows + row);
+            scaled[index] = (input[index] + bias[static_cast<size_t>(row)]) * 0.5f;
+        }
+    }
+
+    std::vector<float> output(input.size());
+    for (int64_t col = 0; col < k_glue_cols; ++col) {
+        float mean_square = 0.0f;
+        for (int64_t row = 0; row < k_glue_rows; ++row) {
+            const float value =
+                scaled[static_cast<size_t>(col * k_glue_rows + row)];
+            mean_square += value * value;
+        }
+        mean_square /= static_cast<float>(k_glue_rows);
+        const float rms_scale = 1.0f / std::sqrt(mean_square + 1.0e-6f);
+        for (int64_t row = 0; row < k_glue_rows; ++row) {
+            const size_t index = static_cast<size_t>(col * k_glue_rows + row);
+            output[index] =
+                silu(scaled[index] * rms_scale) * bias[static_cast<size_t>(row)];
+        }
+    }
+    return output;
+}
+
 bool quantize_matmul_weights(
     const std::vector<float> & weights,
     std::vector<uint8_t> * q1_weights) {
@@ -146,6 +197,82 @@ bool quantize_matmul_weights(
         k_matmul_k,
         nullptr);
     return written == q1_weights->size();
+}
+
+bool scheduler_glue_smoke(
+    ggml_backend_t backend,
+    ggml_backend_t cpu_backend,
+    const std::vector<float> & input_data,
+    const std::vector<float> & bias_data,
+    const std::vector<float> & expected,
+    int * split_count) {
+    constexpr size_t graph_size = 16;
+    const ggml_init_params params = {
+        /* .mem_size   = */ 8 * ggml_tensor_overhead() +
+            ggml_graph_overhead_custom(graph_size, false) +
+            4096,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        std::fprintf(stderr, "scheduler glue ggml_init failed\n");
+        return false;
+    }
+
+    ggml_tensor * input =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_glue_rows, k_glue_cols);
+    ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k_glue_rows);
+    ggml_tensor * add = ggml_add(ctx, input, bias);
+    ggml_tensor * scale = ggml_scale(ctx, add, 0.5f);
+    ggml_tensor * norm = ggml_rms_norm(ctx, scale, 1.0e-6f);
+    ggml_tensor * act = ggml_silu(ctx, norm);
+    ggml_tensor * output = ggml_mul(ctx, act, bias);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_size, false);
+    ggml_build_forward_expand(graph, output);
+
+    ggml_backend_t backends[] = { backend, cpu_backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+        backends,
+        nullptr,
+        2,
+        graph_size,
+        false,
+        true);
+    if (sched == nullptr || !ggml_backend_sched_alloc_graph(sched, graph)) {
+        std::fprintf(stderr, "pynq scheduler glue allocation failed\n");
+        if (sched != nullptr) {
+            ggml_backend_sched_free(sched);
+        }
+        ggml_free(ctx);
+        return false;
+    }
+    if (ggml_backend_sched_get_tensor_backend(sched, output) != backend) {
+        std::fprintf(stderr, "pynq scheduler did not assign F32 glue to PYNQ\n");
+        ggml_backend_sched_free(sched);
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_set(input, input_data.data(), 0, input_data.size() * sizeof(float));
+    ggml_backend_tensor_set(bias, bias_data.data(), 0, bias_data.size() * sizeof(float));
+    if (ggml_backend_sched_graph_compute(sched, graph) != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "pynq scheduler F32 glue compute failed\n");
+        ggml_backend_sched_free(sched);
+        ggml_free(ctx);
+        return false;
+    }
+
+    std::vector<float> actual(expected.size(), 0.0f);
+    ggml_backend_tensor_get(output, actual.data(), 0, actual.size() * sizeof(float));
+    *split_count = ggml_backend_sched_get_n_splits(sched);
+    const bool ok = same_floats(actual, expected, 1e-5f);
+    if (!ok) {
+        std::fprintf(stderr, "scheduler F32 glue output mismatch\n");
+    }
+    ggml_backend_sched_free(sched);
+    ggml_free(ctx);
+    return ok;
 }
 
 bool scheduler_matmul_smoke(
@@ -249,6 +376,9 @@ int main() {
     std::vector<float> matmul_acts = make_matmul_acts();
     std::vector<float> matmul_expected = expected_matmul(matmul_weights, matmul_acts);
     std::vector<uint8_t> matmul_q1_weights;
+    std::vector<float> glue_input = make_glue_input();
+    std::vector<float> glue_bias = make_glue_bias();
+    std::vector<float> glue_expected = expected_glue_output(glue_input, glue_bias);
     if (!quantize_matmul_weights(matmul_weights, &matmul_q1_weights)) {
         std::fprintf(stderr, "Q1_0 weight quantization failed\n");
         ggml_backend_free(backend);
@@ -400,7 +530,8 @@ int main() {
         return 1;
     }
 
-    int scheduler_splits = 0;
+    int scheduler_matmul_splits = 0;
+    int scheduler_glue_splits = 0;
     ggml_backend_load_all_from_path(PYNQ_GGML_BACKEND_DIR);
     ggml_backend_t cpu_backend =
         ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -417,7 +548,20 @@ int main() {
             matmul_q1_weights,
             matmul_acts,
             matmul_expected,
-            &scheduler_splits)) {
+            &scheduler_matmul_splits)) {
+        ggml_backend_free(cpu_backend);
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+    if (!scheduler_glue_smoke(
+            backend,
+            cpu_backend,
+            glue_input,
+            glue_bias,
+            glue_expected,
+            &scheduler_glue_splits)) {
         ggml_backend_free(cpu_backend);
         ggml_backend_buffer_free(buffer);
         ggml_free(ctx);
@@ -428,14 +572,16 @@ int main() {
 
     std::printf(
         "pynq backend smoke ok: total=%zu free=%zu root_bytes=%zu view_bytes=%zu "
-        "copy_bytes=%zu matmul_cells=%zu scheduler_splits=%d\n",
+        "copy_bytes=%zu matmul_cells=%zu scheduler_matmul_splits=%d "
+        "scheduler_glue_splits=%d\n",
         total_bytes,
         free_bytes,
         expected.size() * sizeof(float),
         patch.size() * sizeof(float),
         copied.size() * sizeof(float),
         matmul_actual.size(),
-        scheduler_splits);
+        scheduler_matmul_splits,
+        scheduler_glue_splits);
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);

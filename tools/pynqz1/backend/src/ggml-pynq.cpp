@@ -55,6 +55,12 @@ struct RemoteAllocation {
     size_t nbytes = 0;
 };
 
+struct F32BinaryLowering {
+    const ggml_tensor * src0 = nullptr;
+    const ggml_tensor * src1 = nullptr;
+    bool src1_broadcast = false;
+};
+
 struct BufferContext {
     explicit BufferContext(pynq::Endpoint endpoint) : rpc(endpoint) {
     }
@@ -580,6 +586,118 @@ static bool supports_raw_copy(const ggml_tensor * op) {
         ggml_nbytes(src) == ggml_nbytes(dst);
 }
 
+static bool same_shape(const ggml_tensor * lhs, const ggml_tensor * rhs) {
+    if (lhs == nullptr || rhs == nullptr) {
+        return false;
+    }
+
+    for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+        if (lhs->ne[dim] != rhs->ne[dim]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool is_contiguous_f32(const ggml_tensor * tensor) {
+    return tensor != nullptr &&
+        tensor->type == GGML_TYPE_F32 &&
+        tensor->ne[0] > 0 &&
+        ggml_nelements(tensor) > 0 &&
+        ggml_is_contiguous(tensor);
+}
+
+static int64_t flattened_cols(const ggml_tensor * tensor) {
+    return ggml_nelements(tensor) / tensor->ne[0];
+}
+
+static float op_param_f32(const ggml_tensor * tensor, int index) {
+    float value = 0.0f;
+    std::memcpy(
+        &value,
+        reinterpret_cast<const char *>(tensor->op_params) + index * sizeof(value),
+        sizeof(value));
+    return value;
+}
+
+static bool is_row_broadcast_for(const ggml_tensor * src, const ggml_tensor * dst) {
+    if (!is_contiguous_f32(src) ||
+        !is_contiguous_f32(dst) ||
+        src->ne[0] != dst->ne[0]) {
+        return false;
+    }
+
+    for (int dim = 1; dim < GGML_MAX_DIMS; ++dim) {
+        if (src->ne[dim] != 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool get_f32_binary_lowering(
+    const ggml_tensor * op,
+    F32BinaryLowering * lowering) {
+    if (op == nullptr ||
+        (op->op != GGML_OP_ADD && op->op != GGML_OP_MUL) ||
+        !is_contiguous_f32(op)) {
+        return false;
+    }
+
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+    if (!is_contiguous_f32(src0) || !is_contiguous_f32(src1)) {
+        return false;
+    }
+
+    if (same_shape(src0, op) && same_shape(src1, op)) {
+        *lowering = F32BinaryLowering { src0, src1, false };
+        return true;
+    }
+
+    if (same_shape(src0, op) && is_row_broadcast_for(src1, op)) {
+        *lowering = F32BinaryLowering { src0, src1, true };
+        return true;
+    }
+
+    if (same_shape(src1, op) && is_row_broadcast_for(src0, op)) {
+        *lowering = F32BinaryLowering { src1, src0, true };
+        return true;
+    }
+
+    return false;
+}
+
+static bool supports_f32_binary(const ggml_tensor * op) {
+    F32BinaryLowering lowering;
+    return get_f32_binary_lowering(op, &lowering);
+}
+
+static bool supports_scale_f32(const ggml_tensor * op) {
+    return op != nullptr &&
+        op->op == GGML_OP_SCALE &&
+        is_contiguous_f32(op) &&
+        is_contiguous_f32(op->src[0]) &&
+        same_shape(op, op->src[0]);
+}
+
+static bool supports_silu_f32(const ggml_tensor * op) {
+    return op != nullptr &&
+        op->op == GGML_OP_UNARY &&
+        ggml_get_unary_op(op) == GGML_UNARY_OP_SILU &&
+        is_contiguous_f32(op) &&
+        is_contiguous_f32(op->src[0]) &&
+        same_shape(op, op->src[0]);
+}
+
+static bool supports_rms_norm_f32(const ggml_tensor * op) {
+    return op != nullptr &&
+        op->op == GGML_OP_RMS_NORM &&
+        is_contiguous_f32(op) &&
+        is_contiguous_f32(op->src[0]) &&
+        same_shape(op, op->src[0]);
+}
+
 static bool supports_matmul_q1a8(const ggml_tensor * op) {
     if (op == nullptr || op->op != GGML_OP_MUL_MAT || op->type != GGML_TYPE_F32) {
         return false;
@@ -649,6 +767,193 @@ static bool append_copy_op(
             tensor_name(dst),
             static_cast<unsigned long long>(dst_binding->handle),
             nbytes);
+    }
+    return true;
+}
+
+static bool append_f32_binary_op(
+    const ggml_tensor * node,
+    nlohmann::json * ops,
+    nlohmann::json * outputs) {
+    F32BinaryLowering lowering;
+    if (!get_f32_binary_lowering(node, &lowering)) {
+        GGML_LOG_ERROR("pynq: binary node %s is not a supported F32 op\n", node->name);
+        return false;
+    }
+
+    const RemoteBinding * src0_binding = find_tensor_binding(lowering.src0);
+    const RemoteBinding * src1_binding = find_tensor_binding(lowering.src1);
+    const RemoteBinding * dst_binding = find_tensor_binding(node);
+    const size_t src0_nbytes = ggml_nbytes(lowering.src0);
+    const size_t src1_nbytes = ggml_nbytes(lowering.src1);
+    const size_t dst_nbytes = ggml_nbytes(node);
+    if (src0_binding == nullptr ||
+        src1_binding == nullptr ||
+        dst_binding == nullptr ||
+        !remote_range_is_valid(*src0_binding, 0, src0_nbytes) ||
+        !remote_range_is_valid(*src1_binding, 0, src1_nbytes) ||
+        !remote_range_is_valid(*dst_binding, 0, dst_nbytes)) {
+        GGML_LOG_ERROR("pynq: binary node %s is missing PYNQ tensor handles\n", node->name);
+        return false;
+    }
+
+    const char * op_name = node->op == GGML_OP_ADD ? "ADD_F32" : "MUL_F32";
+    ops->push_back({
+        { "op", op_name },
+        { "src0", src0_binding->handle },
+        { "src1", src1_binding->handle },
+        { "dst", dst_binding->handle },
+        { "rows", node->ne[0] },
+        { "cols", flattened_cols(node) },
+        { "src1_broadcast", lowering.src1_broadcast },
+        { "src0_offset", src0_binding->remote_offset },
+        { "src1_offset", src1_binding->remote_offset },
+        { "dst_offset", dst_binding->remote_offset },
+    });
+    outputs->push_back(dst_binding->handle);
+    if (trace_enabled()) {
+        tracef(
+            "pynq trace: lower %s node=%s src0=%s/%llu src1=%s/%llu "
+            "dst=%llu rows=%lld cols=%lld broadcast=%s\n",
+            op_name,
+            tensor_name(node),
+            tensor_name(lowering.src0),
+            static_cast<unsigned long long>(src0_binding->handle),
+            tensor_name(lowering.src1),
+            static_cast<unsigned long long>(src1_binding->handle),
+            static_cast<unsigned long long>(dst_binding->handle),
+            static_cast<long long>(node->ne[0]),
+            static_cast<long long>(flattened_cols(node)),
+            lowering.src1_broadcast ? "true" : "false");
+    }
+    return true;
+}
+
+static bool append_scale_f32_op(
+    const ggml_tensor * node,
+    nlohmann::json * ops,
+    nlohmann::json * outputs) {
+    if (!supports_scale_f32(node)) {
+        GGML_LOG_ERROR("pynq: SCALE node %s is not a supported F32 scale\n", node->name);
+        return false;
+    }
+
+    const ggml_tensor * src = node->src[0];
+    const RemoteBinding * src_binding = find_tensor_binding(src);
+    const RemoteBinding * dst_binding = find_tensor_binding(node);
+    if (src_binding == nullptr ||
+        dst_binding == nullptr ||
+        !remote_range_is_valid(*src_binding, 0, ggml_nbytes(src)) ||
+        !remote_range_is_valid(*dst_binding, 0, ggml_nbytes(node))) {
+        GGML_LOG_ERROR("pynq: SCALE node %s is missing PYNQ tensor handles\n", node->name);
+        return false;
+    }
+
+    ops->push_back({
+        { "op", "SCALE_F32" },
+        { "src", src_binding->handle },
+        { "dst", dst_binding->handle },
+        { "elements", ggml_nelements(node) },
+        { "scale", op_param_f32(node, 0) },
+        { "bias", op_param_f32(node, 1) },
+        { "src_offset", src_binding->remote_offset },
+        { "dst_offset", dst_binding->remote_offset },
+    });
+    outputs->push_back(dst_binding->handle);
+    if (trace_enabled()) {
+        tracef(
+            "pynq trace: lower SCALE_F32 node=%s src=%s/%llu dst=%llu elements=%lld\n",
+            tensor_name(node),
+            tensor_name(src),
+            static_cast<unsigned long long>(src_binding->handle),
+            static_cast<unsigned long long>(dst_binding->handle),
+            static_cast<long long>(ggml_nelements(node)));
+    }
+    return true;
+}
+
+static bool append_silu_f32_op(
+    const ggml_tensor * node,
+    nlohmann::json * ops,
+    nlohmann::json * outputs) {
+    if (!supports_silu_f32(node)) {
+        GGML_LOG_ERROR("pynq: SILU node %s is not a supported F32 unary op\n", node->name);
+        return false;
+    }
+
+    const ggml_tensor * src = node->src[0];
+    const RemoteBinding * src_binding = find_tensor_binding(src);
+    const RemoteBinding * dst_binding = find_tensor_binding(node);
+    if (src_binding == nullptr ||
+        dst_binding == nullptr ||
+        !remote_range_is_valid(*src_binding, 0, ggml_nbytes(src)) ||
+        !remote_range_is_valid(*dst_binding, 0, ggml_nbytes(node))) {
+        GGML_LOG_ERROR("pynq: SILU node %s is missing PYNQ tensor handles\n", node->name);
+        return false;
+    }
+
+    ops->push_back({
+        { "op", "SILU_F32" },
+        { "src", src_binding->handle },
+        { "dst", dst_binding->handle },
+        { "elements", ggml_nelements(node) },
+        { "src_offset", src_binding->remote_offset },
+        { "dst_offset", dst_binding->remote_offset },
+    });
+    outputs->push_back(dst_binding->handle);
+    if (trace_enabled()) {
+        tracef(
+            "pynq trace: lower SILU_F32 node=%s src=%s/%llu dst=%llu elements=%lld\n",
+            tensor_name(node),
+            tensor_name(src),
+            static_cast<unsigned long long>(src_binding->handle),
+            static_cast<unsigned long long>(dst_binding->handle),
+            static_cast<long long>(ggml_nelements(node)));
+    }
+    return true;
+}
+
+static bool append_rms_norm_f32_op(
+    const ggml_tensor * node,
+    nlohmann::json * ops,
+    nlohmann::json * outputs) {
+    if (!supports_rms_norm_f32(node)) {
+        GGML_LOG_ERROR("pynq: RMS_NORM node %s is not a supported F32 norm\n", node->name);
+        return false;
+    }
+
+    const ggml_tensor * src = node->src[0];
+    const RemoteBinding * src_binding = find_tensor_binding(src);
+    const RemoteBinding * dst_binding = find_tensor_binding(node);
+    if (src_binding == nullptr ||
+        dst_binding == nullptr ||
+        !remote_range_is_valid(*src_binding, 0, ggml_nbytes(src)) ||
+        !remote_range_is_valid(*dst_binding, 0, ggml_nbytes(node))) {
+        GGML_LOG_ERROR("pynq: RMS_NORM node %s is missing PYNQ tensor handles\n", node->name);
+        return false;
+    }
+
+    ops->push_back({
+        { "op", "RMS_NORM_F32" },
+        { "src", src_binding->handle },
+        { "dst", dst_binding->handle },
+        { "rows", node->ne[0] },
+        { "cols", flattened_cols(node) },
+        { "eps", op_param_f32(node, 0) },
+        { "src_offset", src_binding->remote_offset },
+        { "dst_offset", dst_binding->remote_offset },
+    });
+    outputs->push_back(dst_binding->handle);
+    if (trace_enabled()) {
+        tracef(
+            "pynq trace: lower RMS_NORM_F32 node=%s src=%s/%llu dst=%llu "
+            "rows=%lld cols=%lld\n",
+            tensor_name(node),
+            tensor_name(src),
+            static_cast<unsigned long long>(src_binding->handle),
+            static_cast<unsigned long long>(dst_binding->handle),
+            static_cast<long long>(node->ne[0]),
+            static_cast<long long>(flattened_cols(node)));
     }
     return true;
 }
@@ -723,8 +1028,29 @@ static enum ggml_status backend_graph_compute(
         }
 
         switch (node->op) {
+            case GGML_OP_ADD:
+            case GGML_OP_MUL:
+                if (!append_f32_binary_op(node, &ops, &outputs)) {
+                    return GGML_STATUS_FAILED;
+                }
+                break;
             case GGML_OP_CPY:
                 if (!append_copy_op(node, &ops, &outputs)) {
+                    return GGML_STATUS_FAILED;
+                }
+                break;
+            case GGML_OP_RMS_NORM:
+                if (!append_rms_norm_f32_op(node, &ops, &outputs)) {
+                    return GGML_STATUS_FAILED;
+                }
+                break;
+            case GGML_OP_SCALE:
+                if (!append_scale_f32_op(node, &ops, &outputs)) {
+                    return GGML_STATUS_FAILED;
+                }
+                break;
+            case GGML_OP_UNARY:
+                if (!append_silu_f32_op(node, &ops, &outputs)) {
                     return GGML_STATUS_FAILED;
                 }
                 break;
@@ -914,7 +1240,12 @@ static bool device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     if (op != nullptr && is_metadata_op(op->op)) {
         return true;
     }
-    return supports_raw_copy(op) || supports_matmul_q1a8(op);
+    return supports_raw_copy(op) ||
+        supports_f32_binary(op) ||
+        supports_scale_f32(op) ||
+        supports_silu_f32(op) ||
+        supports_rms_norm_f32(op) ||
+        supports_matmul_q1a8(op);
 }
 
 static bool device_supports_buft(
@@ -925,7 +1256,11 @@ static bool device_supports_buft(
 
 static bool device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_UNUSED(dev);
-    return supports_matmul_q1a8(op);
+    return supports_f32_binary(op) ||
+        supports_scale_f32(op) ||
+        supports_silu_f32(op) ||
+        supports_rms_norm_f32(op) ||
+        supports_matmul_q1a8(op);
 }
 
 static const ggml_backend_device_i device_i = {
@@ -970,7 +1305,7 @@ static ggml_backend_dev_t reg_get_device(ggml_backend_reg_t reg, size_t index) {
 static ggml_backend_feature g_features[] = {
     { "transport", "bonsaid-tcp" },
     { "buffer", "remote-tensor-handles" },
-    { "graph_ops", "copy,matmul_q1a8" },
+    { "graph_ops", "copy,matmul_q1a8,add_f32,mul_f32,scale_f32,silu_f32,rms_norm_f32" },
     { nullptr, nullptr },
 };
 

@@ -47,7 +47,10 @@ def test_graph_copy_smoke_round_trip(rpc_server, capsys):
     assert output["nbytes"] == 200 * 1024
     assert output["graph"]["op_count"] == 1
     assert output["graph"]["outputs"] == [output["destination"]["tensor"]["handle"]]
-    assert output["graph"]["counters"] == {
+    counters = dict(output["graph"]["counters"])
+    elapsed_us = counters.pop("elapsed_us")
+    assert elapsed_us >= 0
+    assert counters == {
         "ps_ops": 1,
         "pl_ops": 0,
         "bytes_read": 200 * 1024,

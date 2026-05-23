@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import socket
 import struct
 import threading
@@ -45,7 +46,22 @@ def test_hello_reports_memory_and_capabilities(client):
     assert "ALLOC_TENSOR" in result["capabilities"]
     assert "DOWNLOAD_TENSOR" in result["capabilities"]
     assert "RUN_GRAPH" in result["capabilities"]
-    assert result["graph_ops"] == ["COPY", "MATMUL_Q1A8"]
+    assert result["graph_ops"] == [
+        "COPY",
+        "MATMUL_Q1A8",
+        "ADD_F32",
+        "MUL_F32",
+        "SCALE_F32",
+        "SILU_F32",
+        "RMS_NORM_F32",
+    ]
+
+
+def assert_counters(result, expected):
+    counters = dict(result["counters"])
+    elapsed_us = counters.pop("elapsed_us")
+    assert elapsed_us >= 0
+    assert counters == expected
 
 
 def test_allocate_upload_download_and_free_cross_slab_tensor(client):
@@ -124,12 +140,12 @@ def test_run_graph_copy_keeps_output_on_device_until_download(client):
     assert result["graph_version"] == 1
     assert result["op_count"] == 1
     assert result["outputs"] == [dst]
-    assert result["counters"] == {
+    assert_counters(result, {
         "ps_ops": 1,
         "pl_ops": 0,
         "bytes_read": nbytes,
         "bytes_written": nbytes,
-    }
+    })
 
     response, payload = client.call("DOWNLOAD_TENSOR", handle=dst, size=nbytes)
     assert response["result"]["read"] == nbytes
@@ -190,17 +206,113 @@ def test_run_graph_matmul_q1a8_writes_f32_output(client):
     )
 
     assert payload == b""
-    assert response["result"]["counters"] == {
+    assert_counters(response["result"], {
         "ps_ops": 1,
         "pl_ops": 0,
         "bytes_read": len(weights) + len(acts),
         "bytes_written": rows * cols * 4,
-    }
+    })
 
     _, payload = client.call("DOWNLOAD_TENSOR", handle=dst_handle, size=16)
     got = struct.unpack("<4f", payload)
     q8_scale = struct.unpack("<e", struct.pack("<e", 1.0 / 127.0))[0]
     assert got == pytest.approx((0.0, 0.0, 128.0 * 127.0 * q8_scale, 0.0))
+
+
+def test_run_graph_f32_glue_ops(client):
+    rows = 4
+    cols = 2
+    values = [0.5, -1.0, 2.0, -4.0, 1.5, -2.0, 3.0, -6.0]
+    bias = [1.0, 0.5, -0.25, 2.0]
+    nbytes = len(values) * 4
+
+    response, _ = client.call("ALLOC_TENSOR", nbytes=nbytes, dtype="F32")
+    src = response["result"]["tensor"]["handle"]
+    response, _ = client.call("ALLOC_TENSOR", nbytes=len(bias) * 4, dtype="F32")
+    row_bias = response["result"]["tensor"]["handle"]
+    handles = []
+    for _ in range(5):
+        response, _ = client.call("ALLOC_TENSOR", nbytes=nbytes, dtype="F32")
+        handles.append(response["result"]["tensor"]["handle"])
+
+    client.call("UPLOAD_TENSOR", payload=struct.pack("<8f", *values), handle=src)
+    client.call("UPLOAD_TENSOR", payload=struct.pack("<4f", *bias), handle=row_bias)
+
+    add_out, scale_out, norm_out, silu_out, mul_out = handles
+    response, payload = client.call(
+        "RUN_GRAPH",
+        graph_version=1,
+        ops=[
+            {
+                "op": "ADD_F32",
+                "src0": src,
+                "src1": row_bias,
+                "dst": add_out,
+                "rows": rows,
+                "cols": cols,
+                "src1_broadcast": True,
+            },
+            {
+                "op": "SCALE_F32",
+                "src": add_out,
+                "dst": scale_out,
+                "elements": rows * cols,
+                "scale": 0.5,
+                "bias": -1.0,
+            },
+            {
+                "op": "RMS_NORM_F32",
+                "src": scale_out,
+                "dst": norm_out,
+                "rows": rows,
+                "cols": cols,
+                "eps": 1.0e-6,
+            },
+            {
+                "op": "SILU_F32",
+                "src": norm_out,
+                "dst": silu_out,
+                "elements": rows * cols,
+            },
+            {
+                "op": "MUL_F32",
+                "src0": silu_out,
+                "src1": row_bias,
+                "dst": mul_out,
+                "rows": rows,
+                "cols": cols,
+                "src1_broadcast": True,
+            },
+        ],
+        outputs=[mul_out],
+    )
+
+    assert payload == b""
+    assert_counters(response["result"], {
+        "ps_ops": 5,
+        "pl_ops": 0,
+        "bytes_read": (8 + 4 + 8 + 8 + 8 + 8 + 4) * 4,
+        "bytes_written": 5 * 8 * 4,
+    })
+
+    add = []
+    for col in range(cols):
+        for row in range(rows):
+            add.append(values[col * rows + row] + bias[row])
+    scaled = [(value * 0.5) - 1.0 for value in add]
+    normed = []
+    for col in range(cols):
+        chunk = scaled[col * rows : (col + 1) * rows]
+        scale = 1.0 / ((sum(value * value for value in chunk) / rows + 1.0e-6) ** 0.5)
+        normed.extend(value * scale for value in chunk)
+    silu = [value / (1.0 + math.exp(-value)) for value in normed]
+    expected = []
+    for col in range(cols):
+        for row in range(rows):
+            expected.append(silu[col * rows + row] * bias[row])
+
+    _, payload = client.call("DOWNLOAD_TENSOR", handle=mul_out, size=nbytes)
+    assert struct.unpack("<8f", payload) == pytest.approx(expected)
 
 
 def test_unsupported_graph_op_is_reported(client):
