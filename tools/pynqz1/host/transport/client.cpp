@@ -157,14 +157,43 @@ Endpoint endpoint_from_env() {
     };
 }
 
-RpcClient::RpcClient(const Endpoint & endpoint) : fd_(connect_endpoint(endpoint)) {
+RpcClient::RpcClient(Endpoint endpoint) : endpoint_(std::move(endpoint)) {
 }
 
 RpcClient::~RpcClient() {
-    close_fd(fd_);
+    close_socket();
+}
+
+void RpcClient::ensure_connected() {
+    if (fd_ < 0) {
+        fd_ = connect_endpoint(endpoint_);
+    }
+}
+
+void RpcClient::close_socket() noexcept {
+    if (fd_ >= 0) {
+        close(fd_);
+        fd_ = -1;
+    }
 }
 
 RpcResponse RpcClient::call(
+    const std::string & op,
+    const nlohmann::json & fields,
+    const void * payload,
+    size_t payload_size) {
+    std::lock_guard<std::mutex> lock(mu_);
+    try {
+        ensure_connected();
+        return call_locked(op, fields, payload, payload_size);
+    } catch (const RpcError &) {
+        // Any I/O error invalidates the socket. The next call will reconnect.
+        close_socket();
+        throw;
+    }
+}
+
+RpcResponse RpcClient::call_locked(
     const std::string & op,
     const nlohmann::json & fields,
     const void * payload,
@@ -247,6 +276,13 @@ RpcResponse RpcClient::call(
 
     result.result = response.value("result", nlohmann::json::object());
     return result;
+}
+
+RpcClient & shared_client() {
+    // Constructed once per process against the env-resolved endpoint.
+    // Reconnects internally if the socket drops.
+    static RpcClient client { endpoint_from_env() };
+    return client;
 }
 
 } // namespace pynq

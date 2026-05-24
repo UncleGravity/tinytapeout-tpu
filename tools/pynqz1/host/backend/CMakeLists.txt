@@ -50,7 +50,13 @@ add_library(pynq_transport STATIC "${PYNQ_TRANSPORT_DIR}/client.cpp")
 target_link_libraries(pynq_transport PUBLIC pynq_backend_common)
 set_target_properties(pynq_transport PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-add_library(ggml-pynq MODULE "${CMAKE_CURRENT_LIST_DIR}/src/ggml-pynq.cpp")
+set(PYNQ_BACKEND_SOURCES
+    "${CMAKE_CURRENT_LIST_DIR}/src/device.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/buffer.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/lowering.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/trace.cpp")
+
+add_library(ggml-pynq MODULE ${PYNQ_BACKEND_SOURCES})
 target_link_libraries(ggml-pynq PRIVATE pynq_backend_common pynq_transport)
 target_compile_definitions(ggml-pynq PRIVATE
     GGML_BACKEND_DL GGML_BACKEND_BUILD GGML_BACKEND_SHARED)
@@ -67,9 +73,19 @@ if(PYNQ_BUILD_SMOKE_TESTS)
     find_library(GGML_LIBRARY ggml
         HINTS "${LLAMA_CPP_BUILD_DIR}/lib"
         REQUIRED NO_DEFAULT_PATH)
+    set(PYNQ_SMOKE_TEST_DIR "${PYNQ_E2E_TESTS_DIR}/backend")
+    set(PYNQ_SMOKE_TEST_SOURCES
+        "${PYNQ_SMOKE_TEST_DIR}/main.cpp"
+        "${PYNQ_SMOKE_TEST_DIR}/common.cpp"
+        "${PYNQ_SMOKE_TEST_DIR}/test_upload_download.cpp"
+        "${PYNQ_SMOKE_TEST_DIR}/test_copy.cpp"
+        "${PYNQ_SMOKE_TEST_DIR}/test_matmul.cpp"
+        "${PYNQ_SMOKE_TEST_DIR}/test_swiglu.cpp"
+        "${PYNQ_SMOKE_TEST_DIR}/test_glue.cpp"
+        "${PYNQ_SMOKE_TEST_DIR}/test_multi_extent.cpp")
     add_executable(pynq-backend-smoke
-        "${PYNQ_E2E_TESTS_DIR}/backend_smoke.cpp"
-        "${CMAKE_CURRENT_LIST_DIR}/src/ggml-pynq.cpp")
+        ${PYNQ_SMOKE_TEST_SOURCES}
+        ${PYNQ_BACKEND_SOURCES})
     target_link_libraries(pynq-backend-smoke PRIVATE
         pynq_backend_common
         pynq_transport
