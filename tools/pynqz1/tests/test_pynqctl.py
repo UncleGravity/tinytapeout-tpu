@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from tools import pynqctl
+from host.cli import pynqctl
 
 
 def cli_args(rpc_server, *args: str) -> list[str]:

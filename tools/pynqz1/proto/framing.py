@@ -1,10 +1,26 @@
+"""Wire framing for the PYNQ-Z1 runtime protocol.
+
+Frame layout (matches host C++ in ``host/transport/client.cpp``):
+
+    u8  magic[4]    "BPNQ"
+    u16 version     big endian, currently 1
+    u16 flags       big endian, 0
+    u32 json_len    big endian
+    u32 payload_len big endian
+    u8  json[json_len]    UTF-8 JSON object
+    u8  payload[payload_len]
+
+Only the framing primitives live here. Client-side request/response
+correlation belongs to ``host/transport/client.py``; server-side handler
+dispatch belongs to the board daemon.
+"""
+
 from __future__ import annotations
 
 import json
 import socket
 import struct
 from typing import Any
-
 
 MAGIC = b"BPNQ"
 VERSION = 1
@@ -13,14 +29,7 @@ MAX_JSON_BYTES = 1 * 1024 * 1024
 
 
 class ProtocolError(RuntimeError):
-    pass
-
-
-class RpcRemoteError(RuntimeError):
-    def __init__(self, code: str, message: str):
-        super().__init__(f"{code}: {message}")
-        self.code = code
-        self.message = message
+    """Raised when a frame is malformed or violates the wire contract."""
 
 
 def read_exact(sock: socket.socket, nbytes: int) -> bytes:
@@ -40,9 +49,9 @@ def send_message(
     metadata: dict[str, Any],
     payload: bytes | bytearray | memoryview = b"",
 ) -> None:
-    metadata_bytes = json.dumps(metadata, separators=(",", ":"), sort_keys=True).encode(
-        "utf-8"
-    )
+    metadata_bytes = json.dumps(
+        metadata, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
     payload_view = memoryview(payload)
     header = HEADER.pack(MAGIC, VERSION, 0, len(metadata_bytes), len(payload_view))
     sock.sendall(header)
@@ -73,36 +82,3 @@ def recv_message(sock: socket.socket) -> tuple[dict[str, Any], bytes]:
 
     payload = read_exact(sock, payload_len) if payload_len else b""
     return metadata, payload
-
-
-class RpcClient:
-    def __init__(self, sock: socket.socket):
-        self._sock = sock
-        self._next_id = 1
-
-    def call(
-        self,
-        op: str,
-        payload: bytes | bytearray | memoryview = b"",
-        **fields: Any,
-    ) -> tuple[dict[str, Any], bytes]:
-        request_id = self._next_id
-        self._next_id += 1
-        metadata = {"id": request_id, "op": op, **fields}
-        send_message(self._sock, metadata, payload)
-
-        response, response_payload = recv_message(self._sock)
-        if response.get("id") != request_id:
-            raise ProtocolError(
-                f"response id {response.get('id')} does not match request id {request_id}"
-            )
-        if not response.get("ok", False):
-            error = response.get("error", {})
-            if not isinstance(error, dict):
-                raise ProtocolError("error response must contain an error object")
-            raise RpcRemoteError(
-                str(error.get("code", "remote_error")),
-                str(error.get("message", "")),
-            )
-        return response, response_payload
-

@@ -28,11 +28,17 @@ else()
     set(_pynq_rpath "$ORIGIN;${LLAMA_CPP_BUILD_DIR}/bin;${LLAMA_CPP_BUILD_DIR}/lib")
 endif()
 
+set(PYNQ_TRANSPORT_DIR "${CMAKE_CURRENT_LIST_DIR}/../transport")
+set(PYNQ_PROTO_DIR     "${CMAKE_CURRENT_LIST_DIR}/../../proto")
+set(PYNQ_E2E_TESTS_DIR "${CMAKE_CURRENT_LIST_DIR}/../../tests/e2e")
+
 add_library(pynq_backend_common INTERFACE)
 target_compile_features(pynq_backend_common INTERFACE cxx_std_17)
 target_include_directories(pynq_backend_common INTERFACE
     "${CMAKE_CURRENT_LIST_DIR}/include"
     "${CMAKE_CURRENT_LIST_DIR}/src"
+    "${PYNQ_TRANSPORT_DIR}"
+    "${PYNQ_PROTO_DIR}/.."
     "${LLAMA_CPP_DIR}/ggml/include"
     "${LLAMA_CPP_DIR}/ggml/src")
 target_compile_definitions(pynq_backend_common INTERFACE GGML_SHARED)
@@ -40,12 +46,12 @@ target_link_libraries(pynq_backend_common INTERFACE
     "${GGML_BASE_LIBRARY}"
     nlohmann_json::nlohmann_json)
 
-add_library(pynq_rpc STATIC "${CMAKE_CURRENT_LIST_DIR}/src/rpc.cpp")
-target_link_libraries(pynq_rpc PUBLIC pynq_backend_common)
-set_target_properties(pynq_rpc PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_library(pynq_transport STATIC "${PYNQ_TRANSPORT_DIR}/client.cpp")
+target_link_libraries(pynq_transport PUBLIC pynq_backend_common)
+set_target_properties(pynq_transport PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(ggml-pynq MODULE "${CMAKE_CURRENT_LIST_DIR}/src/ggml-pynq.cpp")
-target_link_libraries(ggml-pynq PRIVATE pynq_backend_common pynq_rpc)
+target_link_libraries(ggml-pynq PRIVATE pynq_backend_common pynq_transport)
 target_compile_definitions(ggml-pynq PRIVATE
     GGML_BACKEND_DL GGML_BACKEND_BUILD GGML_BACKEND_SHARED)
 set_target_properties(ggml-pynq PROPERTIES
@@ -62,11 +68,11 @@ if(PYNQ_BUILD_SMOKE_TESTS)
         HINTS "${LLAMA_CPP_BUILD_DIR}/lib"
         REQUIRED NO_DEFAULT_PATH)
     add_executable(pynq-backend-smoke
-        "${CMAKE_CURRENT_LIST_DIR}/test/backend-smoke.cpp"
+        "${PYNQ_E2E_TESTS_DIR}/backend_smoke.cpp"
         "${CMAKE_CURRENT_LIST_DIR}/src/ggml-pynq.cpp")
     target_link_libraries(pynq-backend-smoke PRIVATE
         pynq_backend_common
-        pynq_rpc
+        pynq_transport
         "${GGML_LIBRARY}")
     target_compile_definitions(pynq-backend-smoke PRIVATE
         PYNQ_GGML_BACKEND_DIR="${LLAMA_CPP_BUILD_DIR}/bin")

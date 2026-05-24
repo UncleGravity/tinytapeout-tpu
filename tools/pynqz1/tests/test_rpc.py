@@ -9,8 +9,8 @@ import threading
 
 import pytest
 
+from host.transport.client import RpcClient, RpcRemoteError
 from runtime.allocator import fake_allocator
-from runtime.bonsai_rpc import RpcClient, RpcRemoteError
 from runtime.bonsaid import BonsaiRpcServer, BonsaiRuntime
 from runtime.graph import run_graph
 from runtime.ps_native import get_native_kernels

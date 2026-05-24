@@ -5,8 +5,8 @@ import threading
 
 import pytest
 
+from host.transport.client import RpcClient
 from runtime.allocator import fake_allocator
-from runtime.bonsai_rpc import RpcClient
 from runtime.bonsaid import BonsaiRpcServer, BonsaiRuntime
 
 

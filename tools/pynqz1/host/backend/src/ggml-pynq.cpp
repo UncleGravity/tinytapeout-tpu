@@ -1,6 +1,6 @@
 #include "ggml-pynq.h"
 
-#include "rpc.h"
+#include "client.h"
 
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"

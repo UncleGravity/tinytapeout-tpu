@@ -8,10 +8,11 @@ from pathlib import Path
 from typing import Any
 
 if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from runtime.bonsai_rpc import ProtocolError, RpcClient, RpcRemoteError  # noqa: E402
-from runtime.bonsaid import DEFAULT_PORT  # noqa: E402
+from proto.framing import ProtocolError  # noqa: E402
+from proto.ops import DEFAULT_PORT  # noqa: E402
+from host.transport.client import RpcClient, RpcRemoteError  # noqa: E402
 
 
 class CliError(RuntimeError):

@@ -9,11 +9,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from runtime.bonsaid import DEFAULT_PORT  # noqa: E402
+from proto.ops import DEFAULT_PORT  # noqa: E402
 
-from tools import pynqctl  # noqa: E402
+from host.cli import pynqctl  # noqa: E402
+
+# NOTE: Board-side paths below still reference the legacy ``runtime/`` layout.
+# They will be updated in delta 2 when ``runtime/`` moves under ``board/``.
 
 DEFAULT_BOARD_HOST = "pynq"
 DEFAULT_REMOTE_DIR = "/home/xilinx/pynqz1-runtime"

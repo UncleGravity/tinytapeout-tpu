@@ -92,7 +92,7 @@
             pkgs.openssh
             pkgs.rsync
           ];
-          pynqBackend = pkgs.callPackage ./backend/package.nix {
+          pynqBackend = pkgs.callPackage ./host/backend/package.nix {
             llamaCppSrc = llama-cpp-src;
           };
           bonsaiPsNative = pkgs.stdenv.mkDerivation {
@@ -172,21 +172,28 @@
           ]);
 
           pythonFiles = [
-            "tools/alloc_probe.py"
             "tools/__init__.py"
+            "tools/alloc_probe.py"
             "tools/mem_bandwidth.py"
-            "tools/pynq_board.py"
-            "tools/pynqctl.py"
-            "dma_loopback/dma_bandwidth.py"
+            "host/__init__.py"
+            "host/cli/__init__.py"
+            "host/cli/deploy.py"
+            "host/cli/pynqctl.py"
+            "host/transport/__init__.py"
+            "host/transport/client.py"
+            "proto/__init__.py"
+            "proto/framing.py"
+            "proto/ops.py"
+            "proto/tests/__init__.py"
+            "proto/tests/test_parity.py"
             "runtime/__init__.py"
             "runtime/allocator.py"
-            "runtime/bonsai_rpc.py"
             "runtime/bonsaid.py"
             "runtime/graph.py"
             "runtime/ps_native.py"
             "tests/conftest.py"
+            "tests/test_deploy.py"
             "tests/test_pynqctl.py"
-            "tests/test_pynq_board.py"
             "tests/test_rpc.py"
           ];
 
@@ -194,7 +201,7 @@
             pkgs.lib.concatMapStringsSep " \\\n                "
               (path: ''"$src/${path}"'')
               pythonFiles;
-          pynqBackend = pkgs.callPackage ./backend/package.nix {
+          pynqBackend = pkgs.callPackage ./host/backend/package.nix {
             llamaCppSrc = llama-cpp-src;
           };
           bonsaiPsNative = self.packages.${system}.bonsai-ps-native;

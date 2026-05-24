@@ -17,7 +17,7 @@ from runtime.allocator import (  # noqa: E402
     fake_allocator,
     pynq_allocator,
 )
-from runtime.bonsai_rpc import ProtocolError, recv_message, send_message  # noqa: E402
+from proto.framing import ProtocolError, recv_message, send_message  # noqa: E402
 from runtime.graph import run_graph  # noqa: E402
 
 

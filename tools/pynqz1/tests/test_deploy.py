@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tools import pynq_board
+from host.cli import deploy
 
 
 def config(**overrides):
@@ -19,11 +19,11 @@ def config(**overrides):
         "rpc_host": None,
     }
     values.update(overrides)
-    return pynq_board.BoardConfig(**values)
+    return deploy.BoardConfig(**values)
 
 
 def test_rsync_runtime_command_uses_runtime_package_path():
-    command = pynq_board.rsync_runtime_command(config(), Path("/repo/pynqz1"))
+    command = deploy.rsync_runtime_command(config(), Path("/repo/pynqz1"))
 
     assert command == [
         "rsync",
@@ -34,7 +34,7 @@ def test_rsync_runtime_command_uses_runtime_package_path():
 
 
 def test_ssh_daemon_command_uses_board_python_overlay_and_heap():
-    command = pynq_board.ssh_daemon_command(
+    command = deploy.ssh_daemon_command(
         config(
             board_host="pynq.local",
             remote_dir="/home/xilinx/runtime scratch",
@@ -57,13 +57,13 @@ def test_ssh_daemon_command_uses_board_python_overlay_and_heap():
 def test_ssh_daemon_command_forwards_profile_env(monkeypatch):
     monkeypatch.setenv("PYNQ_PROFILE", "1")
 
-    command = pynq_board.ssh_daemon_command(config())
+    command = deploy.ssh_daemon_command(config())
 
     assert "PYNQ_PROFILE=1" in command[3]
 
 
 def test_ssh_native_build_command_compiles_runtime_library():
-    command = pynq_board.ssh_native_build_command(config(board_host="pynq.local"))
+    command = deploy.ssh_native_build_command(config(board_host="pynq.local"))
 
     assert command[:3] == ["ssh", "-tt", "xilinx@pynq.local"]
     remote = command[3]
@@ -81,9 +81,9 @@ def test_daemon_syncs_before_ssh(monkeypatch):
         commands.append(command)
         return 0
 
-    monkeypatch.setattr(pynq_board, "run_command", fake_run)
+    monkeypatch.setattr(deploy, "run_command", fake_run)
 
-    rc = pynq_board.main(["--heap-mib", "4", "--slab-mib", "1", "daemon"])
+    rc = deploy.main(["--heap-mib", "4", "--slab-mib", "1", "daemon"])
 
     assert rc == 0
     assert commands[0][0] == "rsync"
@@ -98,9 +98,9 @@ def test_build_native_syncs_before_ssh(monkeypatch):
         commands.append(command)
         return 0
 
-    monkeypatch.setattr(pynq_board, "run_command", fake_run)
+    monkeypatch.setattr(deploy, "run_command", fake_run)
 
-    rc = pynq_board.main(["build-native"])
+    rc = deploy.main(["build-native"])
 
     assert rc == 0
     assert commands[0][0] == "rsync"
@@ -115,9 +115,9 @@ def test_graph_copy_smoke_uses_rpc_host(monkeypatch):
         calls.append(argv)
         return 17
 
-    monkeypatch.setattr(pynq_board.pynqctl, "main", fake_pynqctl_main)
+    monkeypatch.setattr(deploy.pynqctl, "main", fake_pynqctl_main)
 
-    rc = pynq_board.main(
+    rc = deploy.main(
         [
             "--rpc-host",
             "pynq-rpc",

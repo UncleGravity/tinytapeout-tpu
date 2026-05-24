@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pynqz1"
+version = "0.1.0"
+description = "PYNQ-Z1 Bonsai accelerator runtime and host backend"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = [
+    "proto",
+    "host",
+    "host.cli",
+    "host.transport",
+    "board",
+    "board.runtime",
+    "tools",
+]
+
+[tool.setuptools.package-dir]
+"board.runtime" = "runtime"
+
+[tool.pytest.ini_options]
+testpaths = ["proto/tests", "host/tests", "board/tests", "tests"]

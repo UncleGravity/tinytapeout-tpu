@@ -74,7 +74,12 @@ let
   pynq-backend = stdenv.mkDerivation {
     pname = "ggml-pynq-backend";
     version = "local";
-    src = ./.;
+    # Pull the whole pynqz1 tree because the build references sibling folders
+    # (host/transport, proto, tests/e2e). CMakeLists.txt lives at host/backend.
+    src = ../..;
+    preConfigure = ''
+      cd host/backend
+    '';
 
     nativeBuildInputs = [
       cmake
