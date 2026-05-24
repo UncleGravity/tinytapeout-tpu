@@ -16,6 +16,7 @@ test/unit/*.result.xml
 test/gate_level_netlist.v
 .venv/
 build/
+out/
 tt/
 .pdk/
 result/
@@ -23,3 +24,7 @@ models/
 .verilog-viewer/
 bonsai_fixture
 !bonsai_fixture/
+
+# Built PS kernel artifact (board/kernels/ps/Makefile output)
+libbonsai_ps.so
+libbonsai_ps.dylib
