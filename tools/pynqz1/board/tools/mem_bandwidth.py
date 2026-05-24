@@ -11,7 +11,6 @@ import time
 
 import numpy as np
 
-
 MIB = 1024 * 1024
 
 

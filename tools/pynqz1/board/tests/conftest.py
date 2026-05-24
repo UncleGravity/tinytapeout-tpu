@@ -12,7 +12,6 @@ from board.kernels.registry import KernelRegistry
 from board.memory.allocator import TensorAllocator
 from board.memory.slabs import fake_slabs
 
-
 PS_DIR = Path(__file__).resolve().parents[1] / "kernels" / "ps"
 
 

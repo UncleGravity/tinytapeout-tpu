@@ -28,9 +28,10 @@ else()
     set(_pynq_rpath "$ORIGIN;${LLAMA_CPP_BUILD_DIR}/bin;${LLAMA_CPP_BUILD_DIR}/lib")
 endif()
 
-set(PYNQ_TRANSPORT_DIR "${CMAKE_CURRENT_LIST_DIR}/../transport")
-set(PYNQ_PROTO_DIR     "${CMAKE_CURRENT_LIST_DIR}/../../proto")
-set(PYNQ_E2E_TESTS_DIR "${CMAKE_CURRENT_LIST_DIR}/../../tests/e2e")
+set(PYNQ_TRANSPORT_DIR  "${CMAKE_CURRENT_LIST_DIR}/../transport")
+set(PYNQ_PROFILING_DIR  "${CMAKE_CURRENT_LIST_DIR}/../profiling")
+set(PYNQ_PROTO_DIR      "${CMAKE_CURRENT_LIST_DIR}/../../proto")
+set(PYNQ_E2E_TESTS_DIR  "${CMAKE_CURRENT_LIST_DIR}/../../tests/e2e")
 
 add_library(pynq_backend_common INTERFACE)
 target_compile_features(pynq_backend_common INTERFACE cxx_std_17)
@@ -38,6 +39,7 @@ target_include_directories(pynq_backend_common INTERFACE
     "${CMAKE_CURRENT_LIST_DIR}/include"
     "${CMAKE_CURRENT_LIST_DIR}/src"
     "${PYNQ_TRANSPORT_DIR}"
+    "${PYNQ_PROFILING_DIR}"
     "${PYNQ_PROTO_DIR}/.."
     "${LLAMA_CPP_DIR}/ggml/include"
     "${LLAMA_CPP_DIR}/ggml/src")
@@ -46,8 +48,12 @@ target_link_libraries(pynq_backend_common INTERFACE
     "${GGML_BASE_LIBRARY}"
     nlohmann_json::nlohmann_json)
 
+add_library(pynq_profiling STATIC "${PYNQ_PROFILING_DIR}/events.cpp")
+target_link_libraries(pynq_profiling PUBLIC pynq_backend_common)
+set_target_properties(pynq_profiling PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(pynq_transport STATIC "${PYNQ_TRANSPORT_DIR}/client.cpp")
-target_link_libraries(pynq_transport PUBLIC pynq_backend_common)
+target_link_libraries(pynq_transport PUBLIC pynq_backend_common pynq_profiling)
 set_target_properties(pynq_transport PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set(PYNQ_BACKEND_SOURCES

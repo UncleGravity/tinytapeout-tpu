@@ -23,8 +23,8 @@ The daemon endpoint defaults to `127.0.0.1:50055`. Override it for a board
 runtime with:
 
 ```sh
-export PYNQ_BONSAID_HOST=pynq
-export PYNQ_BONSAID_PORT=50055
+export PYNQ_HOST=pynq
+export PYNQ_PORT=50055
 ```
 
 From `tools/pynqz1`, the packaged smoke test requires a running daemon and

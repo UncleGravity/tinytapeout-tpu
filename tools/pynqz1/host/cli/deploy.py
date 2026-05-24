@@ -1,15 +1,17 @@
-"""Deploy + drive the bonsaid daemon on a PYNQ-Z1 board.
+"""Deploy + drive the daemon on a PYNQ-Z1 board.
 
-Two responsibilities, kept symmetric so each maps to one SSH/rsync call:
+One job: SSH + rsync. Three subcommands map 1:1 to remote actions:
 
-  * ``sync``        rsync the board-side packages over to the board
+  * ``sync``         rsync the board-side packages over to the board
   * ``build-native`` rebuild ``libbonsai_ps.so`` on the board via its Makefile
-  * ``daemon``      start the daemon in the foreground
-  * ``hello/smoke/...``  thin wrappers around ``pynqctl``
+  * ``daemon``       start the daemon in the foreground
 
-The native library lives at ``{remote_dir}/board/kernels/ps/libbonsai_ps.so``
-on the board and the daemon loads it from that canonical path — no env var
-override.
+For RPC queries against a running daemon use ``pynqctl --host <board>``
+directly (or set ``PYNQ_HOST=<board>``). This script no longer forwards
+to pynqctl — chain them explicitly:
+
+    pynq-deploy sync && pynq-deploy daemon &
+    PYNQ_HOST=pynq pynqctl hello
 """
 
 from __future__ import annotations
@@ -27,15 +29,17 @@ if __package__ in (None, ""):
 
 from proto.ops import DEFAULT_PORT  # noqa: E402
 
-from host.cli import pynqctl  # noqa: E402
-
-
 DEFAULT_BOARD_HOST = "pynq"
 DEFAULT_REMOTE_DIR = "/home/xilinx/pynqz1"
 DEFAULT_BOARD_PYTHON = "/usr/local/share/pynq-venv/bin/python"
 
-# These three packages are the entirety of the board-side install.
+# Everything below board/ and proto/ gets rsync'd to the board. That's the
+# entire on-board surface — the host backend and CLIs stay local.
 BOARD_PACKAGES = ("board", "proto")
+
+# Env vars on the host that get forwarded into the remote daemon process.
+# PYNQ_PROFILE = "1" or path; affects board.profiling.events.
+FORWARDED_ENV = ("PYNQ_PROFILE",)
 
 
 @dataclass(frozen=True)
@@ -49,15 +53,10 @@ class BoardConfig:
     slab_mib: int
     overlay: str
     overlay_id: str
-    rpc_host: str | None
 
     @property
     def ssh_target(self) -> str:
         return f"{self.ssh_user}@{self.board_host}"
-
-    @property
-    def runtime_host(self) -> str:
-        return self.rpc_host or self.board_host
 
 
 def project_root() -> Path:
@@ -85,7 +84,7 @@ def remote_daemon_command(config: BoardConfig) -> str:
         "XILINX_XRT=/usr",
         "PYNQ_PYTHON=python3.10",
         f"PYTHONPATH={config.remote_dir}",
-        *_forwarded_daemon_env(),
+        *_forwarded_env(),
         config.board_python,
         "-m",
         "board.daemon",
@@ -107,9 +106,9 @@ def remote_daemon_command(config: BoardConfig) -> str:
     return f"cd {shlex.quote(config.remote_dir)} && exec {shlex.join(daemon)}"
 
 
-def _forwarded_daemon_env() -> list[str]:
-    forwarded = []
-    for name in ("PYNQ_PROFILE",):
+def _forwarded_env() -> list[str]:
+    forwarded: list[str] = []
+    for name in FORWARDED_ENV:
         value = os.environ.get(name)
         if value is not None and value.lower() not in ("", "0", "false", "no", "off"):
             forwarded.append(f"{name}={value}")
@@ -117,8 +116,6 @@ def _forwarded_daemon_env() -> list[str]:
 
 
 def remote_native_build_command(config: BoardConfig) -> str:
-    # The board carries its own Makefile under board/kernels/ps/. We just
-    # invoke `make`, with cortex-a9 flags overridden via CFLAGS.
     cflags = "-O3 -mcpu=cortex-a9 -mfpu=neon-vfpv3 -mfloat-abi=hard -std=c99 -fPIC"
     return (
         f"cd {shlex.quote(config.remote_dir)}/board/kernels/ps && "
@@ -132,16 +129,6 @@ def ssh_daemon_command(config: BoardConfig) -> list[str]:
 
 def ssh_native_build_command(config: BoardConfig) -> list[str]:
     return ["ssh", "-tt", config.ssh_target, remote_native_build_command(config)]
-
-
-def pynqctl_args(config: BoardConfig, command: list[str]) -> list[str]:
-    return [
-        "--host",
-        config.runtime_host,
-        "--port",
-        str(config.port),
-        *command,
-    ]
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
@@ -166,54 +153,35 @@ def cmd_build_native(args: argparse.Namespace) -> int:
     return run_command(ssh_native_build_command(config))
 
 
-def cmd_hello(args: argparse.Namespace) -> int:
-    return pynqctl.main(pynqctl_args(config_from_args(args), ["hello"]))
-
-
-def cmd_smoke(args: argparse.Namespace) -> int:
-    return pynqctl.main(
-        pynqctl_args(
-            config_from_args(args),
-            ["smoke", "--bytes", args.nbytes],
-        )
-    )
-
-
-def cmd_graph_copy_smoke(args: argparse.Namespace) -> int:
-    return pynqctl.main(
-        pynqctl_args(
-            config_from_args(args),
-            ["graph-copy-smoke", "--bytes", args.nbytes],
-        )
-    )
-
-
 def run_command(command: list[str]) -> int:
     return subprocess.run(command, check=False).returncode
 
 
 def config_from_args(args: argparse.Namespace) -> BoardConfig:
+    # Daemon-only fields are absent on sync/build-native; defaults are unused
+    # there but BoardConfig is frozen so we have to populate them.
     return BoardConfig(
         board_host=args.board_host,
         ssh_user=args.ssh_user,
         remote_dir=args.remote_dir,
         board_python=args.board_python,
         port=args.port,
-        heap_mib=args.heap_mib,
-        slab_mib=args.slab_mib,
-        overlay=args.overlay,
-        overlay_id=args.overlay_id,
-        rpc_host=args.rpc_host,
+        heap_mib=getattr(args, "heap_mib", 0),
+        slab_mib=getattr(args, "slab_mib", 0),
+        overlay=getattr(args, "overlay", ""),
+        overlay_id=getattr(args, "overlay_id", ""),
     )
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--board-host", default=DEFAULT_BOARD_HOST)
+    parser.add_argument("--board-host", default=os.environ.get("PYNQ_HOST", DEFAULT_BOARD_HOST))
     parser.add_argument("--ssh-user", default="xilinx")
-    parser.add_argument("--rpc-host")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PYNQ_PORT", DEFAULT_PORT)))
     parser.add_argument("--remote-dir", default=DEFAULT_REMOTE_DIR)
     parser.add_argument("--board-python", default=DEFAULT_BOARD_PYTHON)
+
+
+def add_daemon_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--heap-mib", type=int, default=64)
     parser.add_argument("--slab-mib", type=int, default=32)
     parser.add_argument("--overlay", default="base")
@@ -222,50 +190,32 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Deploy and exercise the Bonsai runtime on a PYNQ board"
+        description="Deploy and exercise the daemon on a PYNQ board"
     )
     add_common_args(parser)
-
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     sync = subparsers.add_parser("sync", help="rsync board/ and proto/ to the board")
     sync.set_defaults(func=cmd_sync)
 
     daemon = subparsers.add_parser(
-        "daemon",
-        help="sync packages and run the board daemon in the foreground",
+        "daemon", help="sync packages and run the board daemon in the foreground"
     )
     daemon.add_argument(
-        "--no-sync",
-        action="store_true",
-        help="run the daemon from already-copied board files",
+        "--no-sync", action="store_true",
+        help="run from already-copied board files",
     )
+    add_daemon_args(daemon)
     daemon.set_defaults(func=cmd_daemon)
 
     build_native = subparsers.add_parser(
-        "build-native",
-        help="sync packages and rebuild libbonsai_ps.so on the board",
+        "build-native", help="sync packages and rebuild libbonsai_ps.so on the board"
     )
     build_native.add_argument(
-        "--no-sync",
-        action="store_true",
+        "--no-sync", action="store_true",
         help="build from already-copied board files",
     )
     build_native.set_defaults(func=cmd_build_native)
-
-    hello = subparsers.add_parser("hello", help="query the board daemon over RPC")
-    hello.set_defaults(func=cmd_hello)
-
-    smoke = subparsers.add_parser("smoke", help="run board tensor transfer smoke")
-    smoke.add_argument("--bytes", dest="nbytes", default="64k")
-    smoke.set_defaults(func=cmd_smoke)
-
-    graph_copy_smoke = subparsers.add_parser(
-        "graph-copy-smoke",
-        help="run board RUN_GRAPH COPY smoke",
-    )
-    graph_copy_smoke.add_argument("--bytes", dest="nbytes", default="64k")
-    graph_copy_smoke.set_defaults(func=cmd_graph_copy_smoke)
 
     return parser
 
@@ -275,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except OSError as exc:
-        print(f"pynq-board: {exc}", file=sys.stderr)
+        print(f"pynq-deploy: {exc}", file=sys.stderr)
         return 1
 
 

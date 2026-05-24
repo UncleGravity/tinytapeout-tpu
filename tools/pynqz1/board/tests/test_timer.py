@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-import os
 import time
 
 from board.profiling.timer import Timer
@@ -35,19 +33,11 @@ def test_add_accumulates_fields_per_op():
     assert timer.ops[0].fields["bytes_read"] == 384
 
 
-def test_emit_writes_json_only_when_enabled(capsys, monkeypatch):
+def test_summary_shape():
     timer = Timer()
     with timer.op("FOO", index=0):
-        pass
-
-    monkeypatch.delenv("PYNQ_PROFILE", raising=False)
-    timer.emit_if_enabled()
-    assert capsys.readouterr().err == ""
-
-    monkeypatch.setenv("PYNQ_PROFILE", "1")
-    timer.emit_if_enabled(counters={"ps_ops": 1})
-    captured = capsys.readouterr()
-    assert captured.err.startswith("pynq profile: ")
-    payload = json.loads(captured.err[len("pynq profile: ") :])
+        timer.add("bytes_read", 16)
+    payload = timer.summary(counters={"ps_ops": 1})
     assert payload["counters"]["ps_ops"] == 1
     assert payload["ops"][0]["op"] == "FOO"
+    assert payload["ops"][0]["bytes_read"] == 16

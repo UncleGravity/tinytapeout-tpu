@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import sys
 from pathlib import Path
@@ -10,9 +11,9 @@ from typing import Any
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from host.transport.client import RpcClient, RpcRemoteError  # noqa: E402
 from proto.framing import ProtocolError  # noqa: E402
 from proto.ops import DEFAULT_PORT  # noqa: E402
-from host.transport.client import RpcClient, RpcRemoteError  # noqa: E402
 
 
 class CliError(RuntimeError):
@@ -320,9 +321,9 @@ def deterministic_bytes(nbytes: int) -> bytes:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Control a PYNQ-Z1 bonsaid runtime")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser = argparse.ArgumentParser(description="Control a PYNQ-Z1 daemon")
+    parser.add_argument("--host", default=os.environ.get("PYNQ_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PYNQ_PORT", DEFAULT_PORT)))
     parser.add_argument("--timeout", type=float, default=5.0)
 
     subparsers = parser.add_subparsers(dest="command", required=True)

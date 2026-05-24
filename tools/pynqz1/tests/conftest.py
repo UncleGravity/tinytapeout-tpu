@@ -17,7 +17,6 @@ from board.memory.allocator import TensorAllocator
 from board.memory.slabs import fake_slabs
 from host.transport.client import RpcClient
 
-
 PS_DIR = Path(__file__).resolve().parents[1] / "board" / "kernels" / "ps"
 
 

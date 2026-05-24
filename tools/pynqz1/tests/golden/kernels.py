@@ -139,7 +139,7 @@ def swiglu_f32(gate: bytes, up: bytes, elements: int) -> bytes:
     up_values = struct.unpack(f"<{elements}f", up)
     return struct.pack(
         f"<{elements}f",
-        *(silu(g) * u for g, u in zip(gate_values, up_values)),
+        *(silu(g) * u for g, u in zip(gate_values, up_values, strict=False)),
     )
 
 

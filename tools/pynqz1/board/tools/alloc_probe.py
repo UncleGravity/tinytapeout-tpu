@@ -14,7 +14,6 @@ import time
 import numpy as np
 from pynq import Overlay, allocate
 
-
 MIB = 1024 * 1024
 
 
@@ -30,7 +29,7 @@ def read_meminfo():
     }
     out = {}
     try:
-        with open("/proc/meminfo", "r", encoding="ascii") as f:
+        with open("/proc/meminfo", encoding="ascii") as f:
             for line in f:
                 key, rest = line.split(":", 1)
                 if key in wanted:

@@ -14,8 +14,8 @@ ask for ``extents(handle)`` and program one descriptor per extent.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from typing import Iterable, Iterator
 
 from board.memory.slabs import FakeSlab, PynqSlab, fake_slabs, pynq_slabs
 

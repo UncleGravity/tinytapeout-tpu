@@ -18,7 +18,6 @@ def config(**overrides):
         "slab_mib": 32,
         "overlay": "base",
         "overlay_id": "pynq-base",
-        "rpc_host": None,
     }
     values.update(overrides)
     return deploy.BoardConfig(**values)
@@ -46,7 +45,6 @@ def test_ssh_daemon_runs_board_daemon_module():
     assert "python -m board.daemon" in remote
     assert "--port 50060 --allocator pynq" in remote
     assert "--heap-mib 4 --slab-mib 1" in remote
-    # No PYNQ_PS_LIB anywhere — canonical path only.
     assert "PYNQ_PS_LIB" not in remote
 
 
@@ -54,6 +52,12 @@ def test_ssh_daemon_forwards_profile_env(monkeypatch):
     monkeypatch.setenv("PYNQ_PROFILE", "1")
     command = deploy.ssh_daemon_command(config())
     assert "PYNQ_PROFILE=1" in command[3]
+
+
+def test_ssh_daemon_forwards_profile_path(monkeypatch):
+    monkeypatch.setenv("PYNQ_PROFILE", "/var/log/pynq.ndjson")
+    command = deploy.ssh_daemon_command(config())
+    assert "PYNQ_PROFILE=/var/log/pynq.ndjson" in command[3]
 
 
 def test_ssh_native_build_invokes_makefile():
@@ -65,7 +69,7 @@ def test_ssh_native_build_invokes_makefile():
 
 
 def test_daemon_syncs_before_ssh(monkeypatch):
-    commands = []
+    commands: list[list[str]] = []
     monkeypatch.setattr(deploy, "run_command", lambda c: commands.append(c) or 0)
 
     rc = deploy.main(["daemon"])
@@ -76,7 +80,7 @@ def test_daemon_syncs_before_ssh(monkeypatch):
 
 
 def test_build_native_syncs_before_ssh(monkeypatch):
-    commands = []
+    commands: list[list[str]] = []
     monkeypatch.setattr(deploy, "run_command", lambda c: commands.append(c) or 0)
 
     rc = deploy.main(["build-native"])
@@ -86,15 +90,18 @@ def test_build_native_syncs_before_ssh(monkeypatch):
     assert commands[1][:3] == ["ssh", "-tt", "xilinx@pynq"]
 
 
-def test_subcommand_forwards_to_pynqctl(monkeypatch):
-    calls = []
-    monkeypatch.setattr(deploy.pynqctl, "main", lambda argv: calls.append(argv) or 17)
+def test_no_sync_skips_rsync(monkeypatch):
+    commands: list[list[str]] = []
+    monkeypatch.setattr(deploy, "run_command", lambda c: commands.append(c) or 0)
+    rc = deploy.main(["daemon", "--no-sync"])
+    assert rc == 0
+    assert len(commands) == 1
+    assert commands[0][:3] == ["ssh", "-tt", "xilinx@pynq"]
 
-    rc = deploy.main(
-        ["--rpc-host", "pynq-rpc", "--port", "50060", "graph-copy-smoke", "--bytes", "1536k"]
-    )
 
-    assert rc == 17
-    assert calls == [
-        ["--host", "pynq-rpc", "--port", "50060", "graph-copy-smoke", "--bytes", "1536k"]
-    ]
+def test_board_host_from_env(monkeypatch):
+    monkeypatch.setenv("PYNQ_HOST", "pynq.local")
+    commands: list[list[str]] = []
+    monkeypatch.setattr(deploy, "run_command", lambda c: commands.append(c) or 0)
+    deploy.main(["daemon", "--no-sync"])
+    assert "xilinx@pynq.local" in commands[0]

@@ -1,8 +1,11 @@
 #include "client.h"
 
+#include "events.h"
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -125,7 +128,7 @@ int connect_endpoint(const Endpoint & endpoint) {
 }
 
 uint16_t env_port() {
-    const char * raw = std::getenv("PYNQ_BONSAID_PORT");
+    const char * raw = std::getenv("PYNQ_PORT");
     if (raw == nullptr || raw[0] == '\0') {
         return k_default_port;
     }
@@ -135,7 +138,7 @@ uint16_t env_port() {
     const unsigned long parsed = std::strtoul(raw, &end, 10);
     if (errno != 0 || end == raw || *end != '\0' ||
         parsed == 0 || parsed > std::numeric_limits<uint16_t>::max()) {
-        throw RpcError("invalid PYNQ_BONSAID_PORT");
+        throw RpcError("invalid PYNQ_PORT");
     }
     return static_cast<uint16_t>(parsed);
 }
@@ -150,7 +153,7 @@ std::string remote_error_text(const nlohmann::json & response) {
 } // namespace
 
 Endpoint endpoint_from_env() {
-    const char * host = std::getenv("PYNQ_BONSAID_HOST");
+    const char * host = std::getenv("PYNQ_HOST");
     return Endpoint {
         host != nullptr && host[0] != '\0' ? host : k_default_host,
         env_port(),
@@ -183,10 +186,42 @@ RpcResponse RpcClient::call(
     const void * payload,
     size_t payload_size) {
     std::lock_guard<std::mutex> lock(mu_);
+    const uint64_t req_id = next_id_;
+    const bool profiling = events::enabled();
+    const auto t0 = profiling
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+
+    if (profiling) {
+        events::emit("rpc_send", {
+            {"req_id", req_id},
+            {"op", op},
+            {"bytes", fields.dump().size() + payload_size},
+        });
+    }
+
     try {
         ensure_connected();
-        return call_locked(op, fields, payload, payload_size);
-    } catch (const RpcError &) {
+        RpcResponse resp = call_locked(op, fields, payload, payload_size);
+        if (profiling) {
+            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            events::emit("rpc_recv", {
+                {"req_id", req_id},
+                {"op", op},
+                {"us", us},
+                {"bytes", resp.payload.size()},
+            });
+        }
+        return resp;
+    } catch (const RpcError & exc) {
+        if (profiling) {
+            events::emit("rpc_error", {
+                {"req_id", req_id},
+                {"op", op},
+                {"message", exc.what()},
+            });
+        }
         // Any I/O error invalidates the socket. The next call will reconnect.
         close_socket();
         throw;

@@ -21,7 +21,7 @@ packages = [
     "board.kernels.ps",
     "board.kernels.pl",
     "board.profiling",
-    "tools",
+    "board.tools",
 ]
 
 [tool.pytest.ini_options]
@@ -31,3 +31,11 @@ testpaths = [
     "board/tests",
     "tests",
 ]
+
+[tool.ruff]
+line-length = 100
+extend-exclude = ["**/__pycache__"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]

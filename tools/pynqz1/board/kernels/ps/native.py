@@ -12,7 +12,6 @@ the rest delegate to ``libbonsai_ps.so``.
 from __future__ import annotations
 
 import ctypes
-import struct
 from pathlib import Path
 from typing import Any
 
@@ -52,7 +51,6 @@ from proto.ops import (
     Q1_BLOCK,
     Q1_BLOCK_BYTES,
 )
-
 
 F32_BYTES = 4
 DEFAULT_LIB_PATH = Path(__file__).parent / "libbonsai_ps.so"

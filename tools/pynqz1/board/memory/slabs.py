@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from typing import Protocol
 
-
 MIB = 1024 * 1024
 
 

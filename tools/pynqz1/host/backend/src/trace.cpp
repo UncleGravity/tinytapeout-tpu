@@ -7,25 +7,55 @@
 #include <cstdlib>
 #include <cstring>
 
+// PYNQ_TRACE accepts either:
+//   "0", "false", unset → disabled
+//   "1"                 → human-readable lines to stderr
+//   anything else       → treated as a file path; opened append, line-buffered
+// Same convention used by PYNQ_PROFILE on the board (see board/profiling).
+
 namespace pynq {
 
+namespace {
+
+std::FILE * resolve_sink() {
+    const char * value = std::getenv("PYNQ_TRACE");
+    if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0 ||
+        std::strcmp(value, "false") == 0 || std::strcmp(value, "no") == 0) {
+        return nullptr;
+    }
+    if (std::strcmp(value, "1") == 0) {
+        return stderr;
+    }
+    std::FILE * fp = std::fopen(value, "a");
+    if (fp == nullptr) {
+        std::fprintf(stderr, "pynq: PYNQ_TRACE='%s' could not be opened, falling back to stderr\n", value);
+        return stderr;
+    }
+    std::setvbuf(fp, nullptr, _IOLBF, 0);
+    return fp;
+}
+
+std::FILE * sink() {
+    static std::FILE * fp = resolve_sink();
+    return fp;
+}
+
+} // namespace
+
 bool trace_enabled() {
-    static const bool enabled = [] {
-        const char * value = std::getenv("PYNQ_TRACE");
-        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-    }();
-    return enabled;
+    return sink() != nullptr;
 }
 
 void tracef(const char * format, ...) {
-    if (!trace_enabled()) {
+    std::FILE * fp = sink();
+    if (fp == nullptr) {
         return;
     }
     std::va_list args;
     va_start(args, format);
-    std::vfprintf(stderr, format, args);
+    std::vfprintf(fp, format, args);
     va_end(args);
-    std::fflush(stderr);
+    std::fflush(fp);
 }
 
 double mib(std::size_t nbytes) {

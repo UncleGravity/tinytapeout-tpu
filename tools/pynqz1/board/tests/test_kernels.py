@@ -23,7 +23,6 @@ from proto.ops import (
 from tests.golden import kernels as golden
 from tests.golden.vectors import f32_bytes
 
-
 F32 = 4
 
 
@@ -40,7 +39,7 @@ def allocate_empty(alloc: TensorAllocator, nbytes: int) -> int:
 def run_one(registry, alloc: TensorAllocator, op: dict) -> bytes:
     kernel = registry.get(op["op"])
     timer = Timer()
-    with timer.op(op["op"], index=0):
+    with timer.op(op["op"]):
         kernel.run(alloc, op, timer)
     return alloc.read(op["dst"], 0, alloc.describe(op["dst"])["nbytes"])
 
@@ -103,7 +102,7 @@ def test_silu_f32(registry, allocator):
     })
     expected = golden.silu_f32(src, elements)
     # F32 nonlinearity — allow tiny numerical drift.
-    for got, exp in zip(struct.iter_unpack("<f", out), struct.iter_unpack("<f", expected)):
+    for got, exp in zip(struct.iter_unpack("<f", out), struct.iter_unpack("<f", expected), strict=False):
         assert got[0] == pytest.approx(exp[0], abs=1e-6)
 
 
@@ -119,7 +118,7 @@ def test_swiglu_f32(registry, allocator):
         "elements": elements,
     })
     expected = golden.swiglu_f32(gate, up, elements)
-    for got, exp in zip(struct.iter_unpack("<f", out), struct.iter_unpack("<f", expected)):
+    for got, exp in zip(struct.iter_unpack("<f", out), struct.iter_unpack("<f", expected), strict=False):
         assert got[0] == pytest.approx(exp[0], abs=1e-6)
 
 
@@ -133,7 +132,7 @@ def test_rms_norm_f32(registry, allocator):
         "rows": rows, "cols": cols, "eps": 1e-6,
     })
     expected = golden.rms_norm_f32(src, rows, cols, 1e-6)
-    for got, exp in zip(struct.iter_unpack("<f", out), struct.iter_unpack("<f", expected)):
+    for got, exp in zip(struct.iter_unpack("<f", out), struct.iter_unpack("<f", expected), strict=False):
         assert got[0] == pytest.approx(exp[0], abs=1e-5)
 
 
@@ -166,5 +165,5 @@ def test_matmul_q1a8(registry, allocator):
         "rows": rows, "cols": cols, "k": k,
     })
     expected = golden.matmul_q1a8(weights, acts, rows, cols, k)
-    for got, exp in zip(struct.iter_unpack("<f", out), struct.iter_unpack("<f", expected)):
+    for got, exp in zip(struct.iter_unpack("<f", out), struct.iter_unpack("<f", expected), strict=False):
         assert got[0] == pytest.approx(exp[0], abs=1e-4)

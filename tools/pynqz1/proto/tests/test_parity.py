@@ -7,7 +7,6 @@ from pathlib import Path
 
 from proto import ops
 
-
 HEADER = Path(__file__).resolve().parents[1] / "ops.h"
 
 _INT_DECL = re.compile(
