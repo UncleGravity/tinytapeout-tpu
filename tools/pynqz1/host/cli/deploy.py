@@ -1,3 +1,17 @@
+"""Deploy + drive the bonsaid daemon on a PYNQ-Z1 board.
+
+Two responsibilities, kept symmetric so each maps to one SSH/rsync call:
+
+  * ``sync``        rsync the board-side packages over to the board
+  * ``build-native`` rebuild ``libbonsai_ps.so`` on the board via its Makefile
+  * ``daemon``      start the daemon in the foreground
+  * ``hello/smoke/...``  thin wrappers around ``pynqctl``
+
+The native library lives at ``{remote_dir}/board/kernels/ps/libbonsai_ps.so``
+on the board and the daemon loads it from that canonical path — no env var
+override.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -15,12 +29,13 @@ from proto.ops import DEFAULT_PORT  # noqa: E402
 
 from host.cli import pynqctl  # noqa: E402
 
-# NOTE: Board-side paths below still reference the legacy ``runtime/`` layout.
-# They will be updated in delta 2 when ``runtime/`` moves under ``board/``.
 
 DEFAULT_BOARD_HOST = "pynq"
-DEFAULT_REMOTE_DIR = "/home/xilinx/pynqz1-runtime"
+DEFAULT_REMOTE_DIR = "/home/xilinx/pynqz1"
 DEFAULT_BOARD_PYTHON = "/usr/local/share/pynq-venv/bin/python"
+
+# These three packages are the entirety of the board-side install.
+BOARD_PACKAGES = ("board", "proto")
 
 
 @dataclass(frozen=True)
@@ -49,29 +64,31 @@ def project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def rsync_runtime_command(config: BoardConfig, root: Path | None = None) -> list[str]:
+def rsync_packages_command(config: BoardConfig, root: Path | None = None) -> list[str]:
     base = root or project_root()
+    # --chmod=ug+w: nix-store sources are 0444/0555; without this the dest
+    # tree on the board is un-writable and `make clean` fails.
     return [
         "rsync",
         "-a",
-        str(base / "runtime"),
-        str(base / "proto"),
+        "--chmod=ug+w",
+        "--exclude=__pycache__",
+        *[str(base / pkg) for pkg in BOARD_PACKAGES],
         f"{config.ssh_target}:{config.remote_dir}/",
     ]
 
 
 def remote_daemon_command(config: BoardConfig) -> str:
-    native_lib = f"{config.remote_dir}/runtime/native/libbonsai_ps.so"
     daemon = [
         "sudo",
         "env",
         "XILINX_XRT=/usr",
         "PYNQ_PYTHON=python3.10",
-        f"PYNQ_PS_LIB={native_lib}",
+        f"PYTHONPATH={config.remote_dir}",
         *_forwarded_daemon_env(),
         config.board_python,
         "-m",
-        "runtime.bonsaid",
+        "board.daemon",
         "--host",
         "0.0.0.0",
         "--port",
@@ -100,29 +117,12 @@ def _forwarded_daemon_env() -> list[str]:
 
 
 def remote_native_build_command(config: BoardConfig) -> str:
-    output = "runtime/native/libbonsai_ps.so"
-    tmp_output = "/tmp/libbonsai_ps.so"
-    build = [
-        "gcc",
-        "-O3",
-        "-mcpu=cortex-a9",
-        "-mfpu=neon-vfpv3",
-        "-mfloat-abi=hard",
-        "-std=c99",
-        "-fPIC",
-        "-shared",
-        "-o",
-        tmp_output,
-        "runtime/native/bonsai_ps.c",
-        "-lm",
-    ]
-    install = ["sudo", "install", "-m", "0755", tmp_output, output]
-    cleanup = ["rm", "-f", tmp_output]
+    # The board carries its own Makefile under board/kernels/ps/. We just
+    # invoke `make`, with cortex-a9 flags overridden via CFLAGS.
+    cflags = "-O3 -mcpu=cortex-a9 -mfpu=neon-vfpv3 -mfloat-abi=hard -std=c99 -fPIC"
     return (
-        f"cd {shlex.quote(config.remote_dir)} && "
-        f"{shlex.join(build)} && "
-        f"{shlex.join(install)} && "
-        f"{shlex.join(cleanup)}"
+        f"cd {shlex.quote(config.remote_dir)}/board/kernels/ps && "
+        f"make OUT_DIR=. clean && CFLAGS={shlex.quote(cflags)} make OUT_DIR=."
     )
 
 
@@ -145,13 +145,13 @@ def pynqctl_args(config: BoardConfig, command: list[str]) -> list[str]:
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
-    return run_command(rsync_runtime_command(config_from_args(args)))
+    return run_command(rsync_packages_command(config_from_args(args)))
 
 
 def cmd_daemon(args: argparse.Namespace) -> int:
     config = config_from_args(args)
     if not args.no_sync:
-        rc = run_command(rsync_runtime_command(config))
+        rc = run_command(rsync_packages_command(config))
         if rc != 0:
             return rc
     return run_command(ssh_daemon_command(config))
@@ -160,7 +160,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
 def cmd_build_native(args: argparse.Namespace) -> int:
     config = config_from_args(args)
     if not args.no_sync:
-        rc = run_command(rsync_runtime_command(config))
+        rc = run_command(rsync_packages_command(config))
         if rc != 0:
             return rc
     return run_command(ssh_native_build_command(config))
@@ -228,12 +228,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    sync = subparsers.add_parser("sync", help="copy runtime package to the board")
+    sync = subparsers.add_parser("sync", help="rsync board/ and proto/ to the board")
     sync.set_defaults(func=cmd_sync)
 
     daemon = subparsers.add_parser(
         "daemon",
-        help="sync runtime and run board bonsaid in the foreground",
+        help="sync packages and run the board daemon in the foreground",
     )
     daemon.add_argument(
         "--no-sync",
@@ -244,7 +244,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     build_native = subparsers.add_parser(
         "build-native",
-        help="sync runtime and compile the PS native shared library on the board",
+        help="sync packages and rebuild libbonsai_ps.so on the board",
     )
     build_native.add_argument(
         "--no-sync",
@@ -253,7 +253,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     build_native.set_defaults(func=cmd_build_native)
 
-    hello = subparsers.add_parser("hello", help="query board bonsaid over RPC")
+    hello = subparsers.add_parser("hello", help="query the board daemon over RPC")
     hello.set_defaults(func=cmd_hello)
 
     smoke = subparsers.add_parser("smoke", help="run board tensor transfer smoke")

@@ -15,12 +15,19 @@ packages = [
     "host.cli",
     "host.transport",
     "board",
-    "board.runtime",
+    "board.daemon",
+    "board.memory",
+    "board.kernels",
+    "board.kernels.ps",
+    "board.kernels.pl",
+    "board.profiling",
     "tools",
 ]
 
-[tool.setuptools.package-dir]
-"board.runtime" = "runtime"
-
 [tool.pytest.ini_options]
-testpaths = ["proto/tests", "host/tests", "board/tests", "tests"]
+testpaths = [
+    "proto/tests",
+    "host/tests",
+    "board/tests",
+    "tests",
+]
