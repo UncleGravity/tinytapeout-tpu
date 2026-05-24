@@ -46,15 +46,16 @@ class BoardConfig:
 
 
 def project_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    return Path(__file__).resolve().parents[2]
 
 
 def rsync_runtime_command(config: BoardConfig, root: Path | None = None) -> list[str]:
-    source = (root or project_root()) / "runtime"
+    base = root or project_root()
     return [
         "rsync",
         "-a",
-        str(source),
+        str(base / "runtime"),
+        str(base / "proto"),
         f"{config.ssh_target}:{config.remote_dir}/",
     ]
 

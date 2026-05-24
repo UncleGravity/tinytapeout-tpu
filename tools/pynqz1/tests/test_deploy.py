@@ -29,6 +29,7 @@ def test_rsync_runtime_command_uses_runtime_package_path():
         "rsync",
         "-a",
         "/repo/pynqz1/runtime",
+        "/repo/pynqz1/proto",
         "xilinx@pynq:/home/xilinx/pynqz1-runtime/",
     ]
 

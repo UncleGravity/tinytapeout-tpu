@@ -128,8 +128,8 @@
             };
         in
         {
-          pynqctl = mkTool "pynqctl" "tools/pynqctl.py" [ ];
-          pynq-board = mkTool "pynq-board" "tools/pynq_board.py" boardTransportTools;
+          pynqctl = mkTool "pynqctl" "host/cli/pynqctl.py" [ ];
+          pynq-board = mkTool "pynq-board" "host/cli/deploy.py" boardTransportTools;
           bonsai-ps-native = bonsaiPsNative;
           inherit (pynqBackend) llama-cpp-dl llama-cli-pynq pynq-backend;
           default = self.packages.${system}.pynqctl;
