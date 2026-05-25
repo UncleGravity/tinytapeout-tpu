@@ -12,14 +12,20 @@ around it.
 
 ## Files
 
-| File              | What it is                                                  |
-|-------------------|-------------------------------------------------------------|
-| `q1a8_reducer.v`  | the reducer module (integer reduce + fp scaling)            |
-| `fp16_to_fp32.v`  | combinational fp16 -> fp32 conversion                       |
-| `int_to_fp32.v`   | combinational signed int -> fp32 conversion (parameterized) |
-| `fp32_mul.v`      | combinational truncating fp32 multiplier                    |
-| `test.py`         | cocotb testbench with a bit-exact Python golden             |
-| `Makefile`        | cocotb driver (defaults to verilator)                       |
+This folder holds the test setup only - the synthesizable Verilog lives
+in `../../rtl/q1a8/`:
+
+| Local         | What                                                            |
+|---------------|-----------------------------------------------------------------|
+| `test.py`     | cocotb testbench with a bit-exact Python golden                 |
+| `Makefile`    | cocotb driver (defaults to verilator); points at `rtl/q1a8/`    |
+
+| `../../rtl/q1a8/...`  | Module under test                                       |
+|-----------------------|---------------------------------------------------------|
+| `q1a8_reducer.v`      | the reducer module (integer reduce + fp scaling)        |
+| `fp16_to_fp32.v`      | combinational fp16 -> fp32 conversion                   |
+| `int_to_fp32.v`       | combinational signed int -> fp32 (parameterized)        |
+| `fp32_mul.v`          | combinational truncating fp32 multiplier                |
 
 The fp32 multiplier is truncating (round-toward-zero) and doesn't model
 Inf / NaN. For real silicon swap it for the Xilinx Floating Point Operator

@@ -3,20 +3,18 @@ TOPLEVEL_LANG ?= verilog
 TOPLEVEL = q1a8_kernel
 COCOTB_TEST_MODULES = test
 
-REDUCER_DIR  = $(PWD)/../q1a8_reducer
-CELL_DIR     = $(PWD)/../q1a8_cell
-STREAMER_DIR = $(PWD)/../q1a8_streamer
+RTL = $(PWD)/../../rtl/q1a8
 
 VERILOG_SOURCES = \
-    $(REDUCER_DIR)/fp16_to_fp32.v \
-    $(REDUCER_DIR)/int_to_fp32.v \
-    $(REDUCER_DIR)/fp32_mul.v \
-    $(REDUCER_DIR)/q1a8_reducer.v \
-    $(CELL_DIR)/fp32_add.v \
-    $(CELL_DIR)/q1a8_cell.v \
-    $(STREAMER_DIR)/q1a8_streamer.v \
-    $(PWD)/axis_to_subblock.v \
-    $(PWD)/q1a8_kernel.v
+    $(RTL)/fp16_to_fp32.v \
+    $(RTL)/int_to_fp32.v \
+    $(RTL)/fp32_mul.v \
+    $(RTL)/q1a8_reducer.v \
+    $(RTL)/fp32_add.v \
+    $(RTL)/q1a8_cell.v \
+    $(RTL)/q1a8_streamer.v \
+    $(RTL)/axis_to_subblock.v \
+    $(RTL)/q1a8_kernel.v
 
 ifeq ($(SIM),verilator)
 EXTRA_ARGS += --trace --trace-structs

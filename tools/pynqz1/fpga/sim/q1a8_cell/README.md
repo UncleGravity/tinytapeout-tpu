@@ -17,12 +17,19 @@ For Bonsai-1.7B with K=2048, that's 64 sub-blocks per cell.
 
 ## Files
 
-| File           | What                                                              |
-|----------------|-------------------------------------------------------------------|
-| `q1a8_cell.v`  | Top module - reducer + accumulator + start/done sequencing        |
-| `fp32_add.v`   | Truncating IEEE 754 fp32 adder, same simplifications as fp32_mul  |
-| `test.py`      | cocotb tests with bit-exact Python golden                         |
-| `Makefile`     | cocotb runner; pulls reducer-side .v files from `../q1a8_reducer/`|
+Synthesizable Verilog lives in `../../rtl/q1a8/`; this folder is just
+the test setup:
+
+| Local              | What                                                       |
+|--------------------|------------------------------------------------------------|
+| `test.py`          | cocotb tests with bit-exact Python golden                  |
+| `Makefile`         | cocotb runner; points at `rtl/q1a8/`                       |
+
+| `../../rtl/q1a8/...`  | Module                                                  |
+|-----------------------|---------------------------------------------------------|
+| `q1a8_cell.v`         | reducer + accumulator + start/done sequencing           |
+| `fp32_add.v`          | truncating fp32 adder, same simplifications as fp32_mul |
+| (plus reducer chain)  | fp16_to_fp32, int_to_fp32, fp32_mul, q1a8_reducer       |
 
 ## Run
 

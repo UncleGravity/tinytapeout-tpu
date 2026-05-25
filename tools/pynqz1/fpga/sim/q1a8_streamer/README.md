@@ -23,11 +23,15 @@ What this sim validates:
 
 ## Files
 
-| File                 | What                                                     |
-|----------------------|----------------------------------------------------------|
-| `q1a8_streamer.v`    | The FSM + handshake (~80 lines)                          |
-| `test.py`            | cocotb tests with bit-exact Python golden                |
-| `Makefile`           | cocotb runner; pulls cell + reducer .v files from siblings |
+Synthesizable Verilog lives in `../../rtl/q1a8/` (shared with the
+reducer and cell sims). This folder is the test setup only:
+
+| Local                  | What                                                   |
+|------------------------|--------------------------------------------------------|
+| `test.py`              | cocotb tests with bit-exact Python golden              |
+| `Makefile`             | cocotb runner; points at `rtl/q1a8/`                   |
+
+Module under test: `../../rtl/q1a8/q1a8_streamer.v` (FSM + handshake, ~80 lines).
 
 ## Run
 
