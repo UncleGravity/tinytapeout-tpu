@@ -1,7 +1,12 @@
 """``python -m board.daemon`` entrypoint.
 
-Constructs the kernel registry, allocator, and overlay, then serves
-RPC frames until interrupted.
+Constructs the kernel registry, allocator, and (optionally) the PL
+overlay, then serves RPC frames until interrupted.
+
+PL kernels register after PS kernels — name collisions like ``GOP_COPY``
+override the PS implementation. This is the swap-point that lets a
+bitstream graduate from "loopback for testing" to "real W1A8 matmul"
+without daemon code changes.
 """
 
 from __future__ import annotations
@@ -19,7 +24,7 @@ from proto.ops import DEFAULT_PORT
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="PYNQ-Z1 Bonsai board daemon")
+    parser = argparse.ArgumentParser(description="PYNQ-Z1 board daemon")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--allocator", choices=["fake", "pynq"], default="fake")
@@ -31,6 +36,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="'base', 'none', or a bitfile path (pynq allocator only)",
     )
     parser.add_argument("--overlay-id", default="fake-local")
+    parser.add_argument(
+        "--bitfile",
+        default=None,
+        help="path to a PL bitstream; if set, board.kernels.pl.register_all "
+             "is called against the loaded overlay (overrides matching PS kernels)",
+    )
     return parser.parse_args(argv)
 
 
@@ -41,11 +52,16 @@ def make_runtime(args: argparse.Namespace) -> Runtime:
         allocator = TensorAllocator(fake_slabs(total, slab))
         overlay = None
     else:
-        overlay = load_overlay(args.overlay)
+        overlay = load_overlay(args.bitfile or args.overlay)
         allocator = TensorAllocator(pynq_slabs(total, slab))
 
     registry = KernelRegistry()
     ps_native.register_all(registry)
+
+    if args.bitfile is not None and overlay is not None:
+        from board.kernels import pl
+        pl.register_all(registry, overlay)
+
     return Runtime(allocator, registry, args.overlay_id, overlay)
 
 
@@ -66,15 +82,17 @@ def main(argv: list[str] | None = None) -> int:
     runtime = make_runtime(args)
     with BonsaiRpcServer((args.host, args.port), runtime) as server:
         host, port = server.server_address
+        ops = ", ".join(runtime.registry.names())
         print(
-            f"bonsaid listening on {host}:{port} "
-            f"allocator={args.allocator} heap={args.heap_mib}MiB slab={args.slab_mib}MiB",
+            f"pynqd listening on {host}:{port} "
+            f"allocator={args.allocator} heap={args.heap_mib}MiB slab={args.slab_mib}MiB "
+            f"ops=[{ops}]",
             flush=True,
         )
         try:
             server.serve_forever()
         except KeyboardInterrupt:
-            print("bonsaid stopping", flush=True)
+            print("pynqd stopping", flush=True)
     return 0
 
 

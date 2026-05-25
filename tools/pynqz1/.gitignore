@@ -1,0 +1,4 @@
+# Built PS kernel artifact (board/kernels/ps/Makefile output)
+libbonsai_ps.so
+libbonsai_ps.dylib
+.ruff_cache/

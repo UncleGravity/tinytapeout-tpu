@@ -174,6 +174,38 @@ class TensorAllocator:
         """For zero-copy DMA: every (slab_index, offset, nbytes) in order."""
         return self._get_record(handle).extents
 
+    def slab_view(self, handle: int, offset: int, nbytes: int):
+        """Resolve (handle, offset, nbytes) to its single underlying slab.
+
+        Returns ``(slab, absolute_offset, nbytes)``. PL kernels use this to
+        DMA directly out of a slab's PYNQ buffer. Raises if the requested
+        range spans multiple extents — callers that need to span must walk
+        ``extents(handle)`` and issue one descriptor per extent.
+        """
+        record = self._get_record(handle)
+        if offset < 0 or nbytes < 0:
+            raise AllocatorError("invalid_request", "offset and nbytes must be non-negative")
+        if offset + nbytes > record.nbytes:
+            raise AllocatorError(
+                "out_of_bounds",
+                f"range [{offset}, {offset + nbytes}) exceeds tensor size {record.nbytes}",
+            )
+
+        cursor = 0
+        for extent in record.extents:
+            extent_end = cursor + extent.nbytes
+            if offset >= extent_end:
+                cursor = extent_end
+                continue
+            local = offset - cursor
+            if local + nbytes > extent.nbytes:
+                raise AllocatorError(
+                    "multi_extent",
+                    f"range crosses extent boundary at byte {extent_end - offset}",
+                )
+            return self._slabs[extent.slab_index], extent.offset + local, nbytes
+        raise AllocatorError("internal_error", "no extent contains the requested offset")
+
     def physical(self, handle: int, offset: int = 0) -> int:
         """Physical address of ``offset`` bytes into the tensor.
 

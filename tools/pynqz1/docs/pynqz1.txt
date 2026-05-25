@@ -1,5 +1,11 @@
 PYNQ-Z1 Board
 
+Reference Manual:
+https://digilent.com/reference/programmable-logic/pynq-z1/reference-manual
+
+Setup:
+https://pynq.readthedocs.io/en/latest/getting_started/pynq_z1_setup.html
+
 - Board hostname: pynq.
 - SSH user: xilinx.
 - Default password, if needed: xilinx.

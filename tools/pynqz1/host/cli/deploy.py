@@ -53,6 +53,7 @@ class BoardConfig:
     slab_mib: int
     overlay: str
     overlay_id: str
+    bitfile: str | None
 
     @property
     def ssh_target(self) -> str:
@@ -103,6 +104,8 @@ def remote_daemon_command(config: BoardConfig) -> str:
         "--overlay-id",
         config.overlay_id,
     ]
+    if config.bitfile is not None:
+        daemon += ["--bitfile", config.bitfile]
     return f"cd {shlex.quote(config.remote_dir)} && exec {shlex.join(daemon)}"
 
 
@@ -170,6 +173,7 @@ def config_from_args(args: argparse.Namespace) -> BoardConfig:
         slab_mib=getattr(args, "slab_mib", 0),
         overlay=getattr(args, "overlay", ""),
         overlay_id=getattr(args, "overlay_id", ""),
+        bitfile=getattr(args, "bitfile", None),
     )
 
 
@@ -186,6 +190,12 @@ def add_daemon_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--slab-mib", type=int, default=32)
     parser.add_argument("--overlay", default="base")
     parser.add_argument("--overlay-id", default="pynq-base")
+    parser.add_argument(
+        "--bitfile",
+        default=None,
+        help="path to a PL bitstream ON THE BOARD; forwarded to board.daemon "
+             "to load the overlay and register PL kernels",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

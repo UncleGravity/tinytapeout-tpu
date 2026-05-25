@@ -18,6 +18,7 @@ def config(**overrides):
         "slab_mib": 32,
         "overlay": "base",
         "overlay_id": "pynq-base",
+        "bitfile": None,
     }
     values.update(overrides)
     return deploy.BoardConfig(**values)
@@ -58,6 +59,18 @@ def test_ssh_daemon_forwards_profile_path(monkeypatch):
     monkeypatch.setenv("PYNQ_PROFILE", "/var/log/pynq.ndjson")
     command = deploy.ssh_daemon_command(config())
     assert "PYNQ_PROFILE=/var/log/pynq.ndjson" in command[3]
+
+
+def test_ssh_daemon_omits_bitfile_when_unset():
+    remote = deploy.ssh_daemon_command(config())[3]
+    assert "--bitfile" not in remote
+
+
+def test_ssh_daemon_forwards_bitfile():
+    remote = deploy.ssh_daemon_command(
+        config(bitfile="/home/xilinx/overlays/dma_loopback.bit")
+    )[3]
+    assert "--bitfile /home/xilinx/overlays/dma_loopback.bit" in remote
 
 
 def test_ssh_native_build_invokes_makefile():
