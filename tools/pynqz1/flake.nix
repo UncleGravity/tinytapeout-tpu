@@ -14,7 +14,15 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs   = nixpkgs.legacyPackages.${system};
-        python = pkgs.python3.withPackages (ps: [ ps.numpy ps.pytest ]);
+        python = pkgs.python3.withPackages (ps: [
+          ps.numpy ps.pytest
+          (ps.cocotb.overridePythonAttrs (o: {
+            meta = o.meta // { broken = false; };
+            # ghdl has no aarch64-darwin build; we only run Verilog sims anyway.
+            doCheck = false;
+            nativeCheckInputs = [];
+          }))
+        ]);
 
         backend = pkgs.callPackage ./host/backend/package.nix {
           llamaCppSrc = llama-cpp-src;

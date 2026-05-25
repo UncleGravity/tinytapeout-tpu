@@ -2,3 +2,5 @@
 libbonsai_ps.so
 libbonsai_ps.dylib
 .ruff_cache/
+sim_build/
+results.xml
