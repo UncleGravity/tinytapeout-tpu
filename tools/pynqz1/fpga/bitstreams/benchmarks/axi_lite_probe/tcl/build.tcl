@@ -84,6 +84,7 @@ save_bd_design
 set wrapper [make_wrapper -files [get_files "$proj_dir/$proj_name.srcs/sources_1/bd/$bd_name/$bd_name.bd"] -top]
 add_files -norecurse $wrapper
 update_compile_order -fileset sources_1
+set_property top ${bd_name}_wrapper [current_fileset]
 
 launch_runs synth_1 -jobs 4
 wait_on_run synth_1
