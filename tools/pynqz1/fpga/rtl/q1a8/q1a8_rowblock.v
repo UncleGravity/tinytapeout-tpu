@@ -1,13 +1,15 @@
-// q1a8_rowblock - accumulate one activation column against several rows.
+// q1a8_rowblock - accumulate one activation column against ROWS rows.
 //
-// This is the replacement for the old one-cell datapath. Each valid input is
-// one Q8 sub-block shared by ROWS output rows. Every lane has its own 32 Q1
-// bits and fp16 weight scale, while the 32 int8 activations and fp16
-// activation scale are broadcast across lanes.
+// Each cycle valid_in is high, one Q8 sub-block is broadcast across ROWS
+// lanes. Every lane has its own 32 Q1 bits and fp16 weight scale; the 32
+// int8 activations and the fp16 activation scale are shared across lanes.
 //
-// The output order is lane-major:
-//   results_flat[31:0]     = lane 0 fp32 bits
-//   results_flat[63:32]    = lane 1 fp32 bits
+// The accumulator `acc_flat` clears on `start` and updates one cycle after
+// each reducer output, so consumers must wait at least REDUCER_LATENCY+1
+// cycles after the last `valid_in && last_in` before reading. Output order
+// is lane-major:
+//   results_flat[31:0]  = lane 0 fp32 bits
+//   results_flat[63:32] = lane 1 fp32 bits
 //   ...
 
 `default_nettype none
@@ -19,7 +21,6 @@ module q1a8_rowblock #(
     input  wire                  rst_n,
 
     input  wire                  start,
-    input  wire [7:0]            row_count,
 
     input  wire                  valid_in,
     input  wire                  last_in,
@@ -43,14 +44,13 @@ module q1a8_rowblock #(
     genvar row;
     generate
         for (row = 0; row < ROWS; row = row + 1) begin : gen_lanes
-            wire lane_active = row_count > row;
             wire [31:0] acc = acc_flat[row*32 +: 32];
             wire [31:0] contribution = contributions_flat[row*32 +: 32];
 
             q1a8_reducer u_reducer (
                 .clk(clk),
                 .rst_n(rst_n),
-                .valid_in(valid_in && lane_active),
+                .valid_in(valid_in),
                 .weight_bits(weight_bits_flat[row*32 +: 32]),
                 .acts_packed(acts_packed),
                 .weight_scale(weight_scales_flat[row*16 +: 16]),

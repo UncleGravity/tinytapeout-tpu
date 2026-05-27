@@ -24,17 +24,15 @@ REG_VERSION = 0x04
 REG_CTRL = 0x08
 REG_STATUS = 0x0C
 REG_NUM_Q1_BLOCKS = 0x10
-REG_ROW_COUNT = 0x14
-REG_RESULT_INDEX = 0x18
-REG_RESULT = 0x1C
-REG_CYCLES = 0x20
-REG_ROWS = 0x24
+REG_NUM_ROWBLOCKS = 0x14
+REG_CYCLES = 0x18
+REG_ROWS = 0x1C
 
 CTRL_START = 1 << 0
 STATUS_DONE = 1 << 1
 
 EXPECTED_ID = 0xB05A_2000
-EXPECTED_VERSION = 2
+EXPECTED_VERSION = 3
 
 
 @dataclass
@@ -142,9 +140,10 @@ def contribution(weight_bits, acts, ws_h, as_h):
     return fp32_mul_trunc(fp32_mul_trunc(ws_f32, as_f32), ss_f32)
 
 
-def golden_rows(weight_rows, acts, act_scales, row_count):
+def golden_rowblock(weight_rows, acts, act_scales):
+    """fp32 results for one rowblock (ROWS lanes)."""
     out = []
-    for row in range(row_count):
+    for row in range(ROWS):
         acc = 0
         for q1_index, (ws_h, bits128) in enumerate(weight_rows[row]):
             for q8_local in range(0, Q1_BLOCK, Q8_BLOCK):
@@ -156,14 +155,21 @@ def golden_rows(weight_rows, acts, act_scales, row_count):
     return out
 
 
-def random_case(seed, row_count, q1_blocks):
+def random_rowblock(seed, q1_blocks, active_rows=ROWS):
+    """Random weight rows + acts/scales for one rowblock. Lanes >= active_rows
+    get zero-padded weight bits and scales (matching the host packer's
+    behaviour for a partial last rowblock)."""
     rng = random.Random(seed)
     weight_rows = []
-    for row in range(row_count):
+    for row in range(ROWS):
         blocks = []
         for q1_index in range(q1_blocks):
-            ws_h = fp16_float_to_bits(0.01 + 0.003 * ((row + q1_index) % 17))
-            bits128 = rng.getrandbits(Q1_BLOCK)
+            if row < active_rows:
+                ws_h = fp16_float_to_bits(0.01 + 0.003 * ((row + q1_index) % 17))
+                bits128 = rng.getrandbits(Q1_BLOCK)
+            else:
+                ws_h = 0
+                bits128 = 0
             blocks.append((ws_h, bits128))
         weight_rows.append(blocks)
     acts = [rng.randint(-128, 127) for _ in range(q1_blocks * Q1_BLOCK)]
@@ -174,7 +180,8 @@ def random_case(seed, row_count, q1_blocks):
     return weight_rows, acts, act_scales
 
 
-def pack_stream(weight_rows, acts, act_scales, row_count, q1_blocks):
+def pack_rowblock(weight_rows, acts, act_scales, q1_blocks):
+    """Pack one rowblock's beats into u64 words."""
     beats = []
     scale_beats = (ROWS + 3) // 4
     wbits_beats = (ROWS + 1) // 2
@@ -183,7 +190,7 @@ def pack_stream(weight_rows, acts, act_scales, row_count, q1_blocks):
             word = 0
             for local in range(4):
                 lane = beat * 4 + local
-                scale = weight_rows[lane][q1_index][0] if lane < row_count else 0
+                scale = weight_rows[lane][q1_index][0] if lane < ROWS else 0
                 word |= scale << (local * 16)
             beats.append(word)
 
@@ -201,47 +208,72 @@ def pack_stream(weight_rows, acts, act_scales, row_count, q1_blocks):
                 word = 0
                 for local in range(2):
                     lane = beat * 2 + local
-                    bits = 0
-                    if lane < row_count:
-                        bits = (weight_rows[lane][q1_index][1] >> q8_local) & 0xFFFF_FFFF
+                    bits = (weight_rows[lane][q1_index][1] >> q8_local) & 0xFFFF_FFFF if lane < ROWS else 0
                     word |= bits << (local * 32)
                 beats.append(word)
-    return b"".join(struct.pack("<Q", beat) for beat in beats)
+    return beats
+
+
+def build_matmul(seed, num_rowblocks, q1_blocks, last_active_rows=ROWS):
+    """Build a multi-rowblock matmul. Returns (stream_bytes, expected_results).
+    The final rowblock is zero-padded down to last_active_rows."""
+    rng = random.Random(seed)
+    all_beats = []
+    expected = []
+    for rb in range(num_rowblocks):
+        active = last_active_rows if rb == num_rowblocks - 1 else ROWS
+        wr, ac, sc = random_rowblock(rng.randint(0, 1 << 30), q1_blocks,
+                                     active_rows=active)
+        all_beats.extend(pack_rowblock(wr, ac, sc, q1_blocks))
+        expected.extend(golden_rowblock(wr, ac, sc))
+    return b"".join(struct.pack("<Q", w) for w in all_beats), expected
 
 
 def elapsed_us(start_ns):
     return max(0, (time.perf_counter_ns() - start_ns) // 1000)
 
 
-def run_kernel(overlay, packed, row_count, q1_blocks, buf):
+def run_kernel(overlay, packed, num_rowblocks, q1_blocks, send_buf, recv_buf):
+    """Drive one full matmul: NUM_ROWBLOCKS rowblocks via S2MM result DMA."""
     kernel = overlay.q1a8_kernel_top_0
     dma = overlay.axi_dma_0
     timings = {}
     total_start = time.perf_counter_ns()
-    nbytes = len(packed)
-    assert nbytes <= len(buf), f"buffer too small: {len(buf)} < {nbytes}"
+
+    stream_nbytes = len(packed)
+    result_nbytes = num_rowblocks * ROWS * 4
+    assert stream_nbytes <= len(send_buf), "send buf too small"
+    assert result_nbytes <= len(recv_buf), "recv buf too small"
 
     start = time.perf_counter_ns()
-    buf[:nbytes] = np.frombuffer(packed, dtype=np.uint8)
-    buf.flush()
+    send_buf[:stream_nbytes] = np.frombuffer(packed, dtype=np.uint8)
+    send_buf.flush()
     timings["buffer_load_us"] = elapsed_us(start)
 
     start = time.perf_counter_ns()
     kernel.write(REG_NUM_Q1_BLOCKS, q1_blocks)
-    kernel.write(REG_ROW_COUNT, row_count)
+    kernel.write(REG_NUM_ROWBLOCKS, num_rowblocks)
     timings["kernel_setup_us"] = elapsed_us(start)
 
     start = time.perf_counter_ns()
-    dma.sendchannel.transfer(buf[:nbytes])
-    timings["dma_start_us"] = elapsed_us(start)
+    dma.recvchannel.transfer(recv_buf[:result_nbytes])
+    timings["recv_start_us"] = elapsed_us(start)
 
     start = time.perf_counter_ns()
     kernel.write(REG_CTRL, CTRL_START)
     timings["kernel_start_us"] = elapsed_us(start)
 
     start = time.perf_counter_ns()
+    dma.sendchannel.transfer(send_buf[:stream_nbytes])
+    timings["send_start_us"] = elapsed_us(start)
+
+    start = time.perf_counter_ns()
     dma.sendchannel.wait()
-    timings["dma_wait_us"] = elapsed_us(start)
+    timings["send_wait_us"] = elapsed_us(start)
+
+    start = time.perf_counter_ns()
+    dma.recvchannel.wait()
+    timings["recv_wait_us"] = elapsed_us(start)
 
     start = time.perf_counter_ns()
     for _ in range(10000):
@@ -253,11 +285,10 @@ def run_kernel(overlay, packed, row_count, q1_blocks, buf):
     timings["poll_us"] = elapsed_us(start)
 
     start = time.perf_counter_ns()
-    results = []
-    for lane in range(row_count):
-        kernel.write(REG_RESULT_INDEX, lane)
-        results.append(kernel.read(REG_RESULT))
-    cycles = kernel.read(REG_CYCLES)
+    recv_buf.invalidate()
+    result_words = recv_buf[:result_nbytes].view(np.uint32)
+    results = [int(w) & 0xFFFF_FFFF for w in result_words]
+    cycles = int(kernel.read(REG_CYCLES))
     timings["result_read_us"] = elapsed_us(start)
     timings["total_us"] = elapsed_us(total_start)
     return KernelRun(results=results, cycles=cycles, timings_us=timings)
@@ -284,30 +315,39 @@ def check_id(kernel):
     return True
 
 
+def _allocate_buffers(packed_nbytes, result_nbytes):
+    send_buf = allocate(shape=(packed_nbytes,), dtype=np.uint8)
+    recv_buf = allocate(shape=(result_nbytes,), dtype=np.uint8)
+    return send_buf, recv_buf
+
+
 def cmd_verify(args):
     overlay = Overlay(args.bitfile)
     if not check_id(overlay.q1a8_kernel_top_0):
         return 1
 
-    weight_rows, acts, act_scales = random_case(args.seed, args.rows, args.q1_blocks)
-    packed = pack_stream(weight_rows, acts, act_scales, args.rows, args.q1_blocks)
-    want = golden_rows(weight_rows, acts, act_scales, args.rows)
-
-    buf = allocate(shape=(len(packed),), dtype=np.uint8)
+    packed, want = build_matmul(args.seed, args.rowblocks, args.q1_blocks,
+                                last_active_rows=args.last_rows)
+    result_nbytes = args.rowblocks * ROWS * 4
+    send_buf, recv_buf = _allocate_buffers(len(packed), result_nbytes)
     try:
-        run = run_kernel(overlay, packed, args.rows, args.q1_blocks, buf)
-        for lane, (got, exp) in enumerate(zip(run.results, want, strict=True)):
+        run = run_kernel(overlay, packed, args.rowblocks, args.q1_blocks,
+                         send_buf, recv_buf)
+        for idx, (got, exp) in enumerate(zip(run.results, want, strict=True)):
             if got != exp:
                 print(
-                    f"FAIL lane {lane}: got=0x{got:08x} ({fp32_bits_to_float(got):.6g}) "
+                    f"FAIL idx {idx}: got=0x{got:08x} ({fp32_bits_to_float(got):.6g}) "
                     f"want=0x{exp:08x} ({fp32_bits_to_float(exp):.6g})",
                     file=sys.stderr,
                 )
                 return 1
-        print(f"ok   kernel: rows={args.rows} K={args.q1_blocks * Q1_BLOCK} cycles={run.cycles}")
+        m_rows = args.rowblocks * ROWS - (ROWS - args.last_rows)
+        print(f"ok   matmul: M={m_rows} K={args.q1_blocks * Q1_BLOCK} "
+              f"rowblocks={args.rowblocks} cycles={run.cycles}")
         return 0
     finally:
-        buf.freebuffer()
+        send_buf.freebuffer()
+        recv_buf.freebuffer()
         gc.collect()
 
 
@@ -316,12 +356,12 @@ def cmd_bench(args):
     if not check_id(overlay.q1a8_kernel_top_0):
         return 1
 
-    weight_rows, acts, act_scales = random_case(0x42, args.rows, args.q1_blocks)
-    packed = pack_stream(weight_rows, acts, act_scales, args.rows, args.q1_blocks)
-    want = golden_rows(weight_rows, acts, act_scales, args.rows)
-    buf = allocate(shape=(len(packed),), dtype=np.uint8)
+    packed, want = build_matmul(0x42, args.rowblocks, args.q1_blocks)
+    result_nbytes = args.rowblocks * ROWS * 4
+    send_buf, recv_buf = _allocate_buffers(len(packed), result_nbytes)
     try:
-        warmup = run_kernel(overlay, packed, args.rows, args.q1_blocks, buf)
+        warmup = run_kernel(overlay, packed, args.rowblocks, args.q1_blocks,
+                            send_buf, recv_buf)
         if warmup.results != want:
             print("FAIL: warmup mismatch", file=sys.stderr)
             return 1
@@ -330,7 +370,8 @@ def cmd_bench(args):
         cycle_total = 0
         t0 = time.perf_counter()
         for _ in range(args.iters):
-            run = run_kernel(overlay, packed, args.rows, args.q1_blocks, buf)
+            run = run_kernel(overlay, packed, args.rowblocks, args.q1_blocks,
+                             send_buf, recv_buf)
             if run.results != want:
                 print("FAIL: mid-loop mismatch", file=sys.stderr)
                 return 1
@@ -339,50 +380,65 @@ def cmd_bench(args):
                 timing_totals[key] = timing_totals.get(key, 0) + value
         dt = time.perf_counter() - t0
 
-        us_per_kernel = dt / args.iters * 1e6
+        m_rows = args.rowblocks * ROWS
+        k = args.q1_blocks * Q1_BLOCK
+        us_per_matmul = dt / args.iters * 1e6
+        us_per_rowblock = us_per_matmul / args.rowblocks
         avg_cycles = cycle_total / args.iters
         pl_us = avg_cycles / 100.0
+        macs_per_matmul = m_rows * k
+        bytes_in_per_matmul = len(packed)
         print(
-            f"{args.iters} rowblocks, rows={args.rows}, K={args.q1_blocks * Q1_BLOCK}, "
-            f"stream={len(packed)} bytes"
+            f"{args.iters} matmuls, M={m_rows}, K={k}, rowblocks={args.rowblocks}, "
+            f"stream={len(packed)} B"
         )
-        print(f"  wall:       {dt*1000:.1f} ms ({us_per_kernel:.1f} us/rowblock)")
-        print(f"  outputs:    {args.iters * args.rows / dt:.0f} output cells/s")
-        print(f"  pl compute: {avg_cycles:.1f} cycles ({pl_us:.2f} us @ 100 MHz)")
-        print(f"  ps overhead per rowblock: {us_per_kernel - pl_us:.1f} us")
-        print("  phase avg:")
+        print(f"  wall:        {dt*1000:.1f} ms ({us_per_matmul:.1f} us/matmul, "
+              f"{us_per_rowblock:.1f} us/rowblock)")
+        print(f"  pl compute:  {avg_cycles:.0f} cycles ({pl_us:.1f} us @ 100 MHz)")
+        print(f"  ps overhead: {us_per_matmul - pl_us:.1f} us/matmul")
+        print(f"  throughput:  {macs_per_matmul * args.iters / dt / 1e6:.1f} MMAC/s "
+              f"({bytes_in_per_matmul * args.iters / dt / 1e6:.1f} MB/s in)")
+        print("  phase avg (us/matmul):")
         for key in (
             "buffer_load_us",
             "kernel_setup_us",
-            "dma_start_us",
+            "recv_start_us",
             "kernel_start_us",
-            "dma_wait_us",
+            "send_start_us",
+            "send_wait_us",
+            "recv_wait_us",
             "poll_us",
             "result_read_us",
             "total_us",
         ):
-            print(f"    {key:16s} {timing_totals.get(key, 0) / args.iters:.1f} us")
+            print(f"    {key:16s} {timing_totals.get(key, 0) / args.iters:.1f}")
         return 0
     finally:
-        buf.freebuffer()
+        send_buf.freebuffer()
+        recv_buf.freebuffer()
         gc.collect()
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="matmul_q1a8 rowblock bitstream tests")
+    parser = argparse.ArgumentParser(description="matmul_q1a8 bitstream tests")
     parser.add_argument("--bitfile", default=DEFAULT_BITFILE)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    v = sub.add_parser("verify", help="single rowblock correctness check")
-    v.add_argument("--rows", type=int, default=ROWS, choices=range(1, ROWS + 1))
+    v = sub.add_parser("verify", help="end-to-end correctness check")
+    v.add_argument("--rowblocks", type=int, default=1, help="number of rowblocks")
+    v.add_argument("--last-rows", type=int, default=ROWS,
+                   choices=range(1, ROWS + 1),
+                   help="active lanes in the last rowblock (zero-pad remainder)")
     v.add_argument("--q1-blocks", type=int, default=16)
     v.add_argument("--seed", type=int, default=0xCAFE)
     v.set_defaults(func=cmd_verify)
 
-    b = sub.add_parser("bench", help="back-to-back rowblock throughput")
-    b.add_argument("--rows", type=int, default=ROWS, choices=range(1, ROWS + 1))
-    b.add_argument("--q1-blocks", type=int, default=16)
-    b.add_argument("--iters", type=int, default=1000)
+    b = sub.add_parser("bench", help="full matmul throughput")
+    b.add_argument("--rowblocks", type=int, default=32,
+                   help="rowblocks per matmul (M = rowblocks * 8)")
+    b.add_argument("--q1-blocks", type=int, default=16,
+                   help="Q1 blocks per row (K = q1_blocks * 128)")
+    b.add_argument("--iters", type=int, default=200)
     b.set_defaults(func=cmd_bench)
 
     args = parser.parse_args(argv)

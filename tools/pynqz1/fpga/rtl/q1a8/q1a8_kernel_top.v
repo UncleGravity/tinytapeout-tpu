@@ -1,22 +1,26 @@
-// q1a8_kernel_top - PYNQ bitstream top for the rowblock Q1A8 kernel.
+// q1a8_kernel_top - PYNQ bitstream top for the multi-rowblock Q1A8 kernel.
+//
+// One host command drives a full matmul: PS sets NUM_Q1_BLOCKS and
+// NUM_ROWBLOCKS, then strobes CTRL.start. The kernel autonomously processes
+// all rowblocks, emitting fp32 results as a 64-bit AXI-Stream burst to the
+// S2MM DMA. Per rowblock: 4 beats of 64-bit data (lane-major, 2 fp32/beat).
+// Total burst size = NUM_ROWBLOCKS * 32 bytes.
 //
 // Register map (32-bit aligned, byte offsets):
 //   0x00  ID             RO  0xB05A_2000
-//   0x04  VERSION        RO  0x0000_0002
+//   0x04  VERSION        RO  0x0000_0003
 //   0x08  CTRL           WO  bit[0] = start-kernel strobe
 //   0x0C  STATUS         RO  bit[0] = busy, bit[1] = done_latched
 //   0x10  NUM_Q1_BLOCKS  RW  K / 128
-//   0x14  ROW_COUNT      RW  active lanes in this rowblock (1..ROWS)
-//   0x18  RESULT_INDEX   RW  lane index to read through RESULT
-//   0x1C  RESULT         RO  fp32 result bits for RESULT_INDEX
-//   0x20  CYCLES         RO  busy-cycle count from the last kernel
-//   0x24  ROWS           RO  lanes per rowblock
+//   0x14  NUM_ROWBLOCKS  RW  ceil(M / ROWS)
+//   0x18  CYCLES         RO  busy-cycle count of last run
+//   0x1C  ROWS           RO  lanes per rowblock (8)
 
 `default_nettype none
 
 module q1a8_kernel_top (
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 s_axi_aclk CLK" *)
-    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF S_AXI:S_AXIS, ASSOCIATED_RESET s_axi_aresetn, FREQ_HZ 100000000" *)
+    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF S_AXI:S_AXIS:M_AXIS, ASSOCIATED_RESET s_axi_aresetn, FREQ_HZ 100000000" *)
     input  wire         s_axi_aclk,
     (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 s_axi_aresetn RST" *)
     (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
@@ -70,56 +74,53 @@ module q1a8_kernel_top (
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS TREADY" *)
     output wire         s_axis_tready,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS TLAST" *)
-    input  wire         s_axis_tlast
+    input  wire         s_axis_tlast,
+
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 M_AXIS TDATA" *)
+    output wire [63:0]  m_axis_tdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 M_AXIS TKEEP" *)
+    output wire [7:0]   m_axis_tkeep,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 M_AXIS TVALID" *)
+    output wire         m_axis_tvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 M_AXIS TREADY" *)
+    input  wire         m_axis_tready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 M_AXIS TLAST" *)
+    output wire         m_axis_tlast
 );
     localparam integer ROWS = 8;
-    localparam [7:0] ROWS_U8 = 8'd8;
 
     localparam [31:0] ID_VALUE      = 32'hB05A_2000;
-    localparam [31:0] VERSION_VALUE = 32'h0000_0002;
+    localparam [31:0] VERSION_VALUE = 32'h0000_0003;
 
     wire clk   = s_axi_aclk;
     wire rst_n = s_axi_aresetn;
 
     reg [15:0] num_q1_blocks_q;
-    reg [7:0]  row_count_q;
-    reg [7:0]  result_index_q;
+    reg [15:0] num_rowblocks_q;
     reg        start_strobe;
     reg        done_latched;
     reg [31:0] cycle_count_q;
 
     wire kernel_busy;
     wire kernel_done;
-    wire [ROWS*32-1:0] kernel_results;
 
     q1a8_kernel #(.ROWS(ROWS)) u_kernel (
         .clk(clk),
         .rst_n(rst_n),
         .start_kernel(start_strobe),
         .num_q1_blocks(num_q1_blocks_q),
-        .row_count(row_count_q),
+        .num_rowblocks(num_rowblocks_q),
         .kernel_done(kernel_done),
         .busy(kernel_busy),
-        .results_flat(kernel_results),
         .s_axis_tdata(s_axis_tdata),
         .s_axis_tvalid(s_axis_tvalid),
-        .s_axis_tready(s_axis_tready)
+        .s_axis_tready(s_axis_tready),
+        .m_axis_tdata(m_axis_tdata),
+        .m_axis_tvalid(m_axis_tvalid),
+        .m_axis_tready(m_axis_tready),
+        .m_axis_tlast(m_axis_tlast),
+        .m_axis_tkeep(m_axis_tkeep)
     );
-
-    reg [31:0] selected_result;
-    always @(*) begin
-        case (result_index_q[2:0])
-            3'd0: selected_result = kernel_results[  0 +: 32];
-            3'd1: selected_result = kernel_results[ 32 +: 32];
-            3'd2: selected_result = kernel_results[ 64 +: 32];
-            3'd3: selected_result = kernel_results[ 96 +: 32];
-            3'd4: selected_result = kernel_results[128 +: 32];
-            3'd5: selected_result = kernel_results[160 +: 32];
-            3'd6: selected_result = kernel_results[192 +: 32];
-            3'd7: selected_result = kernel_results[224 +: 32];
-            default: selected_result = 32'd0;
-        endcase
-    end
 
     always @(posedge clk) begin
         if (!rst_n)            done_latched <= 1'b0;
@@ -147,8 +148,7 @@ module q1a8_kernel_top (
             bvalid_q        <= 1'b0;
             awaddr_q        <= 8'd0;
             num_q1_blocks_q <= 16'd0;
-            row_count_q     <= ROWS_U8;
-            result_index_q  <= 8'd0;
+            num_rowblocks_q <= 16'd0;
             start_strobe    <= 1'b0;
         end else begin
             start_strobe <= 1'b0;
@@ -171,10 +171,8 @@ module q1a8_kernel_top (
                         if (s_axi_wstrb[1]) num_q1_blocks_q[15:8] <= s_axi_wdata[15:8];
                     end
                     6'h14: begin
-                        if (s_axi_wstrb[0]) row_count_q <= s_axi_wdata[7:0];
-                    end
-                    6'h18: begin
-                        if (s_axi_wstrb[0]) result_index_q <= s_axi_wdata[7:0];
+                        if (s_axi_wstrb[0]) num_rowblocks_q[7:0]  <= s_axi_wdata[7:0];
+                        if (s_axi_wstrb[1]) num_rowblocks_q[15:8] <= s_axi_wdata[15:8];
                     end
                     default: ;
                 endcase
@@ -202,11 +200,9 @@ module q1a8_kernel_top (
                     6'h08: rdata_q <= 32'd0;
                     6'h0C: rdata_q <= {30'd0, done_latched, kernel_busy};
                     6'h10: rdata_q <= {16'd0, num_q1_blocks_q};
-                    6'h14: rdata_q <= {24'd0, row_count_q};
-                    6'h18: rdata_q <= {24'd0, result_index_q};
-                    6'h1C: rdata_q <= selected_result;
-                    6'h20: rdata_q <= cycle_count_q;
-                    6'h24: rdata_q <= ROWS;
+                    6'h14: rdata_q <= {16'd0, num_rowblocks_q};
+                    6'h18: rdata_q <= cycle_count_q;
+                    6'h1C: rdata_q <= ROWS;
                     default: rdata_q <= 32'd0;
                 endcase
             end else if (rvalid_q && s_axi_rready) begin

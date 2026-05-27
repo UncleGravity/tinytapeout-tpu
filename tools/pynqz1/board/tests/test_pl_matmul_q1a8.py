@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import ctypes
+import random
 import struct
 from types import SimpleNamespace
 
 from board.kernels import pl
 from board.kernels.pl import matmul_q1a8
+from board.kernels.ps.native import load_lib
 from board.kernels.registry import KernelRegistry
 from proto.ops import GOP_COPY, GOP_MATMUL_Q1A8, Q1_BLOCK, Q1_BLOCK_BYTES, Q8_BLOCK
 from tests.golden import kernels as golden
@@ -92,3 +95,123 @@ def test_register_all_registers_matmul_only_for_matmul_overlay():
 
     assert isinstance(registry.get(GOP_MATMUL_Q1A8), matmul_q1a8.PLMatmulQ1A8)
     assert GOP_COPY not in registry
+
+
+# -- C entry point tests vs Python reference -----------------------------
+
+
+def _bind_c_quantize(lib: ctypes.CDLL):
+    fn = lib.bonsai_quantize_q8_0_pl
+    fn.argtypes = [
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_int8),
+        ctypes.POINTER(ctypes.c_uint16),
+    ]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+def _bind_c_pack(lib: ctypes.CDLL):
+    fn = lib.bonsai_pack_matmul_q1a8_stream
+    fn.argtypes = [
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_int8),
+        ctypes.POINTER(ctypes.c_uint16),
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint8),
+    ]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+def test_c_quantize_q8_0_pl_matches_python(native_lib_path):
+    lib = load_lib(native_lib_path)
+    c_quantize = _bind_c_quantize(lib)
+
+    rng = random.Random(0xBEEF)
+    k = Q8_BLOCK * 7  # several blocks, some non-aligned in magnitude
+    values = [rng.uniform(-3.0, 3.0) for _ in range(k)]
+    # Force one all-zero block to exercise the amax==0 path.
+    for i in range(Q8_BLOCK):
+        values[2 * Q8_BLOCK + i] = 0.0
+
+    c_values = (ctypes.c_float * k)(*values)
+    c_quants = (ctypes.c_int8 * k)()
+    c_scales = (ctypes.c_uint16 * (k // Q8_BLOCK))()
+    rc = c_quantize(c_values, ctypes.c_uint32(k), c_quants, c_scales)
+    assert rc == 0
+
+    py_quants, py_scale_bits = matmul_q1a8._quantize_q8_0(tuple(values))
+    assert list(c_quants) == py_quants
+    assert list(c_scales) == py_scale_bits
+
+
+def test_c_pack_matmul_q1a8_stream_matches_python(native_lib_path):
+    lib = load_lib(native_lib_path)
+    c_pack = _bind_c_pack(lib)
+
+    rng = random.Random(0xC0DE)
+    rows = 19  # not a multiple of 8 — exercises the partial last rowblock
+    cols = 2
+    k = Q1_BLOCK * 3
+    rows_per_block = matmul_q1a8.ROWS_PER_BLOCK
+    blocks_per_row = k // Q1_BLOCK
+    weight_row_bytes = blocks_per_row * Q1_BLOCK_BYTES
+    rowblocks_per_col = (rows + rows_per_block - 1) // rows_per_block
+    rowblock_nbytes = matmul_q1a8._rowblock_nbytes(k, rows_per_block)
+    col_stream_nbytes = rowblock_nbytes * rowblocks_per_col
+
+    # Build random Q1_0 weights: row-major, 18 bytes per Q1 block.
+    weights = bytearray(rows * weight_row_bytes)
+    for i in range(len(weights)):
+        weights[i] = rng.randint(0, 255)
+
+    # Per-column int8 quants + fp16 scale bits.
+    act_quants = bytearray(cols * k)
+    act_scale_bits = bytearray(cols * (k // Q8_BLOCK) * 2)
+    quant_list_by_col = []
+    scale_list_by_col = []
+    for col in range(cols):
+        quants = [rng.randint(-128, 127) for _ in range(k)]
+        scales = [rng.randint(0, 0xFFFF) for _ in range(k // Q8_BLOCK)]
+        for i, q in enumerate(quants):
+            act_quants[col * k + i] = q & 0xFF
+        for i, s in enumerate(scales):
+            struct.pack_into("<H", act_scale_bits, (col * (k // Q8_BLOCK) + i) * 2, s)
+        quant_list_by_col.append(quants)
+        scale_list_by_col.append(scales)
+
+    c_out = (ctypes.c_uint8 * (cols * col_stream_nbytes))()
+    c_weights = (ctypes.c_uint8 * len(weights)).from_buffer(weights)
+    c_quants = (ctypes.c_int8 * len(act_quants)).from_buffer(act_quants)
+    c_scales = (ctypes.c_uint16 * (cols * (k // Q8_BLOCK))).from_buffer(act_scale_bits)
+    rc = c_pack(c_weights, c_quants, c_scales,
+                ctypes.c_uint32(rows), ctypes.c_uint32(cols), ctypes.c_uint32(k),
+                c_out)
+    assert rc == 0
+
+    # Build the expected stream via the Python reference, one rowblock at a time.
+    expected = bytearray(cols * col_stream_nbytes)
+    py_block = bytearray(rowblock_nbytes)
+    for col in range(cols):
+        for rb in range(rowblocks_per_col):
+            row_start = rb * rows_per_block
+            row_count = min(rows_per_block, rows - row_start)
+            matmul_q1a8._pack_rowblock_into(
+                py_block,
+                bytes(weights),
+                row_start,
+                row_count,
+                weight_row_bytes,
+                quant_list_by_col[col],
+                scale_list_by_col[col],
+                k,
+                rows_per_block,
+            )
+            off = col * col_stream_nbytes + rb * rowblock_nbytes
+            expected[off : off + rowblock_nbytes] = py_block
+
+    assert bytes(c_out) == bytes(expected)

@@ -1,7 +1,9 @@
-"""Rowblock Q1A8 kernel cocotb tests.
+"""Multi-rowblock Q1A8 kernel cocotb tests.
 
-These tests replace the old single-cell stream tests. The stream now carries
-one activation sub-block shared across several output rows.
+The kernel processes N rowblocks per start strobe and emits results as a
+64-bit AXI-Stream master (2 fp32 per beat, 4 beats per rowblock, TLAST on
+the final beat of the final rowblock). All ROWS lanes are always active;
+inactive lanes are emulated by zero-padding their weight rows.
 """
 
 from __future__ import annotations
@@ -117,9 +119,10 @@ def contribution(weight_bits, acts, ws_h, as_h):
     return fp32_mul_trunc(fp32_mul_trunc(ws_f32, as_f32), ss_f32)
 
 
-def golden_rows(weight_rows, acts, act_scales, row_count):
+def golden_rowblock(weight_rows, acts, act_scales):
+    """Run the matmul golden for one rowblock (ROWS lanes)."""
     out = []
-    for row in range(row_count):
+    for row in range(ROWS):
         acc = 0
         for q1_index, (ws_h, bits128) in enumerate(weight_rows[row]):
             for q8_local in range(0, Q1_BLOCK, Q8_BLOCK):
@@ -131,17 +134,23 @@ def golden_rows(weight_rows, acts, act_scales, row_count):
     return out
 
 
-def random_case(seed, row_count=ROWS, q1_blocks=4):
+def random_rowblock(seed, q1_blocks, active_rows=ROWS):
+    """Random weight rows + acts/scales for one rowblock. Lanes >= active_rows
+    get zero-padded weight bits and scales (emulates the host packer's
+    behaviour for the last partial rowblock when M % ROWS != 0)."""
     rng = random.Random(seed)
     weight_rows = []
-    for row in range(row_count):
+    for row in range(ROWS):
         blocks = []
         for q1_index in range(q1_blocks):
-            ws_h = fp16_float_to_bits(0.01 + 0.003 * ((row + q1_index) % 17))
-            bits128 = rng.getrandbits(Q1_BLOCK)
+            if row < active_rows:
+                ws_h = fp16_float_to_bits(0.01 + 0.003 * ((row + q1_index) % 17))
+                bits128 = rng.getrandbits(Q1_BLOCK)
+            else:
+                ws_h = 0
+                bits128 = 0
             blocks.append((ws_h, bits128))
         weight_rows.append(blocks)
-
     acts = [rng.randint(-128, 127) for _ in range(q1_blocks * Q1_BLOCK)]
     act_scales = [
         fp16_float_to_bits(0.001 + 0.0007 * ((i * 5 + 3) % 19))
@@ -150,7 +159,8 @@ def random_case(seed, row_count=ROWS, q1_blocks=4):
     return weight_rows, acts, act_scales
 
 
-def pack_stream(weight_rows, acts, act_scales, row_count, q1_blocks):
+def pack_rowblock(weight_rows, acts, act_scales, q1_blocks):
+    """Pack one rowblock's worth of stream beats."""
     beats = []
     scale_beats = (ROWS + 3) // 4
     wbits_beats = (ROWS + 1) // 2
@@ -160,7 +170,7 @@ def pack_stream(weight_rows, acts, act_scales, row_count, q1_blocks):
             word = 0
             for local in range(4):
                 lane = beat * 4 + local
-                scale = weight_rows[lane][q1_index][0] if lane < row_count else 0
+                scale = weight_rows[lane][q1_index][0] if lane < ROWS else 0
                 word |= scale << (local * 16)
             beats.append(word)
 
@@ -178,9 +188,7 @@ def pack_stream(weight_rows, acts, act_scales, row_count, q1_blocks):
                 word = 0
                 for local in range(2):
                     lane = beat * 2 + local
-                    bits = 0
-                    if lane < row_count:
-                        bits = (weight_rows[lane][q1_index][1] >> q8_local) & 0xFFFF_FFFF
+                    bits = (weight_rows[lane][q1_index][1] >> q8_local) & 0xFFFF_FFFF if lane < ROWS else 0
                     word |= bits << (local * 32)
                 beats.append(word)
 
@@ -195,9 +203,10 @@ async def reset(dut):
     dut.rst_n.value = 0
     dut.start_kernel.value = 0
     dut.num_q1_blocks.value = 0
-    dut.row_count.value = 0
+    dut.num_rowblocks.value = 0
     dut.s_axis_tvalid.value = 0
     dut.s_axis_tdata.value = 0
+    dut.m_axis_tready.value = 0
     await RisingEdge(dut.clk)
     await RisingEdge(dut.clk)
     dut.rst_n.value = 1
@@ -219,24 +228,70 @@ async def push_beat(dut, data, stall_cycles=0):
     await RisingEdge(dut.clk)
 
 
-async def run_kernel(dut, beats, q1_blocks, row_count, stall_rng=None):
-    dut.num_q1_blocks.value = q1_blocks
-    dut.row_count.value = row_count
-    dut.start_kernel.value = 1
-    await RisingEdge(dut.clk)
-    dut.start_kernel.value = 0
-
+async def stream_input(dut, beats, stall_rng=None):
+    """Push all beats into the kernel's slave AXIS."""
     for beat in beats:
         stall = stall_rng.randint(0, 2) if stall_rng else 0
         await push_beat(dut, beat, stall_cycles=stall)
     dut.s_axis_tvalid.value = 0
 
+
+async def capture_output(dut, num_beats, ready_rng=None):
+    """Capture num_beats from the master AXIS, modelling a (sometimes-stalling)
+    sink. Returns (list_of_64bit_words, list_of_tlast_bits)."""
+    def pick_ready():
+        if ready_rng is None:
+            return 1
+        return 1 if ready_rng.random() < 0.7 else 0
+
+    data = []
+    last = []
+    dut.m_axis_tready.value = pick_ready()
+    while len(data) < num_beats:
+        await ReadOnly()
+        tvalid_now = int(dut.m_axis_tvalid.value)
+        tready_now = int(dut.m_axis_tready.value)
+        if tready_now and tvalid_now == 1:
+            data.append(int(dut.m_axis_tdata.value))
+            last.append(int(dut.m_axis_tlast.value))
+        await RisingEdge(dut.clk)
+        dut.m_axis_tready.value = pick_ready()
+    dut.m_axis_tready.value = 0
+    return data, last
+
+
+def unpack_axis_results(beats):
+    """Each beat = {lane(2k+1), lane(2k)} fp32 bits, lane-major."""
+    out = []
+    for beat in beats:
+        out.append(beat & 0xFFFF_FFFF)
+        out.append((beat >> 32) & 0xFFFF_FFFF)
+    return out
+
+
+async def run_matmul(dut, beats, num_q1_blocks, num_rowblocks,
+                     input_stall_rng=None, output_ready_rng=None):
+    dut.num_q1_blocks.value = num_q1_blocks
+    dut.num_rowblocks.value = num_rowblocks
+    dut.start_kernel.value = 1
+    await RisingEdge(dut.clk)
+    dut.start_kernel.value = 0
+
+    capture_task = cocotb.start_soon(
+        capture_output(dut, num_rowblocks * 4, ready_rng=output_ready_rng)
+    )
+    await stream_input(dut, beats, stall_rng=input_stall_rng)
+    out_beats, tlast = await capture_task
+
+    # Wait for kernel_done so we can also read CYCLES later if desired.
     for _ in range(64):
         await RisingEdge(dut.clk)
         if int(dut.kernel_done.value) == 1:
-            raw = int(dut.results_flat.value)
-            return [(raw >> (lane * 32)) & 0xFFFF_FFFF for lane in range(row_count)]
-    raise AssertionError("kernel_done never fired")
+            break
+    else:
+        raise AssertionError("kernel_done never fired")
+
+    return out_beats, tlast
 
 
 def diff_msg(label, got, want):
@@ -247,42 +302,94 @@ def diff_msg(label, got, want):
 
 
 @cocotb.test()
-async def test_one_q1_full_rowblock(dut):
+async def test_single_rowblock(dut):
     await clk_setup(dut)
     await reset(dut)
-    row_count = ROWS
     q1_blocks = 1
-    weight_rows, acts, act_scales = random_case(0xA11, row_count, q1_blocks)
-    beats = pack_stream(weight_rows, acts, act_scales, row_count, q1_blocks)
-    got = await run_kernel(dut, beats, q1_blocks, row_count)
-    want = golden_rows(weight_rows, acts, act_scales, row_count)
+    weight_rows, acts, act_scales = random_rowblock(0xA11, q1_blocks)
+    beats = pack_rowblock(weight_rows, acts, act_scales, q1_blocks)
+
+    out_beats, tlast = await run_matmul(dut, beats, q1_blocks, 1)
+    assert tlast == [0, 0, 0, 1], f"TLAST pattern wrong: {tlast}"
+    got = unpack_axis_results(out_beats)
+    want = golden_rowblock(weight_rows, acts, act_scales)
     for lane, (g, w) in enumerate(zip(got, want, strict=True)):
         assert g == w, diff_msg(f"lane {lane}", g, w)
 
 
 @cocotb.test()
-async def test_k2048_partial_rowblock(dut):
+async def test_partial_lanes_zero_padded(dut):
+    """When M % ROWS != 0 the host packer zero-pads inactive lanes' weights.
+    Verify that the kernel emits 0.0 fp32 for those lanes."""
     await clk_setup(dut)
     await reset(dut)
-    row_count = 5
+    active_rows = 5
     q1_blocks = 16
-    weight_rows, acts, act_scales = random_case(0xB22, row_count, q1_blocks)
-    beats = pack_stream(weight_rows, acts, act_scales, row_count, q1_blocks)
-    got = await run_kernel(dut, beats, q1_blocks, row_count)
-    want = golden_rows(weight_rows, acts, act_scales, row_count)
+    weight_rows, acts, act_scales = random_rowblock(0xB22, q1_blocks,
+                                                    active_rows=active_rows)
+    beats = pack_rowblock(weight_rows, acts, act_scales, q1_blocks)
+
+    out_beats, tlast = await run_matmul(dut, beats, q1_blocks, 1)
+    assert tlast[-1] == 1 and sum(tlast) == 1
+    got = unpack_axis_results(out_beats)
+    want = golden_rowblock(weight_rows, acts, act_scales)
+    for lane, (g, w) in enumerate(zip(got, want, strict=True)):
+        assert g == w, diff_msg(f"lane {lane}", g, w)
+        if lane >= active_rows:
+            assert g == 0, f"inactive lane {lane} should be 0, got 0x{g:08x}"
+
+
+@cocotb.test()
+async def test_long_k_with_stream_stalls(dut):
+    await clk_setup(dut)
+    await reset(dut)
+    q1_blocks = 16
+    weight_rows, acts, act_scales = random_rowblock(0xC33, q1_blocks)
+    beats = pack_rowblock(weight_rows, acts, act_scales, q1_blocks)
+
+    out_beats, tlast = await run_matmul(
+        dut, beats, q1_blocks, 1,
+        input_stall_rng=random.Random(0x5150),
+        output_ready_rng=random.Random(0x5151),
+    )
+    got = unpack_axis_results(out_beats)
+    want = golden_rowblock(weight_rows, acts, act_scales)
     for lane, (g, w) in enumerate(zip(got, want, strict=True)):
         assert g == w, diff_msg(f"lane {lane}", g, w)
 
 
 @cocotb.test()
-async def test_k2048_with_stream_stalls(dut):
+async def test_multi_rowblock(dut):
+    """Drive a full matmul of NUM_ROWBLOCKS=3 rowblocks. Verify each rowblock's
+    8 fp32 results come out in order and TLAST is only on the final beat."""
     await clk_setup(dut)
     await reset(dut)
-    row_count = ROWS
-    q1_blocks = 16
-    weight_rows, acts, act_scales = random_case(0xC33, row_count, q1_blocks)
-    beats = pack_stream(weight_rows, acts, act_scales, row_count, q1_blocks)
-    got = await run_kernel(dut, beats, q1_blocks, row_count, stall_rng=random.Random(0x5150))
-    want = golden_rows(weight_rows, acts, act_scales, row_count)
-    for lane, (g, w) in enumerate(zip(got, want, strict=True)):
-        assert g == w, diff_msg(f"lane {lane}", g, w)
+    q1_blocks = 4
+    num_rowblocks = 3
+
+    all_beats = []
+    want_per_rowblock = []
+    for rb in range(num_rowblocks):
+        weight_rows, acts, act_scales = random_rowblock(0xD00 + rb, q1_blocks)
+        all_beats.extend(pack_rowblock(weight_rows, acts, act_scales, q1_blocks))
+        want_per_rowblock.append(golden_rowblock(weight_rows, acts, act_scales))
+
+    out_beats, tlast = await run_matmul(
+        dut, all_beats, q1_blocks, num_rowblocks,
+        output_ready_rng=random.Random(0x6160),
+    )
+
+    # 4 beats per rowblock; only the very last beat should have TLAST.
+    expected_tlast = [0] * (num_rowblocks * 4)
+    expected_tlast[-1] = 1
+    assert tlast == expected_tlast, f"TLAST pattern wrong: {tlast}"
+
+    got = unpack_axis_results(out_beats)
+    # got is laid out as: rb0_lane0, rb0_lane1, ..., rb0_lane7,
+    #                    rb1_lane0, ..., rb1_lane7,
+    #                    rb2_lane0, ..., rb2_lane7
+    for rb in range(num_rowblocks):
+        for lane in range(ROWS):
+            g = got[rb * ROWS + lane]
+            w = want_per_rowblock[rb][lane]
+            assert g == w, diff_msg(f"rb={rb} lane={lane}", g, w)

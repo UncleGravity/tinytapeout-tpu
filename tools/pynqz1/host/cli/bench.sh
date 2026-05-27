@@ -6,6 +6,7 @@
 #   PYNQ_PORT          daemon port           (default: 50055)
 #   PYNQ_MODEL         path to .gguf model   (default: ~/models/Bonsai-1.7B/Bonsai-1.7B-Q1_0.gguf)
 #   PYNQ_BOARD_PROFILE board-side trace path (default: /tmp/board.ndjson)
+#   PYNQ_BITFILE       PL bitstream on the board (default: /home/xilinx/overlays/matmul_q1a8.bit)
 
 # Export so every child (pynq-daemon, pynqctl, llama-cli-pynq) sees them
 # without having to prefix each invocation.
@@ -13,6 +14,7 @@ export PYNQ_HOST="${PYNQ_HOST:-pynq}"
 export PYNQ_PORT="${PYNQ_PORT:-50055}"
 PYNQ_MODEL="${PYNQ_MODEL:-$HOME/models/Bonsai-1.7B/Bonsai-1.7B-Q1_0.gguf}"
 PYNQ_BOARD_PROFILE="${PYNQ_BOARD_PROFILE:-/tmp/board.ndjson}"
+PYNQ_BITFILE="${PYNQ_BITFILE:-/home/xilinx/overlays/matmul_q1a8.bit}"
 
 HOST_PROFILE="$(mktemp -t pynq-host.XXXXXX.ndjson)"
 LOCAL_BOARD_PROFILE="$(mktemp -t pynq-board.XXXXXX.ndjson)"
@@ -60,7 +62,7 @@ echo "--- spawning daemon (log: ${DAEMON_LOG}) ---"
 # summary % goes over 100.
 ssh -o BatchMode=yes "xilinx@${PYNQ_HOST}" \
     "sudo rm -f ${PYNQ_BOARD_PROFILE}" 2>/dev/null || true
-PYNQ_PROFILE="${PYNQ_BOARD_PROFILE}" pynq-daemon >"${DAEMON_LOG}" 2>&1 &
+PYNQ_PROFILE="${PYNQ_BOARD_PROFILE}" pynq-daemon --bitfile "${PYNQ_BITFILE}" >"${DAEMON_LOG}" 2>&1 &
 DAEMON_PID=$!
 
 echo "--- waiting for daemon on ${PYNQ_HOST}:${PYNQ_PORT} ---"

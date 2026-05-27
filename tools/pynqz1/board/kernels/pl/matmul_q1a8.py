@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ctypes
 import math
 import struct
 from typing import Any
 
+from board.kernels.ps.native import load_lib
 from board.memory.allocator import AllocatorError, TensorAllocator
 from board.profiling.timer import Timer
 from proto.ops import (
@@ -32,17 +34,15 @@ REG_VERSION = 0x04
 REG_CTRL = 0x08
 REG_STATUS = 0x0C
 REG_NUM_Q1_BLOCKS = 0x10
-REG_ROW_COUNT = 0x14
-REG_RESULT_INDEX = 0x18
-REG_RESULT = 0x1C
-REG_CYCLES = 0x20
-REG_ROWS = 0x24
+REG_NUM_ROWBLOCKS = 0x14
+REG_CYCLES = 0x18
+REG_ROWS = 0x1C
 
 CTRL_START = 1 << 0
 STATUS_DONE = 1 << 1
 
 EXPECTED_ID = 0xB05A_2000
-EXPECTED_VERSION = 2
+EXPECTED_VERSION = 3
 POLL_LIMIT = 100_000
 
 
@@ -64,6 +64,41 @@ def _optional_int(op: dict[str, Any], key: str, default: int = 0) -> int:
     return value
 
 
+# -- ctypes bindings ------------------------------------------------------
+#
+# The PL driver shares libbonsai_ps.so with the PS kernels. The two entry
+# points used here are the wire-stream packer and the fp16-bits Q8_0
+# quantizer; both replace per-rowblock Python loops that dominated the
+# previous driver's per-token wall time.
+
+
+def _bind_native(lib: ctypes.CDLL):
+    quantize = lib.bonsai_quantize_q8_0_pl
+    quantize.argtypes = [
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_int8),
+        ctypes.POINTER(ctypes.c_uint16),
+    ]
+    quantize.restype = ctypes.c_int
+
+    pack = lib.bonsai_pack_matmul_q1a8_stream
+    pack.argtypes = [
+        ctypes.POINTER(ctypes.c_uint8),  # weights
+        ctypes.POINTER(ctypes.c_int8),   # act_quants
+        ctypes.POINTER(ctypes.c_uint16), # act_scale_bits
+        ctypes.c_uint32,                 # rows
+        ctypes.c_uint32,                 # cols
+        ctypes.c_uint32,                 # k
+        ctypes.POINTER(ctypes.c_uint8),  # out_stream
+    ]
+    pack.restype = ctypes.c_int
+    return quantize, pack
+
+
+# -- legacy Python helpers (kept for tests & golden comparisons) ----------
+
+
 def _lround_like_native(value: float) -> int:
     if value >= 0.0:
         return int(value + 0.5)
@@ -75,7 +110,7 @@ def _fp16_float_to_bits(value: float) -> int:
 
 
 def _quantize_q8_0(values: tuple[float, ...]) -> tuple[list[int], list[int]]:
-    """Match the PS kernel's Q8_0 activation quantization."""
+    """Python reference for Q8_0 quantization. Matches the C ``bonsai_quantize_q8_0_pl``."""
     if len(values) % Q8_BLOCK != 0:
         raise ValueError("Q8_0 input length must be a multiple of Q8_BLOCK")
 
@@ -124,7 +159,8 @@ def _pack_rowblock_into(
     k: int,
     rows_per_block: int = ROWS_PER_BLOCK,
 ) -> None:
-    """Pack one rowblock into the RTL rowblock stream format."""
+    """Python reference for packing one rowblock. Used by tests; the runtime path
+    uses the C implementation via ``bonsai_pack_matmul_q1a8_stream``."""
     expected_len = _rowblock_nbytes(k, rows_per_block)
     if len(out) != expected_len:
         raise ValueError(f"packed buffer must be {expected_len} bytes")
@@ -179,6 +215,9 @@ def _pack_rowblock_into(
                 cursor += 8
 
 
+# -- runtime driver -------------------------------------------------------
+
+
 class PLMatmulQ1A8:
     name = GOP_MATMUL_Q1A8
     backend = "pl"
@@ -186,10 +225,25 @@ class PLMatmulQ1A8:
     def __init__(self, overlay):
         self._dma = overlay.axi_dma_0
         self._kernel = overlay.q1a8_kernel_top_0
-        self._buf = None
-        self._buf_size = 0
+        self._stream_buf = None
+        self._stream_buf_size = 0
+        self._result_buf = None
+        self._result_buf_size = 0
         self._np = None
         self._rows_per_block = ROWS_PER_BLOCK
+        self._lib = None
+        self._c_quantize = None
+        self._c_pack = None
+        self._call_count = 0
+
+    def _ensure_native(self) -> None:
+        # Lazy: the host-side registration test constructs PLMatmulQ1A8 without
+        # the on-board libbonsai_ps.so being available, so loading is deferred
+        # until the first run().
+        if self._c_quantize is not None:
+            return
+        self._lib = load_lib()
+        self._c_quantize, self._c_pack = _bind_native(self._lib)
 
     def run(self, allocator: TensorAllocator, op: dict[str, Any], timer: Timer) -> None:
         rows = _required(op, F_ROWS)
@@ -202,6 +256,8 @@ class PLMatmulQ1A8:
                 "invalid_request",
                 f"{GOP_MATMUL_Q1A8} k must be a positive multiple of {Q1_BLOCK}",
             )
+
+        self._ensure_native()
 
         blocks_per_row = k // Q1_BLOCK
         weight_row_bytes = blocks_per_row * Q1_BLOCK_BYTES
@@ -224,44 +280,87 @@ class PLMatmulQ1A8:
 
         self._check_kernel_id()
         rows_per_block = self._read_rows_per_block()
-        packed_nbytes = _rowblock_nbytes(k, rows_per_block)
-        self._ensure_buffer(packed_nbytes)
+        rowblock_nbytes = _rowblock_nbytes(k, rows_per_block)
+        rowblocks_per_col = (rows + rows_per_block - 1) // rows_per_block
+        col_stream_nbytes = rowblock_nbytes * rowblocks_per_col
+        col_result_nbytes = rowblocks_per_col * rows_per_block * F32_BYTES
 
-        packed = bytearray(packed_nbytes)
+        import numpy as np
+
+        self._np = np
+        self._ensure_buffers(col_stream_nbytes, col_result_nbytes)
+
+        # Persistent numpy scratch for one column's worth of activations.
+        act_quants = np.empty(k, dtype=np.int8)
+        act_scale_bits = np.empty(k // Q8_BLOCK, dtype=np.uint16)
+
+        # Backing storage for weights as a contiguous numpy buffer so we can
+        # hand a pointer to the C packer without copying.
+        weights_np = np.frombuffer(weights, dtype=np.uint8)
+        weights_ptr = weights_np.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+        quants_ptr = act_quants.ctypes.data_as(ctypes.POINTER(ctypes.c_int8))
+        scales_ptr = act_scale_bits.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
+        stream_ptr = self._stream_buf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+
         out = bytearray(dst_nbytes)
         total_cycles = 0
-        rowblocks = 0
 
         for col in range(cols):
+            col_acts_offset = col * k * F32_BYTES
+
             with timer.section("quantize"):
-                act_values = struct.unpack_from(f"<{k}f", acts, col * k * F32_BYTES)
-                act_quants, act_scale_bits = _quantize_q8_0(act_values)
+                # No copy: float view over the input bytes.
+                act_view = np.frombuffer(acts, dtype=np.float32, count=k,
+                                         offset=col_acts_offset)
+                acts_ptr = act_view.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+                rc = self._c_quantize(acts_ptr, ctypes.c_uint32(k),
+                                      quants_ptr, scales_ptr)
+                if rc != 0:
+                    raise RuntimeError(f"bonsai_quantize_q8_0_pl rc={rc}")
 
-            for row_start in range(0, rows, rows_per_block):
-                row_count = min(rows_per_block, rows - row_start)
-                with timer.section("pack"):
-                    _pack_rowblock_into(
-                        packed,
-                        weights,
-                        row_start,
-                        row_count,
-                        weight_row_bytes,
-                        act_quants,
-                        act_scale_bits,
-                        k,
-                        rows_per_block,
-                    )
+            with timer.section("pack"):
+                # cols=1: pack just this column into self._stream_buf.
+                self._call_count += 1
+                import sys as _sys
+                _wp = ctypes.cast(weights_ptr, ctypes.c_void_p).value
+                _sp = ctypes.cast(stream_ptr, ctypes.c_void_p).value
+                print(
+                    f"PACK n={self._call_count} col={col} rows={rows} k={k} "
+                    f"weights={_wp:#x}/{weights_np.nbytes} "
+                    f"stream={_sp:#x}/{self._stream_buf.nbytes}",
+                    file=_sys.stderr, flush=True,
+                )
+                rc = self._c_pack(
+                    weights_ptr,
+                    quants_ptr,
+                    scales_ptr,
+                    ctypes.c_uint32(rows),
+                    ctypes.c_uint32(1),
+                    ctypes.c_uint32(k),
+                    stream_ptr,
+                )
+                if rc != 0:
+                    raise RuntimeError(f"bonsai_pack_matmul_q1a8_stream rc={rc}")
 
-                result_bits, cycles = self._run_rowblock(packed, row_count, blocks_per_row, timer)
-                total_cycles += cycles
-                rowblocks += 1
-                for lane, bits in enumerate(result_bits):
-                    struct.pack_into(
-                        "<I",
-                        out,
-                        (col * rows + row_start + lane) * F32_BYTES,
-                        bits,
-                    )
+            with timer.section("flush"):
+                self._stream_buf.flush()
+
+            cycles = self._run_matmul(
+                col_stream_nbytes,
+                col_result_nbytes,
+                blocks_per_row,
+                rowblocks_per_col,
+                timer,
+            )
+            total_cycles += cycles
+
+            with timer.section("result_copy"):
+                # First `rows` fp32 are meaningful; the rest (up to
+                # rowblocks_per_col * 8 - rows) are zero-padded inactive lanes.
+                result_view = self._np.frombuffer(self._result_buf,
+                                                  dtype=self._np.uint8,
+                                                  count=rows * F32_BYTES)
+                out[col * rows * F32_BYTES : (col + 1) * rows * F32_BYTES] = result_view.tobytes()
 
         with timer.section("write"):
             allocator.write(
@@ -270,8 +369,10 @@ class PLMatmulQ1A8:
                 out,
             )
         timer.add("bytes_written", dst_nbytes)
-        timer.add("rowblocks", rowblocks)
-        timer.add("dma_bytes_read", rowblocks * packed_nbytes)
+        timer.add("matmul_cols", cols)
+        timer.add("rowblocks", cols * rowblocks_per_col)
+        timer.add("dma_bytes_read", cols * col_stream_nbytes)
+        timer.add("dma_bytes_written", cols * col_result_nbytes)
         timer.add("kernel_cycles", total_cycles)
 
     def _check_kernel_id(self) -> None:
@@ -289,47 +390,56 @@ class PLMatmulQ1A8:
         self._rows_per_block = rows_per_block
         return rows_per_block
 
-    def _ensure_buffer(self, nbytes: int) -> None:
-        if self._buf is not None and self._buf_size >= nbytes:
-            return
-        if self._buf is not None:
-            self._buf.freebuffer()
-
-        import numpy as np
+    def _ensure_buffers(self, stream_nbytes: int, result_nbytes: int) -> None:
         from pynq import allocate
 
-        self._np = np
-        self._buf = allocate(shape=(nbytes,), dtype=np.uint8)
-        self._buf_size = nbytes
+        if self._stream_buf is None or self._stream_buf_size < stream_nbytes:
+            if self._stream_buf is not None:
+                self._stream_buf.freebuffer()
+            self._stream_buf = allocate(shape=(stream_nbytes,), dtype=self._np.uint8)
+            self._stream_buf_size = stream_nbytes
 
-    def _run_rowblock(
+        if self._result_buf is None or self._result_buf_size < result_nbytes:
+            if self._result_buf is not None:
+                self._result_buf.freebuffer()
+            self._result_buf = allocate(shape=(result_nbytes,), dtype=self._np.uint8)
+            self._result_buf_size = result_nbytes
+
+    def _run_matmul(
         self,
-        packed: bytearray,
-        row_count: int,
+        stream_nbytes: int,
+        result_nbytes: int,
         num_q1_blocks: int,
+        num_rowblocks: int,
         timer: Timer,
-    ) -> tuple[list[int], int]:
-        nbytes = len(packed)
-        assert self._buf is not None
-        assert self._np is not None
+    ) -> int:
+        """Drive one column's matmul: configure kernel, start both DMA channels,
+        wait for both to drain. Returns cycle count of the run."""
+        assert self._stream_buf is not None and self._result_buf is not None
 
-        with timer.section("dma_load"):
-            self._buf[:nbytes] = self._np.frombuffer(packed, dtype=self._np.uint8)
-            self._buf.flush()
+        stream_view = self._stream_buf[:stream_nbytes]
+        result_view = self._result_buf[:result_nbytes]
 
         with timer.section("kernel_setup"):
             self._kernel.write(REG_NUM_Q1_BLOCKS, num_q1_blocks)
-            self._kernel.write(REG_ROW_COUNT, row_count)
+            self._kernel.write(REG_NUM_ROWBLOCKS, num_rowblocks)
 
-        view = self._buf[:nbytes]
-        with timer.section("dma_start"):
-            self._dma.sendchannel.transfer(view)
+        with timer.section("recv_start"):
+            # Arm S2MM first so the kernel cannot deadlock when it starts
+            # emitting after the first rowblock.
+            self._dma.recvchannel.transfer(result_view)
 
         with timer.section("kernel_start"):
             self._kernel.write(REG_CTRL, CTRL_START)
 
-        with timer.section("dma_wait"):
+        with timer.section("send_start"):
+            self._dma.sendchannel.transfer(stream_view)
+
+        with timer.section("send_wait"):
             self._dma.sendchannel.wait()
+
+        with timer.section("recv_wait"):
+            self._dma.recvchannel.wait()
 
         with timer.section("poll"):
             status = 0
@@ -338,12 +448,10 @@ class PLMatmulQ1A8:
                 if status & STATUS_DONE:
                     break
             else:
-                raise RuntimeError(f"q1a8 rowblock kernel never reported done (status=0x{status:08x})")
+                raise RuntimeError(
+                    f"q1a8 kernel never reported done (status=0x{status:08x})")
 
-        results: list[int] = []
-        with timer.section("result_read"):
-            for lane in range(row_count):
-                self._kernel.write(REG_RESULT_INDEX, lane)
-                results.append(int(self._kernel.read(REG_RESULT)) & 0xFFFF_FFFF)
-            cycles = int(self._kernel.read(REG_CYCLES))
-        return results, cycles
+        with timer.section("result_invalidate"):
+            result_view.invalidate()
+
+        return int(self._kernel.read(REG_CYCLES))
