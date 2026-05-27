@@ -43,6 +43,8 @@ def run_graph(
     req_id = metadata.get(F_ID)
 
     timer = Timer(req_id=req_id)
+    ps_ops = 0
+    pl_ops = 0
     events.emit("graph_begin", req_id=req_id, op_count=len(ops))
     with timer.section("graph"):
         for index, op in enumerate(ops):
@@ -52,6 +54,10 @@ def run_graph(
                     "invalid_request", f"graph op {index} is missing op"
                 )
             kernel = registry.get(op_name)
+            if getattr(kernel, "backend", "ps") == "pl":
+                pl_ops += 1
+            else:
+                ps_ops += 1
             with timer.op(op_name):
                 kernel.run(allocator, op, timer)
 
@@ -60,8 +66,8 @@ def run_graph(
         allocator.describe(handle)
 
     counters = {
-        "ps_ops": len(ops),
-        "pl_ops": 0,
+        "ps_ops": ps_ops,
+        "pl_ops": pl_ops,
         "bytes_read": sum(int(s.fields.get("bytes_read", 0)) for s in timer.ops),
         "bytes_written": sum(int(s.fields.get("bytes_written", 0)) for s in timer.ops),
         "elapsed_us": timer.graph_us,

@@ -19,6 +19,7 @@ import random
 import struct
 import sys
 import time
+from dataclasses import dataclass
 
 import numpy as np
 from pynq import Overlay, allocate
@@ -39,6 +40,13 @@ STATUS_DONE = 1 << 1
 
 EXPECTED_ID      = 0xB05A_1000
 EXPECTED_VERSION = 1
+
+
+@dataclass
+class KernelRun:
+    result: int
+    cycles: int
+    timings_us: dict[str, int]
 
 
 # -- Python golden (mirror of fp32_mul.v / fp32_add.v truncating arithmetic) --
@@ -170,37 +178,67 @@ def pack_subblock_bytes(sb):
 
 # -- Bench --------------------------------------------------------------------
 
+def elapsed_us(start_ns):
+    return max(0, (time.perf_counter_ns() - start_ns) // 1000)
+
+
 def run_kernel(overlay, sub_blocks, buf):
-    """Configure + start + DMA + poll; return (result_bits, cycles)."""
+    """Configure + DMA + start + poll; return result, cycles, and phase timing."""
     kernel = overlay.q1a8_kernel_top_0
     dma = overlay.axi_dma_0
 
+    timings = {}
+    total_start = time.perf_counter_ns()
+
+    start = time.perf_counter_ns()
     packed = b"".join(pack_subblock_bytes(sb) for sb in sub_blocks)
     nbytes = len(packed)
     assert nbytes == 48 * len(sub_blocks)
     assert nbytes <= len(buf), f"buffer too small: {len(buf)} < {nbytes}"
+    timings["pack_us"] = elapsed_us(start)
 
+    start = time.perf_counter_ns()
     buf[:nbytes] = np.frombuffer(packed, dtype=np.uint8)
     buf.flush()
+    timings["buffer_load_us"] = elapsed_us(start)
 
-    # Configure + start the kernel BEFORE DMA. The packer's tready is high
-    # immediately (no subblock held), but the streamer's s_ready stays low
-    # until busy, so the packer would hold its first sub-block forever.
-    # Issuing start first makes the streamer ready when beats start arriving.
+    start = time.perf_counter_ns()
     kernel.write(REG_NUM_SUBBLOCKS, len(sub_blocks))
-    kernel.write(REG_CTRL, CTRL_START)
+    timings["kernel_setup_us"] = elapsed_us(start)
 
+    # Arm DMA first, then start the kernel. The DMA may present the first
+    # assembled sub-block and stall until the streamer becomes ready, but
+    # PYNQ's transfer() call itself is non-blocking. This keeps most PS setup
+    # overhead out of the kernel CYCLES register while avoiding a pre-start
+    # dma.wait() deadlock.
+    start = time.perf_counter_ns()
     dma.sendchannel.transfer(buf[:nbytes])
-    dma.sendchannel.wait()
+    timings["dma_start_us"] = elapsed_us(start)
 
+    start = time.perf_counter_ns()
+    kernel.write(REG_CTRL, CTRL_START)
+    timings["kernel_start_us"] = elapsed_us(start)
+
+    start = time.perf_counter_ns()
+    dma.sendchannel.wait()
+    timings["dma_wait_us"] = elapsed_us(start)
+
+    start = time.perf_counter_ns()
     for _ in range(10000):
         status = kernel.read(REG_STATUS)
         if status & STATUS_DONE:
             break
     else:
         raise RuntimeError(f"kernel never reported done (status=0x{status:08x})")
+    timings["poll_us"] = elapsed_us(start)
 
-    return kernel.read(REG_RESULT), kernel.read(REG_CYCLES)
+    start = time.perf_counter_ns()
+    result = kernel.read(REG_RESULT)
+    cycles = kernel.read(REG_CYCLES)
+    timings["result_read_us"] = elapsed_us(start)
+    timings["total_us"] = elapsed_us(total_start)
+
+    return KernelRun(result=result, cycles=cycles, timings_us=timings)
 
 
 def cmd_verify(args):
@@ -228,7 +266,8 @@ def cmd_verify(args):
 
     buf = allocate(shape=(48 * args.num_subblocks,), dtype=np.uint8)
     try:
-        result, cycles = run_kernel(overlay, sub_blocks, buf)
+        run = run_kernel(overlay, sub_blocks, buf)
+        result, cycles = run.result, run.cycles
         want = golden_full_kernel(sub_blocks)
         if result == want:
             print(f"ok   kernel: result=0x{result:08x} ({fp32_bits_to_float(result):.6g})"
@@ -251,28 +290,47 @@ def cmd_bench(args):
     buf = allocate(shape=(48 * args.num_subblocks,), dtype=np.uint8)
     try:
         # Warmup + sanity
-        result, cycles = run_kernel(overlay, sub_blocks, buf)
-        if result != want:
-            print(f"FAIL: warmup mismatch", file=sys.stderr)
+        run = run_kernel(overlay, sub_blocks, buf)
+        if run.result != want:
+            print("FAIL: warmup mismatch", file=sys.stderr)
             return 1
 
+        timing_totals = {}
+        cycle_total = 0
         t0 = time.perf_counter()
         for _ in range(args.iters):
-            result, _ = run_kernel(overlay, sub_blocks, buf)
-            if result != want:
-                print(f"FAIL: mid-loop mismatch", file=sys.stderr)
+            run = run_kernel(overlay, sub_blocks, buf)
+            if run.result != want:
+                print("FAIL: mid-loop mismatch", file=sys.stderr)
                 return 1
+            cycle_total += run.cycles
+            for key, value in run.timings_us.items():
+                timing_totals[key] = timing_totals.get(key, 0) + value
         dt = time.perf_counter() - t0
 
         us_per_kernel = dt / args.iters * 1e6
         kernels_per_sec = args.iters / dt
-        pl_us = cycles / 100.0  # 100 MHz fabric clock
+        avg_cycles = cycle_total / args.iters
+        pl_us = avg_cycles / 100.0  # 100 MHz fabric clock
 
         print(f"{args.iters} kernels, {args.num_subblocks} sub-blocks each (K={args.num_subblocks*32})")
         print(f"  wall:       {dt*1000:.1f} ms  ({us_per_kernel:.1f} us/kernel,"
               f" {kernels_per_sec:.0f} kernels/s)")
-        print(f"  pl compute: {cycles} cycles ({pl_us:.2f} us @ 100 MHz)")
+        print(f"  pl compute: {avg_cycles:.1f} cycles ({pl_us:.2f} us @ 100 MHz)")
         print(f"  ps overhead per kernel: {us_per_kernel - pl_us:.1f} us")
+        print("  phase avg:")
+        for key in (
+            "pack_us",
+            "buffer_load_us",
+            "kernel_setup_us",
+            "dma_start_us",
+            "kernel_start_us",
+            "dma_wait_us",
+            "poll_us",
+            "result_read_us",
+            "total_us",
+        ):
+            print(f"    {key:16s} {timing_totals.get(key, 0) / args.iters:.1f} us")
         return 0
     finally:
         buf.freebuffer()

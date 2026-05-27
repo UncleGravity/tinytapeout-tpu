@@ -25,6 +25,7 @@ from proto.ops import F_DST, F_DST_OFFSET, F_NBYTES, F_SRC, F_SRC_OFFSET, GOP_CO
 
 class PLLoopback:
     name = GOP_COPY
+    backend = "pl"
 
     def __init__(self, overlay):
         # PYNQ exposes the AXI DMA IP block by the name from the .hwh.
