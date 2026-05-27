@@ -206,6 +206,29 @@ class TensorAllocator:
             return self._slabs[extent.slab_index], extent.offset + local, nbytes
         raise AllocatorError("internal_error", "no extent contains the requested offset")
 
+    def slab_pointer(self, handle: int, offset: int, nbytes: int) -> int:
+        """User-space VA into the slab's CMA mmap covering [offset, offset+nbytes).
+
+        Returns an integer address suitable for ``ctypes.cast(addr, POINTER(...))``.
+        Stable for the slab's lifetime: PL kernels use this to hand pointers
+        directly to native code without copying the underlying bytes through
+        a Python ``bytes`` object. Raises if the range spans extents, or if
+        the slab is not pynq-backed (FakeSlab has no usable VA).
+        """
+        import ctypes
+
+        slab, abs_offset, _ = self.slab_view(handle, offset, nbytes)
+        buf = getattr(slab, "pynq_buffer", None)
+        if buf is None:
+            raise AllocatorError(
+                "invalid_request",
+                "slab_pointer requires a pynq-backed slab",
+            )
+        base = buf.ctypes.data_as(ctypes.c_void_p).value
+        if base is None:
+            raise AllocatorError("internal_error", "slab has no usable data pointer")
+        return base + abs_offset
+
     def physical(self, handle: int, offset: int = 0) -> int:
         """Physical address of ``offset`` bytes into the tensor.
 

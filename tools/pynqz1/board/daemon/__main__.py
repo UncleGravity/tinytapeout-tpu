@@ -89,6 +89,11 @@ def main(argv: list[str] | None = None) -> int:
             f"ops=[{ops}]",
             flush=True,
         )
+        # debug: probe q1a8 kernel ID at startup; helps diagnose MMIO corruption.
+        if runtime.overlay is not None and hasattr(runtime.overlay, "q1a8_kernel_top_0"):
+            kid = runtime.overlay.q1a8_kernel_top_0.read(0x00)
+            kver = runtime.overlay.q1a8_kernel_top_0.read(0x04)
+            print(f"q1a8 startup MMIO: ID={kid:#010x} VER={kver:#010x}", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:

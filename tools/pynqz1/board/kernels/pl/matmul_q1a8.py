@@ -234,7 +234,87 @@ class PLMatmulQ1A8:
         self._lib = None
         self._c_quantize = None
         self._c_pack = None
-        self._call_count = 0
+        # Lazy CMA scratch buffers for the rare case where a tensor spans
+        # slab extents: allocator.slab_pointer refuses to hand out a single
+        # pointer there, so we copy the bytes into a contiguous CMA scratch
+        # and pass the scratch's pointer to C.
+        self._weights_scratch = None
+        self._weights_scratch_size = 0
+        self._acts_scratch = None
+        self._acts_scratch_size = 0
+
+    def _resolve_slab_pointer(
+        self,
+        allocator: TensorAllocator,
+        handle: int,
+        offset: int,
+        nbytes: int,
+        kind: str,
+    ) -> int:
+        """Return a CMA address covering ``nbytes`` of tensor data.
+
+        Fast path: the range lives in a single slab extent, so we return the
+        slab's user-space VA directly (zero copy). Fallback: the range spans
+        extents, so we copy it through a persistent CMA scratch reserved for
+        this op channel.
+        """
+        try:
+            return allocator.slab_pointer(handle, offset, nbytes)
+        except AllocatorError as exc:
+            if exc.code != "multi_extent":
+                raise
+            return self._copy_to_cma_scratch(allocator, handle, offset, nbytes, kind)
+
+    def _copy_to_cma_scratch(
+        self,
+        allocator: TensorAllocator,
+        handle: int,
+        offset: int,
+        nbytes: int,
+        kind: str,
+    ) -> int:
+        import ctypes as _ct
+
+        import numpy as np
+        from pynq import allocate
+
+        if kind == "weights":
+            buf = self._weights_scratch
+            size = self._weights_scratch_size
+        else:
+            buf = self._acts_scratch
+            size = self._acts_scratch_size
+
+        if buf is None or size < nbytes:
+            # Orphan the old buffer — Python GC will release it via PynqBuffer
+            # finalization. Calling buf.freebuffer() directly has been
+            # observed to raise AttributeError ('PynqBuffer' object has no
+            # attribute 'bo') in some lifecycle states; the GC path goes
+            # through the same release without touching .bo from our code.
+            buf = allocate(shape=(nbytes,), dtype=np.uint8)
+            size = nbytes
+
+        if kind == "weights":
+            self._weights_scratch = buf
+            self._weights_scratch_size = size
+        else:
+            self._acts_scratch = buf
+            self._acts_scratch_size = size
+
+        src = allocator.read(handle, offset, nbytes)
+        src_arr = np.frombuffer(src, dtype=np.uint8)
+        # Use ctypes.memmove instead of buf[:nbytes] = src_arr. PynqBuffer's
+        # __setitem__ has a cache-coherence hook that touches .bo, which is
+        # missing for some slice/view states and raises AttributeError. A
+        # raw memmove bypasses pynq's hook entirely; no DMA is involved here
+        # so no explicit flush is needed (the C reader uses CPU loads and
+        # sees the just-written cache lines).
+        _ct.memmove(
+            buf.ctypes.data_as(_ct.c_void_p),
+            src_arr.ctypes.data_as(_ct.c_void_p),
+            nbytes,
+        )
+        return buf.ctypes.data_as(_ct.c_void_p).value
 
     def _ensure_native(self) -> None:
         # Lazy: the host-side registration test constructs PLMatmulQ1A8 without
@@ -265,16 +345,21 @@ class PLMatmulQ1A8:
         act_nbytes = cols * k * F32_BYTES
         dst_nbytes = rows * cols * F32_BYTES
 
+        # Acts are small (cols * k floats); resolve once. Weights are
+        # resolved per-chunk inside the loop below, because the whole-tensor
+        # scratch copy would not fit in CMA for big matmuls (lm_head's
+        # token_embd.weight is ~42 MiB; CMA has ~15 MiB free after the model
+        # is loaded). Per-chunk weights are at most rows_per_chunk *
+        # weight_row_bytes ≈ 2 MiB which always fits.
+        weights_handle = _required(op, F_WEIGHTS)
+        weights_base_offset = _optional_int(op, F_WEIGHTS_OFFSET)
         with timer.section("read"):
-            weights = allocator.read(
-                _required(op, F_WEIGHTS),
-                _optional_int(op, F_WEIGHTS_OFFSET),
-                weight_nbytes,
-            )
-            acts = allocator.read(
+            acts_addr = self._resolve_slab_pointer(
+                allocator,
                 _required(op, F_ACTS),
                 _optional_int(op, F_ACTS_OFFSET),
                 act_nbytes,
+                "acts",
             )
         timer.add("bytes_read", weight_nbytes + act_nbytes)
 
@@ -282,22 +367,28 @@ class PLMatmulQ1A8:
         rows_per_block = self._read_rows_per_block()
         rowblock_nbytes = _rowblock_nbytes(k, rows_per_block)
         rowblocks_per_col = (rows + rows_per_block - 1) // rows_per_block
-        col_stream_nbytes = rowblock_nbytes * rowblocks_per_col
-        col_result_nbytes = rowblocks_per_col * rows_per_block * F32_BYTES
+
+        # Cap the stream/result buffers to ~4 MiB so huge matmuls (lm_head:
+        # rows=151669 → 88 MiB stream) split into manageable chunks of
+        # ``rows_per_chunk`` rows. Layer matmuls (rows ≤ 6144) fit in one
+        # chunk and pay no extra kernel-invocation overhead.
+        max_stream_nbytes = 4 * 1024 * 1024
+        max_rowblocks_per_chunk = min(
+            rowblocks_per_col,
+            max(1, max_stream_nbytes // rowblock_nbytes),
+        )
+        rows_per_chunk = max_rowblocks_per_chunk * rows_per_block
+        chunk_stream_nbytes = max_rowblocks_per_chunk * rowblock_nbytes
+        chunk_result_nbytes = max_rowblocks_per_chunk * rows_per_block * F32_BYTES
 
         import numpy as np
 
         self._np = np
-        self._ensure_buffers(col_stream_nbytes, col_result_nbytes)
+        self._ensure_buffers(chunk_stream_nbytes, chunk_result_nbytes)
 
-        # Persistent numpy scratch for one column's worth of activations.
         act_quants = np.empty(k, dtype=np.int8)
         act_scale_bits = np.empty(k // Q8_BLOCK, dtype=np.uint16)
 
-        # Backing storage for weights as a contiguous numpy buffer so we can
-        # hand a pointer to the C packer without copying.
-        weights_np = np.frombuffer(weights, dtype=np.uint8)
-        weights_ptr = weights_np.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
         quants_ptr = act_quants.ctypes.data_as(ctypes.POINTER(ctypes.c_int8))
         scales_ptr = act_scale_bits.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
         stream_ptr = self._stream_buf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
@@ -309,58 +400,74 @@ class PLMatmulQ1A8:
             col_acts_offset = col * k * F32_BYTES
 
             with timer.section("quantize"):
-                # No copy: float view over the input bytes.
-                act_view = np.frombuffer(acts, dtype=np.float32, count=k,
-                                         offset=col_acts_offset)
-                acts_ptr = act_view.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+                acts_ptr = ctypes.cast(
+                    acts_addr + col_acts_offset,
+                    ctypes.POINTER(ctypes.c_float),
+                )
                 rc = self._c_quantize(acts_ptr, ctypes.c_uint32(k),
                                       quants_ptr, scales_ptr)
                 if rc != 0:
                     raise RuntimeError(f"bonsai_quantize_q8_0_pl rc={rc}")
 
-            with timer.section("pack"):
-                # cols=1: pack just this column into self._stream_buf.
-                self._call_count += 1
-                import sys as _sys
-                _wp = ctypes.cast(weights_ptr, ctypes.c_void_p).value
-                _sp = ctypes.cast(stream_ptr, ctypes.c_void_p).value
-                print(
-                    f"PACK n={self._call_count} col={col} rows={rows} k={k} "
-                    f"weights={_wp:#x}/{weights_np.nbytes} "
-                    f"stream={_sp:#x}/{self._stream_buf.nbytes}",
-                    file=_sys.stderr, flush=True,
+            row_chunk_start = 0
+            while row_chunk_start < rows:
+                chunk_rows = min(rows_per_chunk, rows - row_chunk_start)
+                chunk_rowblocks = (chunk_rows + rows_per_block - 1) // rows_per_block
+                chunk_stream = chunk_rowblocks * rowblock_nbytes
+                chunk_result = chunk_rowblocks * rows_per_block * F32_BYTES
+
+                chunk_weight_offset = (
+                    weights_base_offset + row_chunk_start * weight_row_bytes
                 )
-                rc = self._c_pack(
-                    weights_ptr,
-                    quants_ptr,
-                    scales_ptr,
-                    ctypes.c_uint32(rows),
-                    ctypes.c_uint32(1),
-                    ctypes.c_uint32(k),
-                    stream_ptr,
+                chunk_weight_nbytes = chunk_rows * weight_row_bytes
+                chunk_weights_addr = self._resolve_slab_pointer(
+                    allocator,
+                    weights_handle,
+                    chunk_weight_offset,
+                    chunk_weight_nbytes,
+                    "weights",
                 )
-                if rc != 0:
-                    raise RuntimeError(f"bonsai_pack_matmul_q1a8_stream rc={rc}")
+                chunk_weights_ptr = ctypes.cast(
+                    chunk_weights_addr,
+                    ctypes.POINTER(ctypes.c_uint8),
+                )
 
-            with timer.section("flush"):
-                self._stream_buf.flush()
+                with timer.section("pack"):
+                    rc = self._c_pack(
+                        chunk_weights_ptr,
+                        quants_ptr,
+                        scales_ptr,
+                        ctypes.c_uint32(chunk_rows),
+                        ctypes.c_uint32(1),
+                        ctypes.c_uint32(k),
+                        stream_ptr,
+                    )
+                    if rc != 0:
+                        raise RuntimeError(f"bonsai_pack_matmul_q1a8_stream rc={rc}")
 
-            cycles = self._run_matmul(
-                col_stream_nbytes,
-                col_result_nbytes,
-                blocks_per_row,
-                rowblocks_per_col,
-                timer,
-            )
-            total_cycles += cycles
+                with timer.section("flush"):
+                    self._stream_buf.flush()
 
-            with timer.section("result_copy"):
-                # First `rows` fp32 are meaningful; the rest (up to
-                # rowblocks_per_col * 8 - rows) are zero-padded inactive lanes.
-                result_view = self._np.frombuffer(self._result_buf,
-                                                  dtype=self._np.uint8,
-                                                  count=rows * F32_BYTES)
-                out[col * rows * F32_BYTES : (col + 1) * rows * F32_BYTES] = result_view.tobytes()
+                cycles = self._run_matmul(
+                    chunk_stream,
+                    chunk_result,
+                    blocks_per_row,
+                    chunk_rowblocks,
+                    timer,
+                )
+                total_cycles += cycles
+
+                with timer.section("result_copy"):
+                    # First `chunk_rows` fp32 are meaningful; the rest are
+                    # zero-padded inactive lanes inside the last rowblock.
+                    result_view = self._np.frombuffer(
+                        self._result_buf, dtype=self._np.uint8,
+                        count=chunk_rows * F32_BYTES,
+                    )
+                    out_base = (col * rows + row_chunk_start) * F32_BYTES
+                    out[out_base : out_base + chunk_rows * F32_BYTES] = result_view.tobytes()
+
+                row_chunk_start += chunk_rows
 
         with timer.section("write"):
             allocator.write(
@@ -371,8 +478,11 @@ class PLMatmulQ1A8:
         timer.add("bytes_written", dst_nbytes)
         timer.add("matmul_cols", cols)
         timer.add("rowblocks", cols * rowblocks_per_col)
-        timer.add("dma_bytes_read", cols * col_stream_nbytes)
-        timer.add("dma_bytes_written", cols * col_result_nbytes)
+        timer.add("dma_bytes_read", cols * rowblocks_per_col * rowblock_nbytes)
+        timer.add(
+            "dma_bytes_written",
+            cols * rowblocks_per_col * rows_per_block * F32_BYTES,
+        )
         timer.add("kernel_cycles", total_cycles)
 
     def _check_kernel_id(self) -> None:
