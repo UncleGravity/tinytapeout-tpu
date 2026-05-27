@@ -11,9 +11,7 @@ VERILOG_SOURCES = \
     $(RTL)/fp32_mul.v \
     $(RTL)/q1a8_reducer.v \
     $(RTL)/fp32_add.v \
-    $(RTL)/q1a8_cell.v \
-    $(RTL)/q1a8_streamer.v \
-    $(RTL)/axis_to_subblock.v \
+    $(RTL)/q1a8_rowblock.v \
     $(RTL)/q1a8_kernel.v
 
 ifeq ($(SIM),verilator)

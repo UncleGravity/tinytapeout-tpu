@@ -1,10 +1,4 @@
-"""PL-backed MATMUL_Q1A8 driver for the current single-cell bitstream.
-
-This is intentionally a bring-up driver, not the final high-throughput
-matmul architecture. It packs one output cell at a time into the 48-byte
-sub-block stream consumed by ``q1a8_kernel_top`` and writes each fp32 result
-back into the daemon-owned destination tensor.
-"""
+"""PL-backed MATMUL_Q1A8 driver for the rowblock bitstream."""
 
 from __future__ import annotations
 
@@ -31,21 +25,24 @@ from proto.ops import (
 )
 
 F32_BYTES = 4
-SUBBLOCK_BYTES = 48
+ROWS_PER_BLOCK = 8
 
 REG_ID = 0x00
 REG_VERSION = 0x04
 REG_CTRL = 0x08
 REG_STATUS = 0x0C
-REG_NUM_SUBBLOCKS = 0x10
-REG_RESULT = 0x14
-REG_CYCLES = 0x18
+REG_NUM_Q1_BLOCKS = 0x10
+REG_ROW_COUNT = 0x14
+REG_RESULT_INDEX = 0x18
+REG_RESULT = 0x1C
+REG_CYCLES = 0x20
+REG_ROWS = 0x24
 
 CTRL_START = 1 << 0
 STATUS_DONE = 1 << 1
 
-EXPECTED_ID = 0xB05A_1000
-EXPECTED_VERSION = 1
+EXPECTED_ID = 0xB05A_2000
+EXPECTED_VERSION = 2
 POLL_LIMIT = 100_000
 
 
@@ -78,11 +75,7 @@ def _fp16_float_to_bits(value: float) -> int:
 
 
 def _quantize_q8_0(values: tuple[float, ...]) -> tuple[list[int], list[int]]:
-    """Match the PS kernel's Q8_0 activation quantization.
-
-    The quantized int8 values use the unrounded scale, while the scale sent to
-    hardware is the fp16 representation, exactly like ``native.c``.
-    """
+    """Match the PS kernel's Q8_0 activation quantization."""
     if len(values) % Q8_BLOCK != 0:
         raise ValueError("Q8_0 input length must be a multiple of Q8_BLOCK")
 
@@ -110,51 +103,80 @@ def _quantize_q8_0(values: tuple[float, ...]) -> tuple[list[int], list[int]]:
     return quants, scale_bits
 
 
-def _pack_cell_into(
+def _q1_bytes_per_rowblock(rows_per_block: int = ROWS_PER_BLOCK) -> int:
+    scale_beats = (rows_per_block + 3) // 4
+    wbits_beats = (rows_per_block + 1) // 2
+    return (scale_beats + 4 * (5 + wbits_beats)) * 8
+
+
+def _rowblock_nbytes(k: int, rows_per_block: int = ROWS_PER_BLOCK) -> int:
+    return (k // Q1_BLOCK) * _q1_bytes_per_rowblock(rows_per_block)
+
+
+def _pack_rowblock_into(
     out: bytearray,
-    weight_row: bytes,
+    weights: bytes,
+    row_start: int,
+    row_count: int,
+    weight_row_bytes: int,
     act_quants: list[int],
     act_scale_bits: list[int],
     k: int,
+    rows_per_block: int = ROWS_PER_BLOCK,
 ) -> None:
-    """Pack one output cell into the RTL's 48-byte-per-Q8-block stream."""
-    expected_len = (k // Q8_BLOCK) * SUBBLOCK_BYTES
+    """Pack one rowblock into the RTL rowblock stream format."""
+    expected_len = _rowblock_nbytes(k, rows_per_block)
     if len(out) != expected_len:
         raise ValueError(f"packed buffer must be {expected_len} bytes")
-    if len(weight_row) != (k // Q1_BLOCK) * Q1_BLOCK_BYTES:
-        raise ValueError("weight row has wrong length")
+    if row_count < 1 or row_count > rows_per_block:
+        raise ValueError("row_count outside rowblock bounds")
 
-    cursor = 0
+    scale_beats = (rows_per_block + 3) // 4
+    wbits_beats = (rows_per_block + 1) // 2
     blocks_per_row = k // Q1_BLOCK
-    for q1_index in range(blocks_per_row):
-        block_offset = q1_index * Q1_BLOCK_BYTES
-        weight_scale_bits = struct.unpack_from("<H", weight_row, block_offset)[0]
-        bits_offset = block_offset + 2
-        q1_base = q1_index * Q1_BLOCK
+    cursor = 0
 
-        for q8_local in range(0, Q1_BLOCK, Q8_BLOCK):
-            q8_base = q1_base + q8_local
-            weight_bits = int.from_bytes(
-                weight_row[bits_offset + q8_local // 8 : bits_offset + q8_local // 8 + 4],
-                "little",
-            )
-            struct.pack_into("<II", out, cursor, weight_bits, 0)
+    for q1_index in range(blocks_per_row):
+        for beat in range(scale_beats):
+            word = 0
+            for local in range(4):
+                lane = beat * 4 + local
+                scale = 0
+                if lane < row_count:
+                    block_offset = (
+                        (row_start + lane) * weight_row_bytes
+                        + q1_index * Q1_BLOCK_BYTES
+                    )
+                    scale = struct.unpack_from("<H", weights, block_offset)[0]
+                word |= scale << (local * 16)
+            struct.pack_into("<Q", out, cursor, word)
             cursor += 8
 
+        for q8_local in range(0, Q1_BLOCK, Q8_BLOCK):
+            q8_base = q1_index * Q1_BLOCK + q8_local
             out[cursor : cursor + Q8_BLOCK] = bytes(
                 quant & 0xFF for quant in act_quants[q8_base : q8_base + Q8_BLOCK]
             )
             cursor += Q8_BLOCK
 
-            struct.pack_into(
-                "<HHI",
-                out,
-                cursor,
-                weight_scale_bits,
-                act_scale_bits[q8_base // Q8_BLOCK],
-                0,
-            )
+            struct.pack_into("<Q", out, cursor, act_scale_bits[q8_base // Q8_BLOCK])
             cursor += 8
+
+            for beat in range(wbits_beats):
+                word = 0
+                for local in range(2):
+                    lane = beat * 2 + local
+                    bits = 0
+                    if lane < row_count:
+                        block_offset = (
+                            (row_start + lane) * weight_row_bytes
+                            + q1_index * Q1_BLOCK_BYTES
+                        )
+                        bits_offset = block_offset + 2 + q8_local // 8
+                        bits = int.from_bytes(weights[bits_offset : bits_offset + 4], "little")
+                    word |= bits << (local * 32)
+                struct.pack_into("<Q", out, cursor, word)
+                cursor += 8
 
 
 class PLMatmulQ1A8:
@@ -167,6 +189,7 @@ class PLMatmulQ1A8:
         self._buf = None
         self._buf_size = 0
         self._np = None
+        self._rows_per_block = ROWS_PER_BLOCK
 
     def run(self, allocator: TensorAllocator, op: dict[str, Any], timer: Timer) -> None:
         rows = _required(op, F_ROWS)
@@ -185,7 +208,6 @@ class PLMatmulQ1A8:
         weight_nbytes = rows * weight_row_bytes
         act_nbytes = cols * k * F32_BYTES
         dst_nbytes = rows * cols * F32_BYTES
-        packed_nbytes = (k // Q8_BLOCK) * SUBBLOCK_BYTES
 
         with timer.section("read"):
             weights = allocator.read(
@@ -201,31 +223,45 @@ class PLMatmulQ1A8:
         timer.add("bytes_read", weight_nbytes + act_nbytes)
 
         self._check_kernel_id()
+        rows_per_block = self._read_rows_per_block()
+        packed_nbytes = _rowblock_nbytes(k, rows_per_block)
         self._ensure_buffer(packed_nbytes)
+
         packed = bytearray(packed_nbytes)
         out = bytearray(dst_nbytes)
         total_cycles = 0
-        cells = rows * cols
+        rowblocks = 0
 
         for col in range(cols):
             with timer.section("quantize"):
                 act_values = struct.unpack_from(f"<{k}f", acts, col * k * F32_BYTES)
                 act_quants, act_scale_bits = _quantize_q8_0(act_values)
 
-            for row in range(rows):
-                row_start = row * weight_row_bytes
+            for row_start in range(0, rows, rows_per_block):
+                row_count = min(rows_per_block, rows - row_start)
                 with timer.section("pack"):
-                    _pack_cell_into(
+                    _pack_rowblock_into(
                         packed,
-                        weights[row_start : row_start + weight_row_bytes],
+                        weights,
+                        row_start,
+                        row_count,
+                        weight_row_bytes,
                         act_quants,
                         act_scale_bits,
                         k,
+                        rows_per_block,
                     )
 
-                result_bits, cycles = self._run_cell(packed, timer)
+                result_bits, cycles = self._run_rowblock(packed, row_count, blocks_per_row, timer)
                 total_cycles += cycles
-                struct.pack_into("<I", out, (col * rows + row) * F32_BYTES, result_bits)
+                rowblocks += 1
+                for lane, bits in enumerate(result_bits):
+                    struct.pack_into(
+                        "<I",
+                        out,
+                        (col * rows + row_start + lane) * F32_BYTES,
+                        bits,
+                    )
 
         with timer.section("write"):
             allocator.write(
@@ -234,17 +270,24 @@ class PLMatmulQ1A8:
                 out,
             )
         timer.add("bytes_written", dst_nbytes)
-        timer.add("cells", cells)
-        timer.add("dma_bytes_read", cells * packed_nbytes)
+        timer.add("rowblocks", rowblocks)
+        timer.add("dma_bytes_read", rowblocks * packed_nbytes)
         timer.add("kernel_cycles", total_cycles)
 
     def _check_kernel_id(self) -> None:
         got_id = self._kernel.read(REG_ID)
         got_version = self._kernel.read(REG_VERSION)
         if isinstance(got_id, int) and got_id != EXPECTED_ID:
-            raise RuntimeError(f"q1a8 kernel ID mismatch: got 0x{got_id:08x}")
+            raise RuntimeError(f"q1a8 rowblock kernel ID mismatch: got 0x{got_id:08x}")
         if isinstance(got_version, int) and got_version != EXPECTED_VERSION:
-            raise RuntimeError(f"q1a8 kernel version mismatch: got {got_version}")
+            raise RuntimeError(f"q1a8 rowblock kernel version mismatch: got {got_version}")
+
+    def _read_rows_per_block(self) -> int:
+        rows_per_block = int(self._kernel.read(REG_ROWS))
+        if rows_per_block != ROWS_PER_BLOCK:
+            raise RuntimeError(f"q1a8 rowblock lanes mismatch: got {rows_per_block}")
+        self._rows_per_block = rows_per_block
+        return rows_per_block
 
     def _ensure_buffer(self, nbytes: int) -> None:
         if self._buf is not None and self._buf_size >= nbytes:
@@ -259,7 +302,13 @@ class PLMatmulQ1A8:
         self._buf = allocate(shape=(nbytes,), dtype=np.uint8)
         self._buf_size = nbytes
 
-    def _run_cell(self, packed: bytearray, timer: Timer) -> tuple[int, int]:
+    def _run_rowblock(
+        self,
+        packed: bytearray,
+        row_count: int,
+        num_q1_blocks: int,
+        timer: Timer,
+    ) -> tuple[list[int], int]:
         nbytes = len(packed)
         assert self._buf is not None
         assert self._np is not None
@@ -269,15 +318,13 @@ class PLMatmulQ1A8:
             self._buf.flush()
 
         with timer.section("kernel_setup"):
-            self._kernel.write(REG_NUM_SUBBLOCKS, nbytes // SUBBLOCK_BYTES)
+            self._kernel.write(REG_NUM_Q1_BLOCKS, num_q1_blocks)
+            self._kernel.write(REG_ROW_COUNT, row_count)
 
         view = self._buf[:nbytes]
         with timer.section("dma_start"):
             self._dma.sendchannel.transfer(view)
 
-        # Arm DMA first, then start the kernel. The DMA may deliver the first
-        # packed sub-block and stall until the streamer becomes ready; this
-        # keeps PS setup time out of the kernel CYCLES register.
         with timer.section("kernel_start"):
             self._kernel.write(REG_CTRL, CTRL_START)
 
@@ -291,9 +338,12 @@ class PLMatmulQ1A8:
                 if status & STATUS_DONE:
                     break
             else:
-                raise RuntimeError(f"q1a8 kernel never reported done (status=0x{status:08x})")
+                raise RuntimeError(f"q1a8 rowblock kernel never reported done (status=0x{status:08x})")
 
+        results: list[int] = []
         with timer.section("result_read"):
-            result_bits = int(self._kernel.read(REG_RESULT)) & 0xFFFF_FFFF
+            for lane in range(row_count):
+                self._kernel.write(REG_RESULT_INDEX, lane)
+                results.append(int(self._kernel.read(REG_RESULT)) & 0xFFFF_FFFF)
             cycles = int(self._kernel.read(REG_CYCLES))
-        return result_bits, cycles
+        return results, cycles

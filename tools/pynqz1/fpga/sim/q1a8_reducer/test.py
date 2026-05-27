@@ -15,7 +15,7 @@ import struct
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge
+from cocotb.triggers import ReadOnly, RisingEdge
 
 CLK_PERIOD_NS = 10  # 100 MHz, matches FCLK_CLK0
 
@@ -130,8 +130,13 @@ async def drive_one(
     dut.valid_in.value = 1
     await RisingEdge(dut.clk)
     dut.valid_in.value = 0
+    await RisingEdge(dut.clk)
     await RisingEdge(dut.clk)   # output latches here
-    return int(dut.contribution.value), int(dut.valid_out.value)
+    await ReadOnly()
+    contribution = int(dut.contribution.value)
+    valid_out = int(dut.valid_out.value)
+    await RisingEdge(dut.clk)
+    return contribution, valid_out
 
 
 def _diff_msg(label, got, want, sub_sum, ws_h, as_h) -> str:
@@ -222,4 +227,4 @@ async def test_random(dut):
     if failures:
         for f in failures:
             cocotb.log.error(f)
-        assert False, f"{len(failures)} of {trials} trials mismatched"
+        raise AssertionError(f"{len(failures)} of {trials} trials mismatched")

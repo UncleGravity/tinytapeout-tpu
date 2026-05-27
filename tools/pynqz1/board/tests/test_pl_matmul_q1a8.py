@@ -24,38 +24,60 @@ def test_quantize_q8_0_matches_golden():
     ]
 
 
-def test_pack_cell_matches_axis_format():
-    weight_scale = 0x1234
-    weight_bits = bytes(range(Q1_BLOCK // 8))
-    weight_row = struct.pack("<H", weight_scale) + weight_bits
-    assert len(weight_row) == Q1_BLOCK_BYTES
+def test_pack_rowblock_matches_axis_format():
+    row_count = 3
+    weight_row_bytes = Q1_BLOCK_BYTES
+    weights = bytearray()
+    row_bits = []
+    for row in range(row_count):
+        weight_scale = 0x1234 + row
+        bits = bytes((row * 17 + i) & 0xFF for i in range(Q1_BLOCK // 8))
+        row_bits.append(bits)
+        weights += struct.pack("<H", weight_scale) + bits
 
     act_quants = [i - 64 for i in range(Q1_BLOCK)]
     act_scale_bits = [0x2000, 0x2001, 0x2002, 0x2003]
-    packed = bytearray((Q1_BLOCK // Q8_BLOCK) * matmul_q1a8.SUBBLOCK_BYTES)
+    packed = bytearray(matmul_q1a8._rowblock_nbytes(Q1_BLOCK))
 
-    matmul_q1a8._pack_cell_into(
+    matmul_q1a8._pack_rowblock_into(
         packed,
-        weight_row,
+        bytes(weights),
+        0,
+        row_count,
+        weight_row_bytes,
         act_quants,
         act_scale_bits,
         Q1_BLOCK,
     )
 
+    scale_beats = (matmul_q1a8.ROWS_PER_BLOCK + 3) // 4
+    wbits_beats = (matmul_q1a8.ROWS_PER_BLOCK + 1) // 2
+    assert packed[:8] == struct.pack("<Q", 0x1234 | (0x1235 << 16) | (0x1236 << 32))
+    assert packed[8 : scale_beats * 8] == bytes((scale_beats - 1) * 8)
+
+    cursor = scale_beats * 8
     for q8_index in range(Q1_BLOCK // Q8_BLOCK):
-        base = q8_index * matmul_q1a8.SUBBLOCK_BYTES
-        bit_base = q8_index * 4
-        expected_bits = int.from_bytes(weight_bits[bit_base : bit_base + 4], "little")
-        assert packed[base : base + 8] == struct.pack("<II", expected_bits, 0)
-        assert packed[base + 8 : base + 40] == bytes(
+        bit_base = q8_index * (Q8_BLOCK // 8)
+        assert packed[cursor : cursor + Q8_BLOCK] == bytes(
             value & 0xFF for value in act_quants[q8_index * Q8_BLOCK : (q8_index + 1) * Q8_BLOCK]
         )
-        assert packed[base + 40 : base + 48] == struct.pack(
-            "<HHI",
-            weight_scale,
-            act_scale_bits[q8_index],
-            0,
-        )
+        cursor += Q8_BLOCK
+
+        assert packed[cursor : cursor + 8] == struct.pack("<Q", act_scale_bits[q8_index])
+        cursor += 8
+
+        for beat in range(wbits_beats):
+            word = 0
+            for local in range(2):
+                lane = beat * 2 + local
+                bits = 0
+                if lane < row_count:
+                    bits = int.from_bytes(row_bits[lane][bit_base : bit_base + 4], "little")
+                word |= bits << (local * 32)
+            assert packed[cursor : cursor + 8] == struct.pack("<Q", word)
+            cursor += 8
+
+    assert cursor == len(packed)
 
 
 def test_register_all_registers_matmul_only_for_matmul_overlay():

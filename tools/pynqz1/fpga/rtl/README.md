@@ -9,7 +9,7 @@ all gets reused across multiple downstream consumers.
 
 | Folder       | What                                                          |
 |--------------|---------------------------------------------------------------|
-| `q1a8/`      | the W1A8 compute pipeline (reducer -> cell -> streamer -> kernel) plus the shared fp16/int/fp32 helpers |
+| `q1a8/`      | the W1A8 rowblock compute pipeline plus the shared fp16/int/fp32 helpers |
 | `common/`    | generic plumbing reusable across designs (AXI-Lite slave skeletons, etc.) |
 
 ## Consumers

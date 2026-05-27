@@ -1,24 +1,16 @@
-// q1a8_kernel_top - synthesizable Vivado top for the W1A8 matmul kernel.
-//
-// Wraps q1a8_kernel with a small AXI4-Lite slave register file and exposes:
-//   - AXI4-Lite control plane (host reads/writes registers via the PS GP0)
-//   - AXI4-Stream data input (one Q8 sub-block per 6 beats from an AXI DMA)
+// q1a8_kernel_top - PYNQ bitstream top for the rowblock Q1A8 kernel.
 //
 // Register map (32-bit aligned, byte offsets):
-//   0x00  ID             RO  0xB05A_1000
-//   0x04  VERSION        RO  0x0000_0001
-//   0x08  CTRL           RW  bit[0] = start-kernel strobe (writes only)
+//   0x00  ID             RO  0xB05A_2000
+//   0x04  VERSION        RO  0x0000_0002
+//   0x08  CTRL           WO  bit[0] = start-kernel strobe
 //   0x0C  STATUS         RO  bit[0] = busy, bit[1] = done_latched
-//   0x10  NUM_SUBBLOCKS  RW  how many Q8 sub-blocks for the next kernel
-//   0x14  RESULT         RO  fp32 accumulator from the last kernel
-//   0x18  CYCLES         RO  cycle count of the last kernel (perf counter)
-//
-// `done_latched` captures the 1-cycle `kernel_done` pulse so the host can
-// poll it without missing the event. It clears on the next start strobe.
-//
-// AXI-Lite slave is hand-rolled here (same handshake pattern as the
-// axi_lite_probe). When a third bitstream needs an AXI-Lite slave it'll be
-// worth extracting a generic skeleton to rtl/common/.
+//   0x10  NUM_Q1_BLOCKS  RW  K / 128
+//   0x14  ROW_COUNT      RW  active lanes in this rowblock (1..ROWS)
+//   0x18  RESULT_INDEX   RW  lane index to read through RESULT
+//   0x1C  RESULT         RO  fp32 result bits for RESULT_INDEX
+//   0x20  CYCLES         RO  busy-cycle count from the last kernel
+//   0x24  ROWS           RO  lanes per rowblock
 
 `default_nettype none
 
@@ -30,7 +22,6 @@ module q1a8_kernel_top (
     (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
     input  wire         s_axi_aresetn,
 
-    // -- AXI4-Lite slave (control) -----------------------------------------
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI AWADDR" *)
     input  wire [7:0]   s_axi_awaddr,
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI AWPROT" *)
@@ -70,12 +61,6 @@ module q1a8_kernel_top (
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI RREADY" *)
     input  wire         s_axi_rready,
 
-    // -- AXI4-Stream slave (data) ------------------------------------------
-    // TKEEP and TLAST are accepted but ignored: the AXI DMA's MM2S master
-    // always drives them, and Vivado's IP integrator wants them present on
-    // the slave side so it can recognize the bus as an inferred AXIS
-    // interface. We're committed to 64-bit aligned beats and use
-    // NUM_SUBBLOCKS (not TLAST) as the end-of-stream signal.
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS TDATA" *)
     input  wire [63:0]  s_axis_tdata,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS TKEEP" *)
@@ -87,59 +72,67 @@ module q1a8_kernel_top (
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS TLAST" *)
     input  wire         s_axis_tlast
 );
+    localparam integer ROWS = 8;
+    localparam [7:0] ROWS_U8 = 8'd8;
+
+    localparam [31:0] ID_VALUE      = 32'hB05A_2000;
+    localparam [31:0] VERSION_VALUE = 32'h0000_0002;
+
     wire clk   = s_axi_aclk;
     wire rst_n = s_axi_aresetn;
 
-    // -- Register map constants -----------------------------------------
-    localparam [4:0] ADDR_ID            = 5'h00;
-    localparam [4:0] ADDR_VERSION       = 5'h04;
-    localparam [4:0] ADDR_CTRL          = 5'h08;
-    localparam [4:0] ADDR_STATUS        = 5'h0C;
-    localparam [4:0] ADDR_NUM_SUBBLOCKS = 5'h10;
-    localparam [4:0] ADDR_RESULT        = 5'h14;
-    localparam [4:0] ADDR_CYCLES        = 5'h18;
-
-    localparam [31:0] ID_VALUE      = 32'hB05A_1000;
-    localparam [31:0] VERSION_VALUE = 32'h0000_0001;
-
-    // -- Control storage ------------------------------------------------
-    reg [15:0] num_subblocks_q;
-    reg        start_strobe;     // 1-cycle pulse; not stored persistently
+    reg [15:0] num_q1_blocks_q;
+    reg [7:0]  row_count_q;
+    reg [7:0]  result_index_q;
+    reg        start_strobe;
     reg        done_latched;
     reg [31:0] cycle_count_q;
 
-    // -- Kernel instance -------------------------------------------------
-    wire        kernel_busy;
-    wire        kernel_done;
-    wire [31:0] kernel_result;
+    wire kernel_busy;
+    wire kernel_done;
+    wire [ROWS*32-1:0] kernel_results;
 
-    q1a8_kernel u_kernel (
-        .clk(clk), .rst_n(rst_n),
+    q1a8_kernel #(.ROWS(ROWS)) u_kernel (
+        .clk(clk),
+        .rst_n(rst_n),
         .start_kernel(start_strobe),
-        .num_subblocks(num_subblocks_q),
+        .num_q1_blocks(num_q1_blocks_q),
+        .row_count(row_count_q),
         .kernel_done(kernel_done),
         .busy(kernel_busy),
-        .result(kernel_result),
+        .results_flat(kernel_results),
         .s_axis_tdata(s_axis_tdata),
         .s_axis_tvalid(s_axis_tvalid),
         .s_axis_tready(s_axis_tready)
     );
 
-    // -- done_latched: capture the 1-cycle pulse; clear on next start ---
+    reg [31:0] selected_result;
+    always @(*) begin
+        case (result_index_q[2:0])
+            3'd0: selected_result = kernel_results[  0 +: 32];
+            3'd1: selected_result = kernel_results[ 32 +: 32];
+            3'd2: selected_result = kernel_results[ 64 +: 32];
+            3'd3: selected_result = kernel_results[ 96 +: 32];
+            3'd4: selected_result = kernel_results[128 +: 32];
+            3'd5: selected_result = kernel_results[160 +: 32];
+            3'd6: selected_result = kernel_results[192 +: 32];
+            3'd7: selected_result = kernel_results[224 +: 32];
+            default: selected_result = 32'd0;
+        endcase
+    end
+
     always @(posedge clk) begin
         if (!rst_n)            done_latched <= 1'b0;
         else if (start_strobe) done_latched <= 1'b0;
         else if (kernel_done)  done_latched <= 1'b1;
     end
 
-    // -- Cycle counter (free profiling) --------------------------------
     always @(posedge clk) begin
         if (!rst_n)            cycle_count_q <= 32'd0;
         else if (start_strobe) cycle_count_q <= 32'd0;
         else if (kernel_busy)  cycle_count_q <= cycle_count_q + 32'd1;
     end
 
-    // -- AXI4-Lite handshake (write path) -------------------------------
     reg awready_q, wready_q, bvalid_q;
     reg [7:0] awaddr_q;
 
@@ -147,58 +140,48 @@ module q1a8_kernel_top (
         !awready_q && !wready_q && s_axi_awvalid && s_axi_wvalid && !bvalid_q;
     wire write_commit = awready_q && wready_q;
 
-    function [31:0] apply_wstrb;
-        input [31:0] current;
-        input [31:0] wdata;
-        input [3:0]  wstrb;
-        begin
-            apply_wstrb = {
-                wstrb[3] ? wdata[31:24] : current[31:24],
-                wstrb[2] ? wdata[23:16] : current[23:16],
-                wstrb[1] ? wdata[15:8]  : current[15:8],
-                wstrb[0] ? wdata[7:0]   : current[7:0]
-            };
-        end
-    endfunction
-
     always @(posedge clk) begin
         if (!rst_n) begin
             awready_q       <= 1'b0;
             wready_q        <= 1'b0;
             bvalid_q        <= 1'b0;
             awaddr_q        <= 8'd0;
-            num_subblocks_q <= 16'd0;
+            num_q1_blocks_q <= 16'd0;
+            row_count_q     <= ROWS_U8;
+            result_index_q  <= 8'd0;
             start_strobe    <= 1'b0;
         end else begin
-            // start_strobe is always a single-cycle pulse; default low.
             start_strobe <= 1'b0;
 
             awready_q <= write_accept;
             wready_q  <= write_accept;
             if (write_accept) awaddr_q <= s_axi_awaddr;
 
-            if (write_commit)                       bvalid_q <= 1'b1;
-            else if (bvalid_q && s_axi_bready)      bvalid_q <= 1'b0;
+            if (write_commit)                  bvalid_q <= 1'b1;
+            else if (bvalid_q && s_axi_bready) bvalid_q <= 1'b0;
 
-            // Register writes (RO regs silently drop).
             if (write_commit) begin
-                case (awaddr_q[4:0])
-                    ADDR_CTRL: begin
-                        // bit[0] is a write-only strobe (does not latch into a reg).
+                case (awaddr_q[5:0])
+                    6'h08: begin
                         if (s_axi_wstrb[0] && s_axi_wdata[0])
                             start_strobe <= 1'b1;
                     end
-                    ADDR_NUM_SUBBLOCKS: begin
-                        if (s_axi_wstrb[0]) num_subblocks_q[7:0]  <= s_axi_wdata[7:0];
-                        if (s_axi_wstrb[1]) num_subblocks_q[15:8] <= s_axi_wdata[15:8];
+                    6'h10: begin
+                        if (s_axi_wstrb[0]) num_q1_blocks_q[7:0]  <= s_axi_wdata[7:0];
+                        if (s_axi_wstrb[1]) num_q1_blocks_q[15:8] <= s_axi_wdata[15:8];
                     end
-                    default: /* RO or unmapped: drop silently */ ;
+                    6'h14: begin
+                        if (s_axi_wstrb[0]) row_count_q <= s_axi_wdata[7:0];
+                    end
+                    6'h18: begin
+                        if (s_axi_wstrb[0]) result_index_q <= s_axi_wdata[7:0];
+                    end
+                    default: ;
                 endcase
             end
         end
     end
 
-    // -- AXI4-Lite handshake (read path) --------------------------------
     reg        arready_q, rvalid_q;
     reg [31:0] rdata_q;
 
@@ -213,15 +196,18 @@ module q1a8_kernel_top (
             arready_q <= read_accept;
             if (read_accept) begin
                 rvalid_q <= 1'b1;
-                case (s_axi_araddr[4:0])
-                    ADDR_ID:            rdata_q <= ID_VALUE;
-                    ADDR_VERSION:       rdata_q <= VERSION_VALUE;
-                    ADDR_CTRL:          rdata_q <= 32'd0;             // strobe reads as 0
-                    ADDR_STATUS:        rdata_q <= {30'd0, done_latched, kernel_busy};
-                    ADDR_NUM_SUBBLOCKS: rdata_q <= {16'd0, num_subblocks_q};
-                    ADDR_RESULT:        rdata_q <= kernel_result;
-                    ADDR_CYCLES:        rdata_q <= cycle_count_q;
-                    default:            rdata_q <= 32'd0;
+                case (s_axi_araddr[5:0])
+                    6'h00: rdata_q <= ID_VALUE;
+                    6'h04: rdata_q <= VERSION_VALUE;
+                    6'h08: rdata_q <= 32'd0;
+                    6'h0C: rdata_q <= {30'd0, done_latched, kernel_busy};
+                    6'h10: rdata_q <= {16'd0, num_q1_blocks_q};
+                    6'h14: rdata_q <= {24'd0, row_count_q};
+                    6'h18: rdata_q <= {24'd0, result_index_q};
+                    6'h1C: rdata_q <= selected_result;
+                    6'h20: rdata_q <= cycle_count_q;
+                    6'h24: rdata_q <= ROWS;
+                    default: rdata_q <= 32'd0;
                 endcase
             end else if (rvalid_q && s_axi_rready) begin
                 rvalid_q <= 1'b0;
@@ -229,15 +215,21 @@ module q1a8_kernel_top (
         end
     end
 
-    // -- Outputs -------------------------------------------------------
     assign s_axi_awready = awready_q;
     assign s_axi_wready  = wready_q;
-    assign s_axi_bvalid  = bvalid_q;
     assign s_axi_bresp   = 2'b00;
+    assign s_axi_bvalid  = bvalid_q;
     assign s_axi_arready = arready_q;
-    assign s_axi_rvalid  = rvalid_q;
     assign s_axi_rdata   = rdata_q;
     assign s_axi_rresp   = 2'b00;
+    assign s_axi_rvalid  = rvalid_q;
 
-    wire _unused = &{s_axi_awprot, s_axi_arprot, s_axis_tkeep, s_axis_tlast, 1'b0};
+    wire _unused = &{
+        1'b0,
+        s_axi_awprot,
+        s_axi_arprot,
+        s_axis_tkeep,
+        s_axis_tlast
+    };
+
 endmodule

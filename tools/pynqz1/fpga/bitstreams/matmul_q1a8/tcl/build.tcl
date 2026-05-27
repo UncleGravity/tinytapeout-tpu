@@ -36,9 +36,7 @@ foreach v {
     fp32_mul.v
     fp32_add.v
     q1a8_reducer.v
-    q1a8_cell.v
-    q1a8_streamer.v
-    axis_to_subblock.v
+    q1a8_rowblock.v
     q1a8_kernel.v
     q1a8_kernel_top.v
 } {

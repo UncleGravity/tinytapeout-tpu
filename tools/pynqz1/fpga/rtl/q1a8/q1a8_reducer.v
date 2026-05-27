@@ -6,21 +6,19 @@
 //   - fp16 weight_scale  (constant across the 4 Q8 sub-blocks of one Q1 block)
 //   - fp16 act_scale     (varies per Q8 sub-block)
 //
-// and produces (one cycle later)
+// and produces (two cycles later)
 //
 //   contribution = (fp32) weight_scale * act_scale * Sigma_i (b_i ? +a_i : -a_i)
 //
 // which is exactly one term in the Q1A8 matmul inner sum from
 // tests/golden/kernels.py:matmul_q1a8. An outer module accumulates these
-// contributions into one output cell over K/32 cycles.
+// contributions into one output lane over K/32 cycles.
 //
 // All math after the integer reduce is fp32 (round-toward-zero - see
-// fp32_mul.v). The combinational depth is dominated by the 32-wide signed
-// add tree plus two fp32 multiplies; tight at 100 MHz but fine for sim.
-// When timing closes badly, the natural place to add pipeline stages is
-// before/after `combined_f32` and before `contribution`.
+// fp32_mul.v). The two fp32 multiplies are separated by a register stage
+// so the rowblock version can close timing when several lanes are replicated.
 //
-// Latency:    1 cycle (inputs latched on rising edge, output valid next edge)
+// Latency:    2 cycles
 // Throughput: 1 sub-block / cycle
 
 `default_nettype none
@@ -66,22 +64,61 @@ module q1a8_reducer (
     // -- Format conversion -------------------------------------------------
     wire [31:0] weight_scale_f32;
     wire [31:0] act_scale_f32;
-    wire [31:0] sub_sum_f32;
 
     fp16_to_fp32 u_ws  (.in(weight_scale), .out(weight_scale_f32));
     fp16_to_fp32 u_as  (.in(act_scale),    .out(act_scale_f32));
-    int_to_fp32 #(.WIDTH(14)) u_int (.in(sub_sum), .out(sub_sum_f32));
 
-    // -- fp32 multiplies ---------------------------------------------------
+    // -- Pipeline stage 1 --------------------------------------------------
+    reg         valid_s1;
+    reg [31:0] weight_scale_f32_s1;
+    reg [31:0] act_scale_f32_s1;
+    reg signed [13:0] sub_sum_s1;
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            valid_s1            <= 1'b0;
+            weight_scale_f32_s1 <= 32'd0;
+            act_scale_f32_s1    <= 32'd0;
+            sub_sum_s1          <= 14'sd0;
+        end else begin
+            valid_s1            <= valid_in;
+            weight_scale_f32_s1 <= weight_scale_f32;
+            act_scale_f32_s1    <= act_scale_f32;
+            sub_sum_s1          <= sub_sum;
+        end
+    end
+
+    // -- Pipeline stage 2 --------------------------------------------------
     // Fold the two scales first so the mantissa product is the small one
     // (scale * scale). Then multiply by sub_sum_f32 - this is the larger-
-    // magnitude factor and lives on the critical path.
+    // magnitude factor.
     wire [31:0] combined_f32;
+    wire [31:0] sub_sum_f32;
+
+    fp32_mul u_combine (.a(weight_scale_f32_s1), .b(act_scale_f32_s1),
+                        .out(combined_f32));
+    int_to_fp32 #(.WIDTH(14)) u_int (.in(sub_sum_s1), .out(sub_sum_f32));
+
+    reg         valid_s2;
+    reg [31:0] combined_f32_s2;
+    reg [31:0] sub_sum_f32_s2;
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            valid_s2        <= 1'b0;
+            combined_f32_s2 <= 32'd0;
+            sub_sum_f32_s2  <= 32'd0;
+        end else begin
+            valid_s2        <= valid_s1;
+            combined_f32_s2 <= combined_f32;
+            sub_sum_f32_s2  <= sub_sum_f32;
+        end
+    end
+
+    // -- Pipeline stage 3 --------------------------------------------------
     wire [31:0] contribution_comb;
 
-    fp32_mul u_combine (.a(weight_scale_f32), .b(act_scale_f32),
-                        .out(combined_f32));
-    fp32_mul u_contrib (.a(combined_f32),     .b(sub_sum_f32),
+    fp32_mul u_contrib (.a(combined_f32_s2),  .b(sub_sum_f32_s2),
                         .out(contribution_comb));
 
     // -- Output register ---------------------------------------------------
@@ -90,7 +127,7 @@ module q1a8_reducer (
             valid_out    <= 1'b0;
             contribution <= 32'd0;
         end else begin
-            valid_out    <= valid_in;
+            valid_out    <= valid_s2;
             contribution <= contribution_comb;
         end
     end

@@ -10,7 +10,7 @@
 // of small scales and bounded sub_sums, the running sum stays finite, and
 // there's no need to model Inf/NaN.
 //
-// Pairs with the Python `fp32_add_trunc` in test_q1a8_cell.py - both
+// Pairs with the Python `fp32_add_trunc` in the q1a8 kernel tests - both
 // follow exactly the same code path so the comparison is bit-exact.
 
 `default_nettype none

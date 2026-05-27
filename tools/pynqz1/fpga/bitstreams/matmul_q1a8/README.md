@@ -1,8 +1,9 @@
-# matmul_q1a8
+# matmul_q1a8 rowblock
 
-The W1A8 matmul bitstream. One Q1A8 output cell per kernel kick, driven by:
+The W1A8 matmul bitstream. One kernel kick computes up to 8 output rows for
+one activation column, driven by:
 - **AXI4-Lite control** plane (host writes registers via the PS GP0)
-- **AXI4-Stream data** plane (host streams 48-byte packed sub-blocks via AXI DMA -> HP0)
+- **AXI4-Stream data** plane (host streams rowblock-packed data via AXI DMA -> HP0)
 
 ## Topology
 
@@ -19,26 +20,29 @@ See `../../rtl/q1a8/q1a8_kernel_top.v` for the authoritative definitions.
 
 | Offset | Name           | Access | Meaning                              |
 |--------|----------------|--------|--------------------------------------|
-| 0x00   | ID             | RO     | `0xB05A_1000`                        |
-| 0x04   | VERSION        | RO     | `0x0000_0001`                        |
+| 0x00   | ID             | RO     | `0xB05A_2000`                        |
+| 0x04   | VERSION        | RO     | `0x0000_0002`                        |
 | 0x08   | CTRL           | RW     | `bit[0]` = start-kernel strobe       |
 | 0x0C   | STATUS         | RO     | `bit[0]` busy, `bit[1]` done_latched |
-| 0x10   | NUM_SUBBLOCKS  | RW     | K/32 for the next kernel             |
-| 0x14   | RESULT         | RO     | fp32 accumulator                     |
-| 0x18   | CYCLES         | RO     | cycles taken by the last kernel      |
+| 0x10   | NUM_Q1_BLOCKS  | RW     | K/128 for the next rowblock          |
+| 0x14   | ROW_COUNT      | RW     | active lanes in this rowblock        |
+| 0x18   | RESULT_INDEX   | RW     | lane index read through RESULT       |
+| 0x1C   | RESULT         | RO     | fp32 result for RESULT_INDEX         |
+| 0x20   | CYCLES         | RO     | cycles taken by the last kernel      |
+| 0x24   | ROWS           | RO     | lanes per rowblock                   |
 
-## Sub-block byte layout (host packs this into DDR, DMA streams it)
+## Stream layout
 
-48 bytes per sub-block. See `pack_subblock_bytes` in `bench.py`.
+For each Q1 block:
 
-| Offset (bytes) | Field                                             |
-|----------------|---------------------------------------------------|
-| 0..3           | `weight_bits[31:0]`                               |
-| 4..7           | (reserved, write 0)                               |
-| 8..39          | `acts[0..31]` (32 int8s, little-endian per byte)  |
-| 40..41         | `weight_scale` (fp16)                             |
-| 42..43         | `act_scale` (fp16)                                |
-| 44..47         | (reserved, write 0)                               |
+- `ceil(ROWS/4)` beats of fp16 weight scales, four rows per beat.
+- Four Q8 sub-block groups, each with:
+  - four activation beats (`32 x int8`)
+  - one activation-scale beat
+  - `ceil(ROWS/2)` beats of uint32 weight bits, two rows per beat
+
+For `ROWS=8`, one Q1 block is 304 bytes instead of 8 independent single-cell
+streams at 1536 bytes.
 
 ## Build
 
@@ -53,21 +57,15 @@ Vivado VM so the tcl can `add_files [file join $proj_root rtl q1a8 *.v]`.
 ## Run on the board
 
 ```sh
-# Sanity: ID/VERSION + one K=2048 kernel against the truncating-fp32 golden.
+# Sanity: ID/VERSION + one K=2048 rowblock against the truncating-fp32 golden.
 ssh -t xilinx@pynq sudo env XILINX_XRT=/usr \
   /usr/local/share/pynq-venv/bin/python \
   ~/pynqz1/fpga/bitstreams/matmul_q1a8/bench.py verify
 ```
 
 ```sh
-# Throughput: 1000 back-to-back kernels, report PS-side us/kernel + PL cycles.
+# Throughput: 1000 back-to-back rowblocks, report PS-side us/rowblock + PL cycles.
 ssh -t xilinx@pynq sudo env XILINX_XRT=/usr \
   /usr/local/share/pynq-venv/bin/python \
   ~/pynqz1/fpga/bitstreams/matmul_q1a8/bench.py bench --iters 1000
 ```
-
-The `bench` output separates **PL compute** (from the CYCLES register, free
-perf counter) from **PS overhead** (wall time minus PL compute). For the
-first iteration we expect PS overhead to dominate - that's the signal
-that the next optimization target is reducing per-kernel host work
-(batched commands, descriptor-driven kernels, etc.).
