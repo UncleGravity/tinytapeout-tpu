@@ -1,14 +1,16 @@
-// q1a8_kernel_top - PYNQ bitstream top for the multi-rowblock Q1A8 kernel.
+// q1a8_kernel_top - PYNQ bitstream top for the dual-stream Q1A8 kernel (v4).
 //
-// One host command drives a full matmul: PS sets NUM_Q1_BLOCKS and
-// NUM_ROWBLOCKS, then strobes CTRL.start. The kernel autonomously processes
-// all rowblocks, emitting fp32 results as a 64-bit AXI-Stream burst to the
-// S2MM DMA. Per rowblock: 4 beats of 64-bit data (lane-major, 2 fp32/beat).
-// Total burst size = NUM_ROWBLOCKS * 32 bytes.
+// One host command drives a full matmul column: PS sets NUM_Q1_BLOCKS and
+// NUM_ROWBLOCKS, then strobes CTRL.start. The kernel reads acts (once,
+// shared across rowblocks) via S_AXIS_ACTS, then walks rowblocks via
+// S_AXIS for the weight stream. Results stream out the M_AXIS master.
+//
+// Per rowblock: 4 beats of 64-bit data (lane-major, 2 fp32/beat). Total
+// result burst = NUM_ROWBLOCKS * 32 bytes.
 //
 // Register map (32-bit aligned, byte offsets):
 //   0x00  ID             RO  0xB05A_2000
-//   0x04  VERSION        RO  0x0000_0003
+//   0x04  VERSION        RO  0x0000_0004  (v4 = dual-stream)
 //   0x08  CTRL           WO  bit[0] = start-kernel strobe
 //   0x0C  STATUS         RO  bit[0] = busy, bit[1] = done_latched
 //   0x10  NUM_Q1_BLOCKS  RW  K / 128
@@ -20,7 +22,7 @@
 
 module q1a8_kernel_top (
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 s_axi_aclk CLK" *)
-    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF S_AXI:S_AXIS:M_AXIS, ASSOCIATED_RESET s_axi_aresetn, FREQ_HZ 100000000" *)
+    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF S_AXI:S_AXIS:S_AXIS_ACTS:M_AXIS, ASSOCIATED_RESET s_axi_aresetn, FREQ_HZ 100000000" *)
     input  wire         s_axi_aclk,
     (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 s_axi_aresetn RST" *)
     (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
@@ -76,6 +78,17 @@ module q1a8_kernel_top (
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS TLAST" *)
     input  wire         s_axis_tlast,
 
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_ACTS TDATA" *)
+    input  wire [63:0]  s_axis_acts_tdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_ACTS TKEEP" *)
+    input  wire [7:0]   s_axis_acts_tkeep,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_ACTS TVALID" *)
+    input  wire         s_axis_acts_tvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_ACTS TREADY" *)
+    output wire         s_axis_acts_tready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_ACTS TLAST" *)
+    input  wire         s_axis_acts_tlast,
+
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 M_AXIS TDATA" *)
     output wire [63:0]  m_axis_tdata,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 M_AXIS TKEEP" *)
@@ -90,7 +103,7 @@ module q1a8_kernel_top (
     localparam integer ROWS = 8;
 
     localparam [31:0] ID_VALUE      = 32'hB05A_2000;
-    localparam [31:0] VERSION_VALUE = 32'h0000_0003;
+    localparam [31:0] VERSION_VALUE = 32'h0000_0004;
 
     wire clk   = s_axi_aclk;
     wire rst_n = s_axi_aresetn;
@@ -115,6 +128,9 @@ module q1a8_kernel_top (
         .s_axis_tdata(s_axis_tdata),
         .s_axis_tvalid(s_axis_tvalid),
         .s_axis_tready(s_axis_tready),
+        .s_axis_acts_tdata(s_axis_acts_tdata),
+        .s_axis_acts_tvalid(s_axis_acts_tvalid),
+        .s_axis_acts_tready(s_axis_acts_tready),
         .m_axis_tdata(m_axis_tdata),
         .m_axis_tvalid(m_axis_tvalid),
         .m_axis_tready(m_axis_tready),
@@ -225,7 +241,9 @@ module q1a8_kernel_top (
         s_axi_awprot,
         s_axi_arprot,
         s_axis_tkeep,
-        s_axis_tlast
+        s_axis_tlast,
+        s_axis_acts_tkeep,
+        s_axis_acts_tlast
     };
 
 endmodule

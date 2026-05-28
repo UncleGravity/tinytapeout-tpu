@@ -108,6 +108,32 @@ int bonsai_q1a8_pack_weights(
     return 0;
 }
 
+int bonsai_q1a8_pack_acts(
+    const int8_t * act_quants,
+    const uint16_t * act_scale_bits,
+    uint32_t k,
+    uint8_t * out) {
+    if (act_quants == NULL || act_scale_bits == NULL || out == NULL) return -1;
+    if (k == 0 || (k % BONSAI_Q1_BLOCK) != 0) return -2;
+
+    const uint32_t blocks_per_row = k / BONSAI_Q1_BLOCK;
+    uint8_t * s = out;
+
+    /* Layout matches the v4 kernel's LOAD_ACTS FSM: per Q1 block, 4 sub-
+     * blocks each = (32 B acts) + (8 B fp16 scale in low 16 bits). */
+    for (uint32_t q1 = 0; q1 < blocks_per_row; ++q1) {
+        for (uint32_t sub = 0; sub < BONSAI_Q1A8_Q8_SUBBLOCKS; ++sub) {
+            const uint32_t q8_idx = q1 * BONSAI_Q1A8_Q8_SUBBLOCKS + sub;
+            memcpy(s, act_quants + (size_t) q8_idx * BONSAI_Q8_BLOCK,
+                BONSAI_Q1A8_ACTS_BYTES);
+            s += BONSAI_Q1A8_ACTS_BYTES;
+            write_le_u64(s, (uint64_t) act_scale_bits[q8_idx]);
+            s += BONSAI_Q1A8_ACT_SCALE_BYTES;
+        }
+    }
+    return 0;
+}
+
 int bonsai_q1a8_merge_acts(
     const uint8_t * packed_weights,
     const int8_t * act_quants,

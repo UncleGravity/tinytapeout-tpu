@@ -1,16 +1,21 @@
 # vivado -mode batch -source tcl/build.tcl
 #
-# matmul_q1a8 bitstream: ps7 + axi_dma (MM2S + S2MM) + q1a8_kernel_top, with
-# the host driving control via the PS GP0 (AXI-Lite) and data via AXI DMA
-# over HP0 (AXI HP). HP0 carries both DMA reads and writes concurrently.
+# matmul_q1a8 bitstream v4: ps7 + two AXI DMAs + q1a8_kernel_top.
+#
+# axi_dma_0 carries the weight stream (MM2S → S_AXIS) and the result
+# stream (S_AXIS → S2MM). axi_dma_1 (MM2S only) carries the per-column
+# acts stream into the kernel's S_AXIS_ACTS port. Both DMAs share HP0.
 #
 # Topology:
-#   ps7/M_AXI_GP0  -> axi_lite_interconnect -> { axi_dma.S_AXI_LITE,
-#                                                q1a8_kernel_top.S_AXI }
-#   axi_dma.M_AXI_MM2S -> axi_mem_interconnect -> ps7/S_AXI_HP0
-#   axi_dma.M_AXIS_MM2S -> q1a8_kernel_top.S_AXIS    (weights + acts stream)
-#   q1a8_kernel_top.M_AXIS -> axi_dma.S_AXIS_S2MM    (fp32 results stream)
-#   axi_dma.M_AXI_S2MM -> axi_mem_interconnect -> ps7/S_AXI_HP0
+#   ps7/M_AXI_GP0 -> axi_lite_interconnect -> { axi_dma_0.S_AXI_LITE,
+#                                               axi_dma_1.S_AXI_LITE,
+#                                               q1a8_kernel_top.S_AXI }
+#   axi_dma_0.M_AXI_MM2S -> axi_mem_interconnect -> ps7/S_AXI_HP0
+#   axi_dma_0.M_AXIS_MM2S -> q1a8_kernel_top.S_AXIS      (weights)
+#   q1a8_kernel_top.M_AXIS -> axi_dma_0.S_AXIS_S2MM      (results)
+#   axi_dma_0.M_AXI_S2MM -> axi_mem_interconnect -> ps7/S_AXI_HP0
+#   axi_dma_1.M_AXI_MM2S -> axi_mem_interconnect -> ps7/S_AXI_HP0
+#   axi_dma_1.M_AXIS_MM2S -> q1a8_kernel_top.S_AXIS_ACTS (acts)
 #
 # build.sh stages this folder AND the shared `rtl/` tree at the Vivado
 # work root, so paths like ../rtl/q1a8/*.v resolve on the VM the same way
@@ -69,7 +74,7 @@ set_property -dict [list CONFIG.C_OPERATION {not} CONFIG.C_SIZE {1}] [get_bd_cel
 create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:* const_1
 set_property -dict [list CONFIG.CONST_VAL {1} CONFIG.CONST_WIDTH {1}] [get_bd_cells const_1]
 
-# AXI DMA - MM2S (stream into kernel) + S2MM (stream results back).
+# AXI DMA 0 - weights MM2S (stream into kernel) + S2MM (results back).
 create_bd_cell -type ip -vlnv xilinx.com:ip:axi_dma:* axi_dma_0
 set_property -dict [list \
     CONFIG.c_include_sg {0} \
@@ -84,13 +89,25 @@ set_property -dict [list \
     CONFIG.c_m_axi_s2mm_data_width {64} \
 ] [get_bd_cells axi_dma_0]
 
-# AXI-Lite interconnect: 1 SI (GP0) -> 2 MI (DMA control + kernel control).
-create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:* axi_lite_interconnect
-set_property -dict [list CONFIG.NUM_MI {2} CONFIG.NUM_SI {1}] [get_bd_cells axi_lite_interconnect]
+# AXI DMA 1 - acts MM2S only (one-shot per matmul column). No S2MM.
+create_bd_cell -type ip -vlnv xilinx.com:ip:axi_dma:* axi_dma_1
+set_property -dict [list \
+    CONFIG.c_include_sg {0} \
+    CONFIG.c_include_mm2s {1} \
+    CONFIG.c_include_s2mm {0} \
+    CONFIG.c_include_mm2s_dre {1} \
+    CONFIG.c_sg_length_width {26} \
+    CONFIG.c_m_axis_mm2s_tdata_width {64} \
+    CONFIG.c_m_axi_mm2s_data_width {64} \
+] [get_bd_cells axi_dma_1]
 
-# Memory interconnect: 2 SI (DMA MM2S + S2MM) -> 1 MI (HP0).
+# AXI-Lite interconnect: 1 SI (GP0) -> 3 MI (DMA0, DMA1, kernel control).
+create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:* axi_lite_interconnect
+set_property -dict [list CONFIG.NUM_MI {3} CONFIG.NUM_SI {1}] [get_bd_cells axi_lite_interconnect]
+
+# Memory interconnect: 3 SI (DMA0 MM2S + S2MM, DMA1 MM2S) -> 1 MI (HP0).
 create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:* axi_mem_interconnect
-set_property -dict [list CONFIG.NUM_MI {1} CONFIG.NUM_SI {2}] [get_bd_cells axi_mem_interconnect]
+set_property -dict [list CONFIG.NUM_MI {1} CONFIG.NUM_SI {3}] [get_bd_cells axi_mem_interconnect]
 
 # Custom kernel top (Vivado infers the AXI-Lite slave + AXIS slave from
 # the X_INTERFACE_INFO attributes in the RTL).
@@ -117,52 +134,66 @@ connect_bd_net [get_bd_pins ps7_0/FCLK_RESET0_N] [get_bd_pins reset_inv_0/Op1]
 connect_bd_net [get_bd_pins reset_inv_0/Res]     [get_bd_pins rst_0/ext_reset_in]
 connect_bd_net [get_bd_pins const_1/dout]        [get_bd_pins rst_0/dcm_locked]
 
-# DMA
+# DMA 0
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]          [get_bd_pins axi_dma_0/s_axi_lite_aclk]
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]          [get_bd_pins axi_dma_0/m_axi_mm2s_aclk]
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]          [get_bd_pins axi_dma_0/m_axi_s2mm_aclk]
 connect_bd_net [get_bd_pins rst_0/peripheral_aresetn] [get_bd_pins axi_dma_0/axi_resetn]
 
+# DMA 1
+connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]          [get_bd_pins axi_dma_1/s_axi_lite_aclk]
+connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]          [get_bd_pins axi_dma_1/m_axi_mm2s_aclk]
+connect_bd_net [get_bd_pins rst_0/peripheral_aresetn] [get_bd_pins axi_dma_1/axi_resetn]
+
 # Kernel top
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]          [get_bd_pins q1a8_kernel_top_0/s_axi_aclk]
 connect_bd_net [get_bd_pins rst_0/peripheral_aresetn] [get_bd_pins q1a8_kernel_top_0/s_axi_aresetn]
 
-# AXI-Lite interconnect (1 SI + 2 MI)
+# AXI-Lite interconnect (1 SI + 3 MI)
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]            [get_bd_pins axi_lite_interconnect/ACLK]
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]            [get_bd_pins axi_lite_interconnect/S00_ACLK]
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]            [get_bd_pins axi_lite_interconnect/M00_ACLK]
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]            [get_bd_pins axi_lite_interconnect/M01_ACLK]
+connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]            [get_bd_pins axi_lite_interconnect/M02_ACLK]
 connect_bd_net [get_bd_pins rst_0/interconnect_aresetn] [get_bd_pins axi_lite_interconnect/ARESETN]
 connect_bd_net [get_bd_pins rst_0/peripheral_aresetn]   [get_bd_pins axi_lite_interconnect/S00_ARESETN]
 connect_bd_net [get_bd_pins rst_0/peripheral_aresetn]   [get_bd_pins axi_lite_interconnect/M00_ARESETN]
 connect_bd_net [get_bd_pins rst_0/peripheral_aresetn]   [get_bd_pins axi_lite_interconnect/M01_ARESETN]
+connect_bd_net [get_bd_pins rst_0/peripheral_aresetn]   [get_bd_pins axi_lite_interconnect/M02_ARESETN]
 
-# Memory interconnect (2 SI + 1 MI)
+# Memory interconnect (3 SI + 1 MI)
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]            [get_bd_pins axi_mem_interconnect/ACLK]
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]            [get_bd_pins axi_mem_interconnect/S00_ACLK]
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]            [get_bd_pins axi_mem_interconnect/S01_ACLK]
+connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]            [get_bd_pins axi_mem_interconnect/S02_ACLK]
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]            [get_bd_pins axi_mem_interconnect/M00_ACLK]
 connect_bd_net [get_bd_pins rst_0/interconnect_aresetn] [get_bd_pins axi_mem_interconnect/ARESETN]
 connect_bd_net [get_bd_pins rst_0/peripheral_aresetn]   [get_bd_pins axi_mem_interconnect/S00_ARESETN]
 connect_bd_net [get_bd_pins rst_0/peripheral_aresetn]   [get_bd_pins axi_mem_interconnect/S01_ARESETN]
+connect_bd_net [get_bd_pins rst_0/peripheral_aresetn]   [get_bd_pins axi_mem_interconnect/S02_ARESETN]
 connect_bd_net [get_bd_pins rst_0/peripheral_aresetn]   [get_bd_pins axi_mem_interconnect/M00_ARESETN]
 
 # -- AXI plumbing -----------------------------------------------------------
 
-# Control: GP0 -> AXI-Lite interconnect -> { DMA control, kernel control }
+# Control: GP0 -> AXI-Lite interconnect -> { DMA0, DMA1, kernel control }
 connect_bd_intf_net [get_bd_intf_pins ps7_0/M_AXI_GP0]               [get_bd_intf_pins axi_lite_interconnect/S00_AXI]
 connect_bd_intf_net [get_bd_intf_pins axi_lite_interconnect/M00_AXI] [get_bd_intf_pins axi_dma_0/S_AXI_LITE]
-connect_bd_intf_net [get_bd_intf_pins axi_lite_interconnect/M01_AXI] [get_bd_intf_pins q1a8_kernel_top_0/S_AXI]
+connect_bd_intf_net [get_bd_intf_pins axi_lite_interconnect/M01_AXI] [get_bd_intf_pins axi_dma_1/S_AXI_LITE]
+connect_bd_intf_net [get_bd_intf_pins axi_lite_interconnect/M02_AXI] [get_bd_intf_pins q1a8_kernel_top_0/S_AXI]
 
-# Data: DMA MM2S + S2MM -> mem interconnect -> HP0
+# Data: DMA0 MM2S + S2MM and DMA1 MM2S -> mem interconnect -> HP0
 connect_bd_intf_net [get_bd_intf_pins axi_dma_0/M_AXI_MM2S]          [get_bd_intf_pins axi_mem_interconnect/S00_AXI]
 connect_bd_intf_net [get_bd_intf_pins axi_dma_0/M_AXI_S2MM]          [get_bd_intf_pins axi_mem_interconnect/S01_AXI]
+connect_bd_intf_net [get_bd_intf_pins axi_dma_1/M_AXI_MM2S]          [get_bd_intf_pins axi_mem_interconnect/S02_AXI]
 connect_bd_intf_net [get_bd_intf_pins axi_mem_interconnect/M00_AXI]  [get_bd_intf_pins ps7_0/S_AXI_HP0]
 
-# Stream: DMA MM2S stream -> kernel data input
+# Stream: DMA0 MM2S -> kernel weights input
 connect_bd_intf_net [get_bd_intf_pins axi_dma_0/M_AXIS_MM2S]         [get_bd_intf_pins q1a8_kernel_top_0/S_AXIS]
 
-# Stream: kernel results -> DMA S2MM stream
+# Stream: DMA1 MM2S -> kernel acts input
+connect_bd_intf_net [get_bd_intf_pins axi_dma_1/M_AXIS_MM2S]         [get_bd_intf_pins q1a8_kernel_top_0/S_AXIS_ACTS]
+
+# Stream: kernel results -> DMA0 S2MM
 connect_bd_intf_net [get_bd_intf_pins q1a8_kernel_top_0/M_AXIS]      [get_bd_intf_pins axi_dma_0/S_AXIS_S2MM]
 
 assign_bd_address

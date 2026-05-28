@@ -31,6 +31,7 @@ WBITS_BYTES = WBITS_BEATS * 8                        # 32
 SUBBLOCK_STREAM_BYTES = ACTS_BYTES + ACT_SCALE_BYTES + WBITS_BYTES  # 72
 STREAM_PER_Q1_BLOCK = SCALES_BYTES + Q8_SUBBLOCKS * SUBBLOCK_STREAM_BYTES  # 304
 PACKED_PER_Q1_BLOCK = SCALES_BYTES + Q8_SUBBLOCKS * WBITS_BYTES            # 144
+ACTS_PER_Q1_BLOCK = Q8_SUBBLOCKS * (ACTS_BYTES + ACT_SCALE_BYTES)          # 160
 
 assert PACKED_PER_Q1_BLOCK == ROWS_PER_BLOCK * Q1_BLOCK_BYTES, (
     "packed weight layout size must equal Q1_0 source size; layout changed?"
@@ -64,6 +65,11 @@ def stream_bytes_per_rowblock(k: int) -> int:
 
 def packed_bytes_per_rowblock(k: int) -> int:
     return blocks_per_row(k) * PACKED_PER_Q1_BLOCK
+
+
+def acts_stream_nbytes(k: int) -> int:
+    """v4 acts stream size per matmul column."""
+    return blocks_per_row(k) * ACTS_PER_Q1_BLOCK
 
 
 # -- reference packer + merger --------------------------------------------
@@ -124,6 +130,37 @@ def pack_weights(q1_0_weights: bytes, rows: int, k: int) -> bytes:
                     struct.pack_into("<Q", out, cursor, word)
                     cursor += 8
 
+    return bytes(out)
+
+
+def pack_acts(
+    act_quants: bytes,
+    act_scale_bits: bytes,
+    k: int,
+) -> bytes:
+    """Pack one column's acts + fp16 scales into the v4 acts wire stream.
+
+    act_quants:     k bytes of int8 (one column post-Q8_0)
+    act_scale_bits: (k / Q8_BLOCK) × 2 bytes, fp16 LE
+    """
+    if len(act_quants) != k:
+        raise ValueError("act_quants must be k bytes")
+    bpr = blocks_per_row(k)
+    if len(act_scale_bits) != bpr * Q8_SUBBLOCKS * 2:
+        raise ValueError("act_scale_bits length mismatch")
+
+    out = bytearray(acts_stream_nbytes(k))
+    s = 0
+    for q1 in range(bpr):
+        for sub in range(Q8_SUBBLOCKS):
+            q8_idx = q1 * Q8_SUBBLOCKS + sub
+            a_off = q8_idx * Q8_BLOCK
+            out[s : s + ACTS_BYTES] = act_quants[a_off : a_off + ACTS_BYTES]
+            s += ACTS_BYTES
+            scale_lo = act_scale_bits[q8_idx * 2]
+            scale_hi = act_scale_bits[q8_idx * 2 + 1]
+            struct.pack_into("<Q", out, s, scale_lo | (scale_hi << 8))
+            s += ACT_SCALE_BYTES
     return bytes(out)
 
 

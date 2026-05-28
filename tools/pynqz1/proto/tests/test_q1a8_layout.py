@@ -99,6 +99,53 @@ def test_stream_size_matches_existing_packer():
     assert L.stream_nbytes(rows, k, cols) == 2 * 2 * 304
 
 
+def test_pack_acts_sizes_and_layout():
+    """Acts stream is k * 1.25 bytes per column, sub-block-major."""
+    k = 256
+    assert L.acts_stream_nbytes(k) == (k // 128) * 4 * 40
+    assert L.acts_stream_nbytes(k) == k * 5 // 4
+
+    # Smoke-pack and verify the first sub-block is the first 32 quants
+    # followed by the first scale's fp16 bits.
+    quants = bytes(range(k))
+    scales = bytes((i & 0xFF for i in range(k // 32 * 2)))
+    out = L.pack_acts(quants, scales, k)
+    assert out[0:32] == quants[0:32]
+    # bytes 32..39 = scale beat, low 16 = scale_bits[0]
+    assert out[32] == scales[0]
+    assert out[33] == scales[1]
+    assert out[34:40] == b"\x00" * 6
+
+
+def test_pack_acts_c_and_python_match():
+    """The C pack_acts and the Python reference produce identical bytes."""
+    import ctypes
+    from board.kernels.ps.native import load_lib
+
+    lib = load_lib("/tmp/bonsai_ps_test/libbonsai_ps.so")
+    fn = lib.bonsai_q1a8_pack_acts
+    fn.argtypes = [
+        ctypes.POINTER(ctypes.c_int8),
+        ctypes.POINTER(ctypes.c_uint16),
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint8),
+    ]
+    fn.restype = ctypes.c_int
+
+    k = 512  # 4 Q1 blocks
+    quants = bytes((i * 7 + 11) & 0xFF for i in range(k))
+    scale_words = [(i * 13 + 5) & 0xFFFF for i in range(k // 32)]
+    scales = b"".join(struct.pack("<H", s) for s in scale_words)
+    want = L.pack_acts(quants, scales, k)
+
+    c_quants = (ctypes.c_int8 * k)(*[b - 256 if b >= 128 else b for b in quants])
+    c_scales = (ctypes.c_uint16 * (k // 32))(*scale_words)
+    c_out = (ctypes.c_uint8 * len(want))()
+    rc = fn(c_quants, c_scales, ctypes.c_uint32(k), c_out)
+    assert rc == 0
+    assert bytes(c_out) == want
+
+
 def test_pack_then_merge_matches_legacy_packer():
     """The new pack(Q1_0) + merge(packed, acts) must produce identical
     bytes to the legacy bonsai_pack_matmul_q1a8_stream. This is the

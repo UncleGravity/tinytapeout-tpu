@@ -85,9 +85,16 @@ def test_pack_rowblock_matches_axis_format():
 
 def test_register_all_registers_matmul_only_for_matmul_overlay():
     registry = KernelRegistry()
+    # v4 bitstream wires two DMAs: axi_dma_0 (weights + results) and
+    # axi_dma_1 (acts MM2S only).
     overlay = SimpleNamespace(
-        ip_dict={"axi_dma_0": {}, "q1a8_kernel_top_0": {}},
+        ip_dict={
+            "axi_dma_0": {},
+            "axi_dma_1": {},
+            "q1a8_kernel_top_0": {},
+        },
         axi_dma_0=SimpleNamespace(),
+        axi_dma_1=SimpleNamespace(),
         q1a8_kernel_top_0=SimpleNamespace(),
     )
 
