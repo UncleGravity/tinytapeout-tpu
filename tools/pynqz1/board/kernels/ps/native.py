@@ -152,6 +152,8 @@ class MatmulQ1A8(_NativeKernel):
     )
 
     def run(self, allocator, op, timer):
+        from proto import q1a8_layout
+
         rows = _required(op, F_ROWS)
         cols = _required(op, F_COLS)
         k = _required(op, F_K)
@@ -161,7 +163,10 @@ class MatmulQ1A8(_NativeKernel):
                 f"{GOP_MATMUL_Q1A8} k must be a positive multiple of {Q1_BLOCK}",
             )
 
-        weight_nbytes = rows * (k // Q1_BLOCK) * Q1_BLOCK_BYTES
+        # Weights are stored in AXIS-packed layout (host backend repacks at
+        # upload). Same total bytes as Q1_0 *when rows is a multiple of
+        # ROWS_PER_BLOCK*; partial trailing rowblocks pad up to a full block.
+        weight_nbytes = q1a8_layout.packed_nbytes(rows, k)
         act_nbytes = cols * k * F32_BYTES
         dst_nbytes = rows * cols * F32_BYTES
 

@@ -154,16 +154,21 @@ def _make_q1_weights(rows: int, k: int) -> bytes:
 
 
 def test_matmul_q1a8(registry, allocator):
+    from proto import q1a8_layout
+
     rows, cols, k = 4, 2, Q1_BLOCK
-    weights = _make_q1_weights(rows, k)
+    weights_q1_0 = _make_q1_weights(rows, k)
     acts = f32_bytes(cols * k, seed=17)
-    hw = allocate_and_upload(allocator, weights)
+    # Mirror libggml-pynq.so: weights live on-board in AXIS-packed layout.
+    weights_packed = q1a8_layout.pack_weights(weights_q1_0, rows, k)
+    hw = allocate_and_upload(allocator, weights_packed)
     ha = allocate_and_upload(allocator, acts)
     dst = allocate_empty(allocator, rows * cols * F32)
     out = run_one(registry, allocator, {
         "op": GOP_MATMUL_Q1A8, "weights": hw, "acts": ha, "dst": dst,
         "rows": rows, "cols": cols, "k": k,
     })
-    expected = golden.matmul_q1a8(weights, acts, rows, cols, k)
+    # Golden oracle still operates on the Q1_0 source — it's the ground truth.
+    expected = golden.matmul_q1a8(weights_q1_0, acts, rows, cols, k)
     for got, exp in zip(struct.iter_unpack("<f", out), struct.iter_unpack("<f", expected), strict=False):
         assert got[0] == pytest.approx(exp[0], abs=1e-4)

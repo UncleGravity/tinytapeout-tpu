@@ -2,6 +2,7 @@
 #include "trace.h"
 
 #include "proto/ops.h"
+#include "proto/q1a8_layout.h"
 
 #include "ggml-backend-impl.h"
 
@@ -48,6 +49,44 @@ const RemoteBinding * find_binding(BufferContext * ctx, const ggml_tensor * tens
     return it == ctx->bindings.end() ? nullptr : &it->second;
 }
 
+// Q1_0 weight tensors are repacked at upload into the AXIS rowblock layout
+// (board/kernels/pl/matmul_q1a8.py reads them that way). For tensors whose
+// row count is a multiple of ROWS_PER_BLOCK the packed size equals
+// ggml_nbytes, but partial trailing rowblocks need padding — e.g. Bonsai
+// 1.7B's lm_head has 151669 rows, packed needs 3 extra zero-padded rows,
+// adding 864 bytes. We override get_alloc_size to give every Q1_0 tensor a
+// packed-size slot, and the binding records that size as well.
+bool is_repackable_q1_0(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->type != GGML_TYPE_Q1_0) return false;
+    if (tensor->ne[0] <= 0 || tensor->ne[1] <= 0) return false;
+    if (tensor->ne[2] != 1 || tensor->ne[3] != 1) return false;
+    if (tensor->ne[0] % BONSAI_Q1_BLOCK != 0) return false;
+    if (!ggml_is_contiguous(tensor)) return false;
+    return true;
+}
+
+std::size_t q1_0_packed_size(const ggml_tensor * tensor) {
+    return bonsai_q1a8_packed_nbytes(
+        static_cast<uint32_t>(tensor->ne[1]),
+        static_cast<uint32_t>(tensor->ne[0]));
+}
+
+// Effective on-board allocation size for a tensor: packed size for Q1_0,
+// ggml_nbytes for everything else.
+std::size_t effective_alloc_size(const ggml_tensor * tensor) {
+    if (is_repackable_q1_0(tensor)) {
+        return q1_0_packed_size(tensor);
+    }
+    return ggml_nbytes(tensor);
+}
+
+bool should_repack_as_axis_q1a8(const ggml_tensor * tensor,
+                                std::size_t offset, std::size_t size) {
+    if (!is_repackable_q1_0(tensor)) return false;
+    if (offset != 0) return false;
+    return size == ggml_nbytes(tensor);
+}
+
 void upload_fill(uint64_t handle, std::size_t offset, std::size_t size, uint8_t value) {
     std::vector<uint8_t> fill(std::min(size, k_fill_chunk_size), value);
     std::size_t done = 0;
@@ -84,7 +123,7 @@ bool tensor_buffer_offset(
     }
 
     const std::size_t local_offset = static_cast<std::size_t>(data - base);
-    const std::size_t nbytes = ggml_nbytes(tensor);
+    const std::size_t nbytes = effective_alloc_size(tensor);
     try {
         if (add_checked(local_offset, nbytes) > ctx->size) {
             return false;
@@ -177,7 +216,10 @@ enum ggml_status pynq_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tens
             return GGML_STATUS_SUCCESS;
         }
 
-        const std::size_t nbytes = ggml_nbytes(tensor);
+        // Use packed size for Q1_0 tensors so the binding's bounds match
+        // what we'll actually upload, and so subsequent tensors land at the
+        // arena offset ggml computed via get_alloc_size.
+        const std::size_t nbytes = effective_alloc_size(tensor);
         std::size_t remote_offset = 0;
         if (!tensor_buffer_offset(ctx, tensor, &remote_offset)) {
             GGML_LOG_ERROR("pynq: tensor %s is outside its PYNQ buffer arena\n", tensor->name);
@@ -260,6 +302,48 @@ void pynq_buffer_set_tensor(
         GGML_LOG_ERROR("pynq: invalid upload range for tensor %s\n", tensor->name);
         return;
     }
+
+    // Q1_0 weight tensor uploaded whole: repack into AXIS rowblock layout.
+    // The packed bytes may be longer than the Q1_0 source if rows isn't a
+    // multiple of ROWS_PER_BLOCK (partial trailing rowblock is zero-padded).
+    // get_alloc_size and the binding already reserve the packed size, so
+    // uploading want > size is safe.
+    std::vector<uint8_t> repacked;
+    const void * upload_data = data;
+    std::size_t  upload_size = size;
+    const bool repack = should_repack_as_axis_q1a8(tensor, offset, size);
+    if (repack) {
+        const uint32_t k    = static_cast<uint32_t>(tensor->ne[0]);
+        const uint32_t rows = static_cast<uint32_t>(tensor->ne[1]);
+        const size_t   want = bonsai_q1a8_packed_nbytes(rows, k);
+        try {
+            repacked.resize(want);
+        } catch (const std::bad_alloc &) {
+            GGML_LOG_ERROR("pynq: cannot allocate %zu-byte repack scratch for %s\n",
+                want, tensor_name(tensor));
+            return;
+        }
+        const int rc = bonsai_q1a8_pack_weights(
+            static_cast<const uint8_t *>(data), rows, k, repacked.data());
+        if (rc != 0) {
+            GGML_LOG_ERROR("pynq: Q1_0 repack failed for tensor %s rc=%d\n",
+                tensor_name(tensor), rc);
+            return;
+        }
+        upload_data = repacked.data();
+        upload_size = want;
+        if (trace_enabled()) {
+            tracef("pynq trace: repack name=%s rows=%u k=%u q1_0=%zu packed=%zu\n",
+                tensor_name(tensor), rows, k, size, want);
+        }
+    } else if (tensor->type == GGML_TYPE_Q1_0 && trace_enabled()) {
+        // Surface partial Q1_0 uploads so we notice if llama.cpp ever starts
+        // doing chunked weight loads — that would leave a mixed-layout tensor.
+        tracef("pynq trace: WARN Q1_0 partial upload name=%s offset=%zu size=%zu "
+               "(not repacked; on-board layout may be inconsistent)\n",
+            tensor_name(tensor), offset, size);
+    }
+
     try {
         shared_client().call(
             P::OP_UPLOAD_TENSOR,
@@ -267,19 +351,20 @@ void pynq_buffer_set_tensor(
                 { P::F_HANDLE, binding->handle },
                 { P::F_OFFSET, add_checked(binding->remote_offset, offset) },
             },
-            data,
-            size);
+            upload_data,
+            upload_size);
         if (trace_enabled()) {
             const std::size_t total =
-                trace_counters().uploaded_bytes.fetch_add(size) + size;
+                trace_counters().uploaded_bytes.fetch_add(upload_size) + upload_size;
             tracef(
                 "pynq trace: upload name=%s type=%s handle=%llu offset=%zu "
-                "bytes=%zu uploaded_total=%.2f MiB\n",
+                "bytes=%zu repack=%s uploaded_total=%.2f MiB\n",
                 tensor_name(tensor),
                 ggml_type_name(tensor->type),
                 static_cast<unsigned long long>(binding->handle),
                 add_checked(binding->remote_offset, offset),
-                size,
+                upload_size,
+                repack ? "axis_q1a8" : "raw",
                 mib(total));
         }
     } catch (const std::exception & exc) {
@@ -466,7 +551,9 @@ std::size_t buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
 
 std::size_t buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     GGML_UNUSED(buft);
-    return ggml_nbytes(tensor);
+    // Q1_0 weight tensors need extra room when rows isn't a multiple of
+    // ROWS_PER_BLOCK (the packed layout pads the trailing partial rowblock).
+    return effective_alloc_size(tensor);
 }
 
 bool buffer_type_is_host(ggml_backend_buffer_type_t buft) {

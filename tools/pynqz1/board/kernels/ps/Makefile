@@ -18,9 +18,16 @@ else
     SHARED := -shared
 endif
 
-$(OUT_DIR)/$(LIB): native.c
+# proto/q1a8_layout.c lives outside this dir but is part of the same .so:
+# both PS kernels and the PL matmul driver call its merge_acts entry point.
+PROTO_DIR := $(abspath ../../../proto)
+INCLUDES  := -I$(PROTO_DIR)/..
+
+SOURCES := native.c $(PROTO_DIR)/q1a8_layout.c
+
+$(OUT_DIR)/$(LIB): $(SOURCES)
 	@mkdir -p $(OUT_DIR)
-	$(CC) $(CFLAGS) $(SHARED) -o $@ $< $(LDFLAGS)
+	$(CC) $(CFLAGS) $(INCLUDES) $(SHARED) -o $@ $(SOURCES) $(LDFLAGS)
 
 clean:
 	rm -f $(OUT_DIR)/$(LIB)

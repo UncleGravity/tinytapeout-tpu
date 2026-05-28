@@ -3,16 +3,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum {
-    BONSAI_Q1_BLOCK = 128,
-    BONSAI_Q1_BLOCK_BYTES = 18,
-    BONSAI_Q8_BLOCK = 32,
-    BONSAI_Q1A8_ROWS_PER_BLOCK = 8,
-    BONSAI_Q1A8_SCALE_BEATS = (BONSAI_Q1A8_ROWS_PER_BLOCK + 3) / 4,
-    BONSAI_Q1A8_WBITS_BEATS = (BONSAI_Q1A8_ROWS_PER_BLOCK + 1) / 2,
-    BONSAI_Q1A8_ROWBLOCK_BYTES =
-        (BONSAI_Q1A8_SCALE_BEATS + 4 * (5 + BONSAI_Q1A8_WBITS_BEATS)) * 8,
-};
+#include "proto/q1a8_layout.h"
+
+/* Block-size constants now live in proto/q1a8_layout.h. Old
+ * BONSAI_Q1A8_ROWBLOCK_BYTES is BONSAI_Q1A8_STREAM_PER_Q1_BLOCK there. */
 
 const char * bonsai_ps_version(void) {
     return "bonsai_ps_v1";
@@ -29,6 +23,13 @@ static float silu_f32(float value) {
 
 static uint16_t read_le_u16(const uint8_t * ptr) {
     return (uint16_t) ptr[0] | ((uint16_t) ptr[1] << 8);
+}
+
+static uint32_t read_le_u32(const uint8_t * ptr) {
+    return (uint32_t) ptr[0]
+         | ((uint32_t) ptr[1] << 8)
+         | ((uint32_t) ptr[2] << 16)
+         | ((uint32_t) ptr[3] << 24);
 }
 
 static float half_to_float(uint16_t h) {
@@ -164,14 +165,27 @@ static void quantize_q8_0(
     }
 }
 
+/*
+ * Matmul Q1A8 over weights pre-packed in the AXIS rowblock layout
+ * (proto/q1a8_layout.h). The host backend repacks Q1_0 weights on upload,
+ * so this is what the daemon's PS path always sees. Used as the fallback
+ * when no PL bitstream is loaded.
+ *
+ * Packed layout per (rowblock, q1_block) = 144 bytes:
+ *   bytes [ 0..15]   weight_scales: 8 fp16 (row R at offset 2*R)
+ *   bytes [16..47]   wbits sub-block 0: 8 u32 (row R at offset R*4)
+ *   bytes [48..79]   wbits sub-block 1
+ *   bytes [80..111]  wbits sub-block 2
+ *   bytes [112..143] wbits sub-block 3
+ */
 int bonsai_matmul_q1a8(
-    const uint8_t * weights,
+    const uint8_t * packed_weights,
     const float * acts,
     float * dst,
     uint32_t rows,
     uint32_t cols,
     uint32_t k) {
-    if (weights == NULL || acts == NULL || dst == NULL ||
+    if (packed_weights == NULL || acts == NULL || dst == NULL ||
         rows == 0 || cols == 0 || k == 0 ||
         (k % BONSAI_Q1_BLOCK) != 0) {
         return -1;
@@ -186,47 +200,45 @@ int bonsai_matmul_q1a8(
     }
 
     const uint32_t blocks_per_row = k / BONSAI_Q1_BLOCK;
-    const uint32_t weight_row_bytes = blocks_per_row * BONSAI_Q1_BLOCK_BYTES;
+    const size_t   packed_per_rowblock =
+        (size_t) blocks_per_row * BONSAI_Q1A8_PACKED_PER_Q1_BLOCK;
 
     for (uint32_t col = 0; col < cols; ++col) {
         quantize_q8_0(acts + (size_t) col * k, k, act_quants, act_scales);
 
         for (uint32_t row = 0; row < rows; ++row) {
+            const uint32_t rb = row / BONSAI_Q1A8_ROWS_PER_BLOCK;
+            const uint32_t row_in_rb = row % BONSAI_Q1A8_ROWS_PER_BLOCK;
+            const uint8_t * rb_base =
+                packed_weights + (size_t) rb * packed_per_rowblock;
             float acc = 0.0f;
-            const uint8_t * weight_row =
-                weights + (size_t) row * weight_row_bytes;
 
-            for (uint32_t q1_index = 0; q1_index < blocks_per_row; ++q1_index) {
+            for (uint32_t q1 = 0; q1 < blocks_per_row; ++q1) {
                 const uint8_t * block =
-                    weight_row + (size_t) q1_index * BONSAI_Q1_BLOCK_BYTES;
-                const float weight_scale = half_to_float(read_le_u16(block));
-                if (weight_scale == 0.0f) {
-                    continue;
-                }
+                    rb_base + (size_t) q1 * BONSAI_Q1A8_PACKED_PER_Q1_BLOCK;
+                const float weight_scale = half_to_float(
+                    read_le_u16(block + 2 * row_in_rb));
+                if (weight_scale == 0.0f) continue;
 
-                const uint8_t * bits = block + 2;
-                const uint32_t q1_base = q1_index * BONSAI_Q1_BLOCK;
-                for (uint32_t q8_local = 0;
-                     q8_local < BONSAI_Q1_BLOCK;
-                     q8_local += BONSAI_Q8_BLOCK) {
-                    const uint32_t q8_base = q1_base + q8_local;
+                const uint8_t * wbits_base = block + BONSAI_Q1A8_SCALES_BYTES;
+                for (uint32_t sub = 0; sub < BONSAI_Q1A8_Q8_SUBBLOCKS; ++sub) {
+                    const uint32_t q8_base =
+                        q1 * BONSAI_Q1_BLOCK + sub * BONSAI_Q8_BLOCK;
                     const float act_scale = act_scales[q8_base / BONSAI_Q8_BLOCK];
-                    if (act_scale == 0.0f) {
-                        continue;
-                    }
+                    if (act_scale == 0.0f) continue;
+
+                    /* This row's 32-bit weight mask for this sub-block. */
+                    const uint32_t wbits = read_le_u32(
+                        wbits_base
+                        + (size_t) sub * BONSAI_Q1A8_WBITS_BYTES
+                        + (size_t) row_in_rb * 4);
 
                     int sub_sum = 0;
                     for (uint32_t i = 0; i < BONSAI_Q8_BLOCK; ++i) {
-                        const uint32_t bit_index = q8_local + i;
-                        const uint8_t bit_byte = bits[bit_index >> 3];
                         const int act = (int) act_quants[q8_base + i];
-                        if ((bit_byte & (uint8_t) (1u << (bit_index & 7u))) != 0) {
-                            sub_sum += act;
-                        } else {
-                            sub_sum -= act;
-                        }
+                        if (((wbits >> i) & 1u) != 0) sub_sum += act;
+                        else                          sub_sum -= act;
                     }
-
                     acc += weight_scale * act_scale * (float) sub_sum;
                 }
             }
@@ -535,7 +547,7 @@ int bonsai_pack_matmul_q1a8_stream(
     const uint32_t scales_per_col = k / BONSAI_Q8_BLOCK;
     const uint32_t rowblocks_per_col =
         (rows + BONSAI_Q1A8_ROWS_PER_BLOCK - 1) / BONSAI_Q1A8_ROWS_PER_BLOCK;
-    const size_t rowblock_bytes = BONSAI_Q1A8_ROWBLOCK_BYTES * (size_t) blocks_per_row;
+    const size_t rowblock_bytes = BONSAI_Q1A8_STREAM_PER_Q1_BLOCK * (size_t) blocks_per_row;
     const size_t col_stride = rowblock_bytes * rowblocks_per_col;
 
     for (uint32_t col = 0; col < cols; ++col) {

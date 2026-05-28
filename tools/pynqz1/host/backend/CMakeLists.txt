@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(pynq_backend LANGUAGES CXX)
+project(pynq_backend LANGUAGES C CXX)
 
 option(PYNQ_BUILD_SMOKE_TESTS "Build standalone backend smoke tests" OFF)
 
@@ -60,7 +60,8 @@ set(PYNQ_BACKEND_SOURCES
     "${CMAKE_CURRENT_LIST_DIR}/src/device.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/buffer.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/lowering.cpp"
-    "${CMAKE_CURRENT_LIST_DIR}/src/trace.cpp")
+    "${CMAKE_CURRENT_LIST_DIR}/src/trace.cpp"
+    "${PYNQ_PROTO_DIR}/q1a8_layout.c")
 
 add_library(ggml-pynq MODULE ${PYNQ_BACKEND_SOURCES})
 target_link_libraries(ggml-pynq PRIVATE pynq_backend_common pynq_transport)

@@ -122,7 +122,11 @@ def _fmt_time(us: int) -> str:
 
 
 def _bar(fraction: float, width: int = 40) -> str:
-    return "█" * int(round(fraction * width))
+    # Clamp so a malformed section (e.g. a field that snuck through the
+    # ``*_us`` filter holding a wall-clock timestamp) cannot OOM the tool
+    # trying to allocate billions of bar characters.
+    clamped = max(0.0, min(1.0, fraction))
+    return "█" * int(round(clamped * width))
 
 
 def cmd_summary(args: argparse.Namespace) -> int:
@@ -138,6 +142,9 @@ def cmd_summary(args: argparse.Namespace) -> int:
     op_calls: dict[str, int] = defaultdict(int)
     op_durations: dict[str, list[int]] = defaultdict(list)
     op_bytes: dict[str, int] = defaultdict(int)
+    # Per-op, per-section totals. Any span field ending in ``_us`` except
+    # ``total_us`` is treated as a timer section emitted by the kernel.
+    op_sections: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for call in calls.values():
         for span in call.op_spans:
             name = str(span.get("op", "?"))
@@ -146,6 +153,15 @@ def cmd_summary(args: argparse.Namespace) -> int:
             op_calls[name] += 1
             op_durations[name].append(us)
             op_bytes[name] += int(span.get("bytes_read", 0)) + int(span.get("bytes_written", 0))
+            for key, value in span.items():
+                # ``total_us`` is the op wall time, not a section.
+                # ``t_us`` is the event timestamp injected by events.py.
+                if key in ("total_us", "t_us") or not key.endswith("_us"):
+                    continue
+                try:
+                    op_sections[name][key[:-3]] += int(value)
+                except (TypeError, ValueError):
+                    continue
 
     total_compute_us = sum(int(s.get("compute_us", 0)) for c in calls.values() for s in c.op_spans)
     total_memory_us = sum(
@@ -186,6 +202,30 @@ def cmd_summary(args: argparse.Namespace) -> int:
                 f"{_fmt_time(avg):>10} {_fmt_time(p99):>10} {op_bytes[name]:>12}"
             )
         print()
+
+        # Per-op section breakdown. Each kernel emits its own timer.section()
+        # calls; we surface them here so the dominant sub-step is visible
+        # without grepping the raw ndjson.
+        ops_with_sections = [
+            (name, total) for name, total in ordered
+            if op_sections.get(name) and len(op_sections[name]) > 1
+        ]
+        if ops_with_sections:
+            print("Section breakdown:")
+            for name, total in ops_with_sections:
+                sections = sorted(
+                    op_sections[name].items(),
+                    key=lambda kv: kv[1],
+                    reverse=True,
+                )
+                print(f"  {name}  ({op_calls[name]} calls, {_fmt_time(total)} total)")
+                for section, value in sections:
+                    frac = value / total if total > 0 else 0.0
+                    print(
+                        f"    {section:<16} {_fmt_time(value):>10}  "
+                        f"{frac * 100:5.1f}%  {_bar(frac, width=30)}"
+                    )
+                print()
     return 0
 
 

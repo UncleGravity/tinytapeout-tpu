@@ -1,4 +1,11 @@
-"""PL-backed MATMUL_Q1A8 driver for the rowblock bitstream."""
+"""PL-backed MATMUL_Q1A8 driver for the rowblock bitstream.
+
+Hot path: per-column quantize + merge_acts(packed_weights, quants, scales)
++ DMA. The merge_acts step is a memcpy walk over weights that the host
+already pre-packed into AXIS rowblock layout at upload time. No bit
+shuffles in the hot path; the legacy per-matmul stream pack that used to
+dominate matmul wall time (~85%) is gone.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +17,7 @@ from typing import Any
 from board.kernels.ps.native import load_lib
 from board.memory.allocator import AllocatorError, TensorAllocator
 from board.profiling.timer import Timer
+from proto import q1a8_layout
 from proto.ops import (
     F_ACTS,
     F_ACTS_OFFSET,
@@ -27,7 +35,7 @@ from proto.ops import (
 )
 
 F32_BYTES = 4
-ROWS_PER_BLOCK = 8
+ROWS_PER_BLOCK = q1a8_layout.ROWS_PER_BLOCK
 
 REG_ID = 0x00
 REG_VERSION = 0x04
@@ -82,18 +90,20 @@ def _bind_native(lib: ctypes.CDLL):
     ]
     quantize.restype = ctypes.c_int
 
-    pack = lib.bonsai_pack_matmul_q1a8_stream
-    pack.argtypes = [
-        ctypes.POINTER(ctypes.c_uint8),  # weights
+    # Merge: walks packed_weights (one chunk's worth) + per-column acts +
+    # scales into the AXIS wire stream. Replaces the old per-matmul pack
+    # which read Q1_0 and did the bit shuffles inline.
+    merge = lib.bonsai_q1a8_merge_acts
+    merge.argtypes = [
+        ctypes.POINTER(ctypes.c_uint8),  # packed_weights
         ctypes.POINTER(ctypes.c_int8),   # act_quants
         ctypes.POINTER(ctypes.c_uint16), # act_scale_bits
         ctypes.c_uint32,                 # rows
-        ctypes.c_uint32,                 # cols
         ctypes.c_uint32,                 # k
         ctypes.POINTER(ctypes.c_uint8),  # out_stream
     ]
-    pack.restype = ctypes.c_int
-    return quantize, pack
+    merge.restype = ctypes.c_int
+    return quantize, merge
 
 
 # -- legacy Python helpers (kept for tests & golden comparisons) ----------
@@ -233,7 +243,7 @@ class PLMatmulQ1A8:
         self._rows_per_block = ROWS_PER_BLOCK
         self._lib = None
         self._c_quantize = None
-        self._c_pack = None
+        self._c_merge = None
         # Lazy CMA scratch buffers for the rare case where a tensor spans
         # slab extents: allocator.slab_pointer refuses to hand out a single
         # pointer there, so we copy the bytes into a contiguous CMA scratch
@@ -323,7 +333,7 @@ class PLMatmulQ1A8:
         if self._c_quantize is not None:
             return
         self._lib = load_lib()
-        self._c_quantize, self._c_pack = _bind_native(self._lib)
+        self._c_quantize, self._c_merge = _bind_native(self._lib)
 
     def run(self, allocator: TensorAllocator, op: dict[str, Any], timer: Timer) -> None:
         rows = _required(op, F_ROWS)
@@ -337,11 +347,17 @@ class PLMatmulQ1A8:
                 f"{GOP_MATMUL_Q1A8} k must be a positive multiple of {Q1_BLOCK}",
             )
 
+        timer.add("rows", rows)
+        timer.add("cols", cols)
+        timer.add("k", k)
+
         self._ensure_native()
 
         blocks_per_row = k // Q1_BLOCK
-        weight_row_bytes = blocks_per_row * Q1_BLOCK_BYTES
-        weight_nbytes = rows * weight_row_bytes
+        # Packed weight layout (host pre-packed at upload): rowblock-major,
+        # PACKED_PER_Q1_BLOCK bytes per Q1 block per rowblock.
+        packed_bytes_per_rb = q1a8_layout.packed_bytes_per_rowblock(k)
+        weight_nbytes = q1a8_layout.packed_nbytes(rows, k)
         act_nbytes = cols * k * F32_BYTES
         dst_nbytes = rows * cols * F32_BYTES
 
@@ -350,7 +366,7 @@ class PLMatmulQ1A8:
         # scratch copy would not fit in CMA for big matmuls (lm_head's
         # token_embd.weight is ~42 MiB; CMA has ~15 MiB free after the model
         # is loaded). Per-chunk weights are at most rows_per_chunk *
-        # weight_row_bytes ≈ 2 MiB which always fits.
+        # packed_bytes_per_rb ≈ a few MiB which always fits.
         weights_handle = _required(op, F_WEIGHTS)
         weights_base_offset = _optional_int(op, F_WEIGHTS_OFFSET)
         with timer.section("read"):
@@ -365,7 +381,7 @@ class PLMatmulQ1A8:
 
         self._check_kernel_id()
         rows_per_block = self._read_rows_per_block()
-        rowblock_nbytes = _rowblock_nbytes(k, rows_per_block)
+        rowblock_stream_nbytes = q1a8_layout.STREAM_PER_Q1_BLOCK * blocks_per_row
         rowblocks_per_col = (rows + rows_per_block - 1) // rows_per_block
 
         # Cap the stream/result buffers to ~4 MiB so huge matmuls (lm_head:
@@ -375,10 +391,10 @@ class PLMatmulQ1A8:
         max_stream_nbytes = 4 * 1024 * 1024
         max_rowblocks_per_chunk = min(
             rowblocks_per_col,
-            max(1, max_stream_nbytes // rowblock_nbytes),
+            max(1, max_stream_nbytes // rowblock_stream_nbytes),
         )
         rows_per_chunk = max_rowblocks_per_chunk * rows_per_block
-        chunk_stream_nbytes = max_rowblocks_per_chunk * rowblock_nbytes
+        chunk_stream_nbytes = max_rowblocks_per_chunk * rowblock_stream_nbytes
         chunk_result_nbytes = max_rowblocks_per_chunk * rows_per_block * F32_BYTES
 
         import numpy as np
@@ -410,16 +426,20 @@ class PLMatmulQ1A8:
                     raise RuntimeError(f"bonsai_quantize_q8_0_pl rc={rc}")
 
             row_chunk_start = 0
+            rowblock_chunk_start = 0
             while row_chunk_start < rows:
                 chunk_rows = min(rows_per_chunk, rows - row_chunk_start)
                 chunk_rowblocks = (chunk_rows + rows_per_block - 1) // rows_per_block
-                chunk_stream = chunk_rowblocks * rowblock_nbytes
+                chunk_stream = chunk_rowblocks * rowblock_stream_nbytes
                 chunk_result = chunk_rowblocks * rows_per_block * F32_BYTES
 
+                # Packed weights are rowblock-major; offset by full rowblocks
+                # processed so far (chunking always aligns to a rowblock).
                 chunk_weight_offset = (
-                    weights_base_offset + row_chunk_start * weight_row_bytes
+                    weights_base_offset
+                    + rowblock_chunk_start * packed_bytes_per_rb
                 )
-                chunk_weight_nbytes = chunk_rows * weight_row_bytes
+                chunk_weight_nbytes = chunk_rowblocks * packed_bytes_per_rb
                 chunk_weights_addr = self._resolve_slab_pointer(
                     allocator,
                     weights_handle,
@@ -432,29 +452,32 @@ class PLMatmulQ1A8:
                     ctypes.POINTER(ctypes.c_uint8),
                 )
 
-                with timer.section("pack"):
-                    rc = self._c_pack(
+                with timer.section("merge"):
+                    # rows passed to merge_acts is the logical chunk_rows;
+                    # internally it rounds up to whole rowblocks and zero-
+                    # pads inactive lanes via the same pre-packed zeros.
+                    rc = self._c_merge(
                         chunk_weights_ptr,
                         quants_ptr,
                         scales_ptr,
                         ctypes.c_uint32(chunk_rows),
-                        ctypes.c_uint32(1),
                         ctypes.c_uint32(k),
                         stream_ptr,
                     )
                     if rc != 0:
-                        raise RuntimeError(f"bonsai_pack_matmul_q1a8_stream rc={rc}")
+                        raise RuntimeError(f"bonsai_q1a8_merge_acts rc={rc}")
 
                 with timer.section("flush"):
                     self._stream_buf.flush()
 
-                cycles = self._run_matmul(
-                    chunk_stream,
-                    chunk_result,
-                    blocks_per_row,
-                    chunk_rowblocks,
-                    timer,
-                )
+                with timer.section("compute"):
+                    cycles = self._run_matmul(
+                        chunk_stream,
+                        chunk_result,
+                        blocks_per_row,
+                        chunk_rowblocks,
+                        timer,
+                    )
                 total_cycles += cycles
 
                 with timer.section("result_copy"):
@@ -468,6 +491,7 @@ class PLMatmulQ1A8:
                     out[out_base : out_base + chunk_rows * F32_BYTES] = result_view.tobytes()
 
                 row_chunk_start += chunk_rows
+                rowblock_chunk_start += chunk_rowblocks
 
         with timer.section("write"):
             allocator.write(
@@ -478,7 +502,7 @@ class PLMatmulQ1A8:
         timer.add("bytes_written", dst_nbytes)
         timer.add("matmul_cols", cols)
         timer.add("rowblocks", cols * rowblocks_per_col)
-        timer.add("dma_bytes_read", cols * rowblocks_per_col * rowblock_nbytes)
+        timer.add("dma_bytes_read", cols * rowblocks_per_col * rowblock_stream_nbytes)
         timer.add(
             "dma_bytes_written",
             cols * rowblocks_per_col * rows_per_block * F32_BYTES,
