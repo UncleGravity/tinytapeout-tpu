@@ -206,6 +206,115 @@ bool supports_rope_f32(const ggml_tensor * op) {
     return true;
 }
 
+// FLASH_ATTN_EXT op_params layout (ggml.c ggml_flash_attn_ext_impl):
+//   [0] (f32) scale
+//   [1] (f32) max_bias
+//   [2] (f32) logit_softcap
+//
+// Bonsai-1.7B (Qwen3-based) uses: Q=F32, K=F16, V=F16, mask=F16, GQA,
+// max_bias=0 (no ALiBi), logit_softcap=0, no sinks. v1 supports exactly
+// that shape; everything else falls back to CPU.
+//
+// K and V tensors are normally views into the persistent KV cache, so
+// they're regular-strided per dim but NOT ggml_is_contiguous in the
+// conventional sense (head stride = head_dim * ctx_max, not
+// head_dim * n_kv). The kernel takes nb1/nb2 strides explicitly.
+bool supports_flash_attn_ext_f32(const ggml_tensor * op) {
+    if (op == nullptr || op->op != GGML_OP_FLASH_ATTN_EXT) return false;
+    if (op->type != GGML_TYPE_F32) return false;
+
+    const ggml_tensor * q = op->src[0];
+    const ggml_tensor * k = op->src[1];
+    const ggml_tensor * v = op->src[2];
+    const ggml_tensor * mask = (GGML_MAX_SRC >= 4) ? op->src[3] : nullptr;
+    const ggml_tensor * sinks = (GGML_MAX_SRC >= 5) ? op->src[4] : nullptr;
+    if (q == nullptr || k == nullptr || v == nullptr) return false;
+
+    if (q->type != GGML_TYPE_F32) return false;
+    if (k->type != GGML_TYPE_F16) return false;
+    if (v->type != GGML_TYPE_F16) return false;
+    if (mask != nullptr && mask->type != GGML_TYPE_F16) return false;
+    if (sinks != nullptr) return false;  // not implemented
+
+    // ggml_flash_attn_ext_impl shape conventions:
+    //   q  : [head_dim_q, n_token, n_head,    1]
+    //   k  : [head_dim_q, n_kv,    n_head_kv, 1]
+    //   v  : [head_dim_v, n_kv,    n_head_kv, 1]
+    //   dst: [head_dim_v, n_head,  n_token,   1]   (note: permuted)
+    if (q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 || op->ne[3] != 1) return false;
+    if (q->ne[0] != k->ne[0]) return false;             // DK matches
+    if (q->ne[0] <= 0 || v->ne[0] <= 0) return false;
+    if (k->ne[1] != v->ne[1]) return false;             // n_kv matches
+    if (k->ne[2] != v->ne[2]) return false;             // n_head_kv matches
+    if (q->ne[2] <= 0 || k->ne[2] <= 0) return false;
+    if (q->ne[2] % k->ne[2] != 0) return false;         // GQA divides evenly
+
+    // nb0 must be the raw element size — this is the assertion ggml itself
+    // makes (ggml/src/ggml-cpu/ops.cpp:8199-8201). If it ever fails we
+    // need a deeper rethink; just reject for safety.
+    if (q->nb[0] != ggml_type_size(GGML_TYPE_F32)) return false;
+    if (k->nb[0] != ggml_type_size(GGML_TYPE_F16)) return false;
+    if (v->nb[0] != ggml_type_size(GGML_TYPE_F16)) return false;
+    if (mask != nullptr && mask->nb[0] != ggml_type_size(GGML_TYPE_F16)) return false;
+
+    float max_bias = 0.0f, logit_softcap = 0.0f;
+    std::memcpy(&max_bias,      reinterpret_cast<const char *>(op->op_params) + 1*sizeof(float), sizeof(float));
+    std::memcpy(&logit_softcap, reinterpret_cast<const char *>(op->op_params) + 2*sizeof(float), sizeof(float));
+    if (max_bias != 0.0f) return false;       // ALiBi not implemented
+    if (logit_softcap != 0.0f) return false;  // softcap not implemented
+
+    // Runtime safety cap — keeps KV cache footprint in the CMA budget.
+    if (k->ne[1] > 8192) return false;
+    return true;
+}
+
+// GET_ROWS: src0 has rows of some type (Q1_0 / F16 / F32), src1 is i32
+// indices, dst is F32. Used for the token embedding lookup
+// (Bonsai's tok_embd.weight is Q1_0 of shape [n_embd, vocab]).
+bool supports_get_rows(const ggml_tensor * op) {
+    if (op == nullptr || op->op != GGML_OP_GET_ROWS) return false;
+    if (op->type != GGML_TYPE_F32) return false;
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+    if (src0 == nullptr || src1 == nullptr) return false;
+    if (src1->type != GGML_TYPE_I32) return false;
+    if (src0->type != GGML_TYPE_Q1_0 &&
+        src0->type != GGML_TYPE_F16 &&
+        src0->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // Row count must align with Q1_0 block when src0 is Q1_0.
+    if (src0->type == GGML_TYPE_Q1_0) {
+        if (src0->ne[0] % ggml_blck_size(GGML_TYPE_Q1_0) != 0) {
+            return false;
+        }
+        if (src0->ne[2] != 1 || src0->ne[3] != 1 || !ggml_is_contiguous(src0)) {
+            return false;
+        }
+    }
+    if (!ggml_is_contiguous(op)) return false;
+    return true;
+}
+
+// SET_ROWS: writes src0 (F32) rows into dst (F16) at indices given by
+// src1 (i32 or i64). Used by llama.cpp to append the new K/V into the
+// KV cache each token (the dst is the F16 KV cache view).
+bool supports_set_rows(const ggml_tensor * op) {
+    if (op == nullptr || op->op != GGML_OP_SET_ROWS) return false;
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+    if (src0 == nullptr || src1 == nullptr) return false;
+    if (src0->type != GGML_TYPE_F32) return false;
+    if (op->type != GGML_TYPE_F16) return false;
+    if (src1->type != GGML_TYPE_I32 && src1->type != GGML_TYPE_I64) return false;
+    if (src0->nb[0] != ggml_type_size(GGML_TYPE_F32)) return false;
+    if (op->nb[0] != ggml_type_size(GGML_TYPE_F16)) return false;
+    if (src0->ne[0] != op->ne[0]) return false;
+    if (op->ne[2] % src1->ne[1] != 0) return false;
+    if (op->ne[3] % src1->ne[2] != 0) return false;
+    return true;
+}
+
 bool supports_matmul_q1a8(const ggml_tensor * op) {
     if (op == nullptr || op->op != GGML_OP_MUL_MAT || op->type != GGML_TYPE_F32) {
         return false;
@@ -577,6 +686,228 @@ bool append_matmul_q1a8_op(const ggml_tensor * node, nlohmann::json * ops, nlohm
     return true;
 }
 
+const char * type_tag(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_F32:  return "f32";
+        case GGML_TYPE_F16:  return "f16";
+        case GGML_TYPE_I32:  return "i32";
+        case GGML_TYPE_I64:  return "i64";
+        case GGML_TYPE_Q1_0: return "q1_0";
+        default:             return "unknown";
+    }
+}
+
+bool append_flash_attn_ext_f32_op(
+    const ggml_tensor * node, nlohmann::json * ops, nlohmann::json * outputs) {
+    const ggml_tensor * q = node->src[0];
+    const ggml_tensor * k = node->src[1];
+    const ggml_tensor * v = node->src[2];
+    const ggml_tensor * mask = (GGML_MAX_SRC >= 4) ? node->src[3] : nullptr;
+    const RemoteBinding * q_b = find_tensor_binding(q);
+    const RemoteBinding * k_b = find_tensor_binding(k);
+    const RemoteBinding * v_b = find_tensor_binding(v);
+    const RemoteBinding * mask_b = mask ? find_tensor_binding(mask) : nullptr;
+    const RemoteBinding * dst_b = find_tensor_binding(node);
+
+    if (q_b == nullptr || k_b == nullptr || v_b == nullptr || dst_b == nullptr ||
+        !remote_range_is_valid(*q_b, 0, ggml_nbytes(q)) ||
+        !remote_range_is_valid(*k_b, 0, ggml_nbytes(k)) ||
+        !remote_range_is_valid(*v_b, 0, ggml_nbytes(v)) ||
+        !remote_range_is_valid(*dst_b, 0, ggml_nbytes(node))) {
+        GGML_LOG_ERROR("pynq: FLASH_ATTN_EXT node %s missing handles\n", node->name);
+        return false;
+    }
+    if (mask != nullptr && (mask_b == nullptr ||
+        !remote_range_is_valid(*mask_b, 0, ggml_nbytes(mask)))) {
+        GGML_LOG_ERROR("pynq: FLASH_ATTN_EXT node %s mask handle invalid\n", node->name);
+        return false;
+    }
+
+    float scale         = op_param_f32(node, 0);
+    float max_bias      = op_param_f32(node, 1);
+    float logit_softcap = op_param_f32(node, 2);
+
+    nlohmann::json op = {
+        { P::F_OP,             P::GOP_FLASH_ATTN_EXT_F32 },
+        { P::F_NAME,           tensor_name(node) },
+        { P::F_SRC0,           q_b->handle },
+        { P::F_SRC0_OFFSET,    q_b->remote_offset },
+        { P::F_K_TENSOR,       k_b->handle },
+        { P::F_K_OFFSET,       k_b->remote_offset },
+        { P::F_V_TENSOR,       v_b->handle },
+        { P::F_V_OFFSET,       v_b->remote_offset },
+        { P::F_DST,            dst_b->handle },
+        { P::F_DST_OFFSET,     dst_b->remote_offset },
+        { P::F_HAS_MASK,       mask != nullptr },
+        { P::F_HEAD_DIM_Q,     q->ne[0] },
+        { P::F_HEAD_DIM_V,     v->ne[0] },
+        { P::F_N_TOKEN,        q->ne[1] },
+        { P::F_N_HEAD,         q->ne[2] },
+        { P::F_N_KV,           k->ne[1] },
+        { P::F_N_HEAD_KV,      k->ne[2] },
+        { P::F_SCALE,          scale },
+        { P::F_MAX_BIAS,       max_bias },
+        { P::F_LOGIT_SOFTCAP,  logit_softcap },
+        { P::F_Q_NB1,          q->nb[1] },
+        { P::F_Q_NB2,          q->nb[2] },
+        { P::F_K_NB1,          k->nb[1] },
+        { P::F_K_NB2,          k->nb[2] },
+        { P::F_V_NB1,          v->nb[1] },
+        { P::F_V_NB2,          v->nb[2] },
+        { P::F_DST_NB1,        node->nb[1] },
+        { P::F_DST_NB2,        node->nb[2] },
+    };
+    if (mask != nullptr) {
+        op[P::F_MASK]        = mask_b->handle;
+        op[P::F_MASK_OFFSET] = mask_b->remote_offset;
+        op[P::F_MASK_NB1]    = mask->nb[1];
+    }
+    ops->push_back(std::move(op));
+    outputs->push_back(dst_b->handle);
+    if (trace_enabled()) {
+        tracef(
+            "pynq trace: lower FLASH_ATTN_EXT_F32 node=%s q=%s/%llu k=%s/%llu "
+            "v=%s/%llu dst=%llu head_dim_q=%lld head_dim_v=%lld "
+            "n_head=%lld n_head_kv=%lld n_kv=%lld n_token=%lld scale=%g mask=%s\n",
+            tensor_name(node),
+            tensor_name(q), static_cast<unsigned long long>(q_b->handle),
+            tensor_name(k), static_cast<unsigned long long>(k_b->handle),
+            tensor_name(v), static_cast<unsigned long long>(v_b->handle),
+            static_cast<unsigned long long>(dst_b->handle),
+            static_cast<long long>(q->ne[0]),
+            static_cast<long long>(v->ne[0]),
+            static_cast<long long>(q->ne[2]),
+            static_cast<long long>(k->ne[2]),
+            static_cast<long long>(k->ne[1]),
+            static_cast<long long>(q->ne[1]),
+            scale,
+            mask ? "yes" : "no");
+    }
+    return true;
+}
+
+bool append_get_rows_op(
+    const ggml_tensor * node, nlohmann::json * ops, nlohmann::json * outputs) {
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    const RemoteBinding * src0_b = find_tensor_binding(src0);
+    const RemoteBinding * src1_b = find_tensor_binding(src1);
+    const RemoteBinding * dst_b = find_tensor_binding(node);
+    if (src0_b == nullptr || src1_b == nullptr || dst_b == nullptr ||
+        !remote_range_is_valid(*src0_b, 0, ggml_nbytes(src0)) ||
+        !remote_range_is_valid(*src1_b, 0, ggml_nbytes(src1)) ||
+        !remote_range_is_valid(*dst_b, 0, ggml_nbytes(node))) {
+        GGML_LOG_ERROR("pynq: GET_ROWS node %s missing handles\n", node->name);
+        return false;
+    }
+
+    const int64_t n_indices = src1->ne[0] * src1->ne[1] * src1->ne[2];
+    ops->push_back({
+        { P::F_OP,             P::GOP_GET_ROWS },
+        { P::F_NAME,           tensor_name(node) },
+        { P::F_SRC0,           src0_b->handle },
+        { P::F_SRC0_OFFSET,    src0_b->remote_offset },
+        { P::F_INDICES,        src1_b->handle },
+        { P::F_INDICES_OFFSET, src1_b->remote_offset },
+        { P::F_DST,            dst_b->handle },
+        { P::F_DST_OFFSET,     dst_b->remote_offset },
+        { P::F_SRC0_TYPE,      type_tag(src0->type) },
+        { P::F_INDICES_TYPE,   type_tag(src1->type) },
+        { P::F_HEAD_DIM,       src0->ne[0] },     // row width (n_embd)
+        { P::F_NE01,           src0->ne[1] },     // total rows in src0
+        { P::F_NE02,           src0->ne[2] },
+        { P::F_NE03,           src0->ne[3] },
+        { P::F_N_INDICES,      n_indices },
+        { P::F_NE10,           src1->ne[0] },
+        { P::F_NE11,           src1->ne[1] },
+        { P::F_NE12,           src1->ne[2] },
+        { P::F_SRC0_NB1,       src0->nb[1] },
+        { P::F_SRC0_NB2,       src0->nb[2] },
+        { P::F_SRC0_NB3,       src0->nb[3] },
+        { P::F_INDICES_NB1,    src1->nb[1] },
+        { P::F_INDICES_NB2,    src1->nb[2] },
+        { P::F_DST_NB1,        node->nb[1] },
+        { P::F_DST_NB2,        node->nb[2] },
+        { P::F_DST_NB3,        node->nb[3] },
+    });
+    outputs->push_back(dst_b->handle);
+    if (trace_enabled()) {
+        tracef(
+            "pynq trace: lower GET_ROWS node=%s src0=%s/%llu type=%s "
+            "indices=%s/%llu n_indices=%lld head_dim=%lld\n",
+            tensor_name(node),
+            tensor_name(src0),
+            static_cast<unsigned long long>(src0_b->handle),
+            type_tag(src0->type),
+            tensor_name(src1),
+            static_cast<unsigned long long>(src1_b->handle),
+            static_cast<long long>(n_indices),
+            static_cast<long long>(src0->ne[0]));
+    }
+    return true;
+}
+
+bool append_set_rows_op(
+    const ggml_tensor * node, nlohmann::json * ops, nlohmann::json * outputs) {
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    const RemoteBinding * src0_b = find_tensor_binding(src0);
+    const RemoteBinding * src1_b = find_tensor_binding(src1);
+    const RemoteBinding * dst_b = find_tensor_binding(node);
+    if (src0_b == nullptr || src1_b == nullptr || dst_b == nullptr ||
+        !remote_range_is_valid(*src0_b, 0, ggml_nbytes(src0)) ||
+        !remote_range_is_valid(*src1_b, 0, ggml_nbytes(src1)) ||
+        !remote_range_is_valid(*dst_b, 0, ggml_nbytes(node))) {
+        GGML_LOG_ERROR("pynq: SET_ROWS node %s missing handles\n", node->name);
+        return false;
+    }
+
+    ops->push_back({
+        { P::F_OP,             P::GOP_SET_ROWS },
+        { P::F_NAME,           tensor_name(node) },
+        { P::F_SRC0,           src0_b->handle },
+        { P::F_SRC0_OFFSET,    src0_b->remote_offset },
+        { P::F_INDICES,        src1_b->handle },
+        { P::F_INDICES_OFFSET, src1_b->remote_offset },
+        { P::F_DST,            dst_b->handle },
+        { P::F_DST_OFFSET,     dst_b->remote_offset },
+        { P::F_INDICES_TYPE,   type_tag(src1->type) },
+        { P::F_DST_TYPE,       type_tag(node->type) },  // f16 for KV cache
+        { P::F_HEAD_DIM,       src0->ne[0] },           // nc (row width)
+        { P::F_NE01,           src0->ne[1] },           // n rows in src0
+        { P::F_NE02,           src0->ne[2] },
+        { P::F_NE03,           src0->ne[3] },
+        { P::F_NE10,           src1->ne[0] },
+        { P::F_NE11,           src1->ne[1] },
+        { P::F_NE12,           src1->ne[2] },
+        { P::F_SRC0_NB1,       src0->nb[1] },
+        { P::F_SRC0_NB2,       src0->nb[2] },
+        { P::F_SRC0_NB3,       src0->nb[3] },
+        { P::F_INDICES_NB1,    src1->nb[1] },
+        { P::F_INDICES_NB2,    src1->nb[2] },
+        { P::F_DST_NB1,        node->nb[1] },
+        { P::F_DST_NB2,        node->nb[2] },
+        { P::F_DST_NB3,        node->nb[3] },
+    });
+    outputs->push_back(dst_b->handle);
+    if (trace_enabled()) {
+        tracef(
+            "pynq trace: lower SET_ROWS node=%s src0=%s/%llu indices=%s/%llu "
+            "dst=%llu head_dim=%lld n_rows=%lld dst_type=%s indices_type=%s\n",
+            tensor_name(node),
+            tensor_name(src0),
+            static_cast<unsigned long long>(src0_b->handle),
+            tensor_name(src1),
+            static_cast<unsigned long long>(src1_b->handle),
+            static_cast<unsigned long long>(dst_b->handle),
+            static_cast<long long>(src0->ne[0]),
+            static_cast<long long>(src0->ne[1]),
+            type_tag(node->type),
+            type_tag(src1->type));
+    }
+    return true;
+}
+
 // -- op lowering table ----------------------------------------------------
 //
 // One entry per supported ggml op. ``matches`` decides whether this op
@@ -589,14 +920,17 @@ struct OpLowering {
 };
 
 constexpr OpLowering k_lowerings[] = {
-    { supports_raw_copy,      append_copy_op },
-    { supports_matmul_q1a8,   append_matmul_q1a8_op },
-    { supports_f32_binary,    append_f32_binary_op },
-    { supports_scale_f32,     append_scale_f32_op },
-    { supports_silu_f32,      append_silu_f32_op },
-    { supports_swiglu_f32,    append_swiglu_f32_op },
-    { supports_rms_norm_f32,  append_rms_norm_f32_op },
-    { supports_rope_f32,      append_rope_f32_op },
+    { supports_raw_copy,           append_copy_op },
+    { supports_matmul_q1a8,        append_matmul_q1a8_op },
+    { supports_f32_binary,         append_f32_binary_op },
+    { supports_scale_f32,          append_scale_f32_op },
+    { supports_silu_f32,           append_silu_f32_op },
+    { supports_swiglu_f32,         append_swiglu_f32_op },
+    { supports_rms_norm_f32,       append_rms_norm_f32_op },
+    { supports_rope_f32,           append_rope_f32_op },
+    { supports_flash_attn_ext_f32, append_flash_attn_ext_f32_op },
+    { supports_get_rows,           append_get_rows_op },
+    { supports_set_rows,           append_set_rows_op },
 };
 
 const OpLowering * lookup_lowering(const ggml_tensor * op) {

@@ -44,6 +44,8 @@ GOP_SWIGLU_F32 = "SWIGLU_F32"
 GOP_RMS_NORM_F32 = "RMS_NORM_F32"
 GOP_ROPE_F32 = "ROPE_F32"
 GOP_FLASH_ATTN_EXT_F32 = "FLASH_ATTN_EXT_F32"
+GOP_GET_ROWS = "GET_ROWS"
+GOP_SET_ROWS = "SET_ROWS"
 
 GRAPH_OPS = (
     GOP_COPY,
@@ -56,6 +58,8 @@ GRAPH_OPS = (
     GOP_RMS_NORM_F32,
     GOP_ROPE_F32,
     GOP_FLASH_ATTN_EXT_F32,
+    GOP_GET_ROWS,
+    GOP_SET_ROWS,
 )
 
 # Envelope
@@ -155,9 +159,41 @@ F_V_OFFSET = "v_offset"
 F_MASK = "mask"
 F_MASK_OFFSET = "mask_offset"
 F_HAS_MASK = "has_mask"
+F_HEAD_DIM_Q = "head_dim_q"
 F_HEAD_DIM_V = "head_dim_v"
 F_MAX_BIAS = "max_bias"
 F_LOGIT_SOFTCAP = "logit_softcap"
+
+# FLASH_ATTN_EXT strides (in bytes; nb0 is implicit type_size)
+F_Q_NB1 = "q_nb1"
+F_Q_NB2 = "q_nb2"
+F_K_NB1 = "k_nb1"
+F_K_NB2 = "k_nb2"
+F_V_NB1 = "v_nb1"
+F_V_NB2 = "v_nb2"
+F_MASK_NB1 = "mask_nb1"
+F_DST_NB1 = "dst_nb1"
+F_DST_NB2 = "dst_nb2"
+
+# GET_ROWS / SET_ROWS
+F_INDICES = "indices"
+F_INDICES_OFFSET = "indices_offset"
+F_INDICES_TYPE = "indices_type"   # "i32" | "i64"
+F_SRC0_TYPE = "src0_type"         # "f32" | "f16" | "q1_0"
+F_DST_TYPE = "dst_type"           # "f32" | "f16"
+F_N_INDICES = "n_indices"
+F_SRC0_NB1 = "src0_nb1"
+F_SRC0_NB2 = "src0_nb2"
+F_SRC0_NB3 = "src0_nb3"
+F_INDICES_NB1 = "indices_nb1"
+F_INDICES_NB2 = "indices_nb2"
+F_DST_NB3 = "dst_nb3"
+F_NE10 = "ne10"
+F_NE11 = "ne11"
+F_NE12 = "ne12"
+F_NE01 = "ne01"
+F_NE02 = "ne02"
+F_NE03 = "ne03"
 
 # Error codes returned by the daemon. Hosts should switch on these, not on
 # the human-readable message.

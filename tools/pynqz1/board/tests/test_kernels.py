@@ -11,6 +11,7 @@ from board.profiling.timer import Timer
 from proto.ops import (
     GOP_ADD_F32,
     GOP_COPY,
+    GOP_GET_ROWS,
     GOP_MATMUL_Q1A8,
     GOP_MUL_F32,
     GOP_RMS_NORM_F32,
@@ -154,6 +155,19 @@ def _make_q1_weights(rows: int, k: int) -> bytes:
     return bytes(out)
 
 
+def _decode_q1_row(row: bytes, k: int) -> list[float]:
+    out: list[float] = []
+    for block_index in range(k // Q1_BLOCK):
+        block = row[
+            block_index * Q1_BLOCK_BYTES : (block_index + 1) * Q1_BLOCK_BYTES
+        ]
+        scale = struct.unpack("<e", block[:2])[0]
+        for bit in range(Q1_BLOCK):
+            byte = block[2 + bit // 8]
+            out.append(scale if ((byte >> (bit % 8)) & 1) else -scale)
+    return out
+
+
 def test_rope_f32_normal(registry, allocator):
     head_dim, n_head, n_token = 8, 4, 3
     n_dims = 8  # full rotation
@@ -248,6 +262,53 @@ def test_rope_f32_neox_partial(registry, allocator):
         src, positions, head_dim, n_head, n_token, n_dims, mode, freq_base)
     for got, exp in zip(struct.iter_unpack("<f", out), struct.iter_unpack("<f", expected), strict=False):
         assert got[0] == pytest.approx(exp[0], abs=1e-5)
+
+
+def test_get_rows_q1_0_from_packed_layout(registry, allocator):
+    from proto import q1a8_layout
+
+    rows, k = 10, 256
+    indices = [9, 1, 7]
+    row_bytes = (k // Q1_BLOCK) * Q1_BLOCK_BYTES
+    weights_q1_0 = _make_q1_weights(rows, k)
+    weights_packed = q1a8_layout.pack_weights(weights_q1_0, rows, k)
+    idx_bytes = struct.pack(f"<{len(indices)}i", *indices)
+
+    hw = allocate_and_upload(allocator, weights_packed)
+    hi = allocate_and_upload(allocator, idx_bytes)
+    dst = allocate_empty(allocator, len(indices) * k * F32)
+
+    out = run_one(registry, allocator, {
+        "op": GOP_GET_ROWS,
+        "src0": hw,
+        "indices": hi,
+        "dst": dst,
+        "src0_type": "q1_0",
+        "indices_type": "i32",
+        "head_dim": k,
+        "ne01": rows,
+        "ne02": 1,
+        "ne03": 1,
+        "ne10": len(indices),
+        "ne11": 1,
+        "ne12": 1,
+        "src0_nb1": row_bytes,
+        "src0_nb2": row_bytes * rows,
+        "src0_nb3": row_bytes * rows,
+        "indices_nb1": len(idx_bytes),
+        "indices_nb2": len(idx_bytes),
+        "dst_nb1": k * F32,
+        "dst_nb2": len(indices) * k * F32,
+        "dst_nb3": len(indices) * k * F32,
+    })
+
+    expected: list[float] = []
+    for idx in indices:
+        row = weights_q1_0[idx * row_bytes : (idx + 1) * row_bytes]
+        expected.extend(_decode_q1_row(row, k))
+
+    got = [v[0] for v in struct.iter_unpack("<f", out)]
+    assert got == pytest.approx(expected, abs=0.0)
 
 
 def test_matmul_q1a8(registry, allocator):

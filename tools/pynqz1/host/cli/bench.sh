@@ -82,19 +82,23 @@ if [[ -z "${READY}" ]]; then
 fi
 
 echo "--- running llama-cli (model: ${PYNQ_MODEL}) ---"
+# -ngl 99 offloads ALL transformer layers (including KV cache) to PYNQ.
+# Without it, model.dev_layer(il) = CPU for every layer and ggml's FA
+# auto-detect disables FA on a layer/KV device mismatch — see
+# llama-context.cpp:449 ("layer N is assigned to device CPU but the
+# Flash Attention tensor is assigned to device PYNQ"). With FA off,
+# attention is decomposed into MUL_MAT:f16xf32+SOFT_MAX+CONT splits.
 PYNQ_PROFILE="${HOST_PROFILE}" \
     llama-cli-pynq \
     -m "${PYNQ_MODEL}" \
     -p Hello \
-    -n 16 \
+    -n 2 \
     -c 128 \
     -b 16 -ub 16 \
     -t 4 \
-    -n 2 \
+    -ngl 99 \
     --device PYNQ \
-    --no-kv-offload \
     --temp 0 \
     --no-warmup \
     --single-turn \
-    --no-display-prompt \
-    --verbosity 2
+    --no-display-prompt

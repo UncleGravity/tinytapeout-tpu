@@ -52,9 +52,18 @@
           deploy  = mkPyTool "pynq-deploy"  "host/cli/deploy.py"       transportTools;
           profile = mkPyTool "pynq-profile" "host/cli/pynq-profile.py" [];
 
-          # `nix run .#daemon` — deploy daemon with canonical sizing. Extra
-          # args are forwarded and (because argparse takes the last value)
-          # override the baked-in flags: `nix run .#daemon -- --heap-mib 200`.
+          # `nix run .#daemon` — deploy daemon with canonical sizing.
+          #
+          # heap-mib 288 leaves room for:
+          #   - 231 MiB Bonsai-1.7B Q1_0 weights
+          #   - ~14 MiB KV cache (ctx=128, 28 layers, F16)
+          #   - ~9 MiB activation/compute scratch
+          #   - alignment/fragmentation headroom (each slab loses ≤ slab-mib
+          #     worth at allocation boundaries)
+          # Stays under the ~296 MiB CMA budget on cma=320M boards.
+          # Extra args are forwarded and (because argparse takes the last
+          # value) override the baked-in flags:
+          #   `nix run .#daemon -- --heap-mib 200`
           daemon = pkgs.writeShellApplication {
             name = "pynq-daemon";
             text = ''exec ${pkgs.lib.getExe deploy} daemon --heap-mib 256 --slab-mib 32 "$@"'';

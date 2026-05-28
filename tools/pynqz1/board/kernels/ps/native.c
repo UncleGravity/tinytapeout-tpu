@@ -642,6 +642,386 @@ static void pack_rowblock(
     }
 }
 
+/*
+ * GET_ROWS: dst[i] = src0[indices[i]], dequantized to F32.
+ *
+ * Three entry points, one per src0 type. dst is always F32, indices are
+ * always I32 (ggml uses I32 for GET_ROWS; SET_ROWS is the one with both
+ * I32/I64). Strides are in BYTES.
+ *
+ * Outer loops match ggml-cpu/ops.cpp:4663: for (i12, i11, i10), look up
+ * i01 = indices[i10*nb10 + i11*nb11 + i12*nb12], then copy src0 row
+ * [i01, i11, i12] to dst row [i10, i11, i12]. nb10 is implicit
+ * (= sizeof(int32_t)).
+ */
+static const int32_t * indices_i32_at(
+    const uint8_t * indices, size_t i10,
+    size_t i11, size_t indices_nb1,
+    size_t i12, size_t indices_nb2) {
+    return (const int32_t *)(indices
+        + i10 * sizeof(int32_t)
+        + i11 * indices_nb1
+        + i12 * indices_nb2);
+}
+
+int bonsai_get_rows_f32(
+    const uint8_t * src0,
+    size_t src0_nb1, size_t src0_nb2, size_t src0_nb3,
+    const uint8_t * indices,
+    size_t indices_nb1, size_t indices_nb2,
+    uint8_t * dst,
+    size_t dst_nb1, size_t dst_nb2, size_t dst_nb3,
+    uint32_t head_dim, uint32_t ne01,
+    uint32_t ne10, uint32_t ne11, uint32_t ne12) {
+    if (src0 == NULL || indices == NULL || dst == NULL || head_dim == 0) {
+        return -1;
+    }
+    for (uint32_t i12 = 0; i12 < ne12; ++i12) {
+        for (uint32_t i11 = 0; i11 < ne11; ++i11) {
+            for (uint32_t i10 = 0; i10 < ne10; ++i10) {
+                const int32_t i01 = *indices_i32_at(
+                    indices, i10, i11, indices_nb1, i12, indices_nb2);
+                if (i01 < 0 || (uint32_t) i01 >= ne01) return -2;
+
+                const float * src_row = (const float *)(src0
+                    + (size_t) i01 * src0_nb1
+                    + (size_t) i11 * src0_nb2
+                    + (size_t) i12 * src0_nb3);
+                float * dst_row = (float *)(dst
+                    + (size_t) i10 * dst_nb1
+                    + (size_t) i11 * dst_nb2
+                    + (size_t) i12 * dst_nb3);
+                for (uint32_t d = 0; d < head_dim; ++d) dst_row[d] = src_row[d];
+            }
+        }
+    }
+    return 0;
+}
+
+int bonsai_get_rows_f16(
+    const uint8_t * src0,
+    size_t src0_nb1, size_t src0_nb2, size_t src0_nb3,
+    const uint8_t * indices,
+    size_t indices_nb1, size_t indices_nb2,
+    uint8_t * dst,
+    size_t dst_nb1, size_t dst_nb2, size_t dst_nb3,
+    uint32_t head_dim, uint32_t ne01,
+    uint32_t ne10, uint32_t ne11, uint32_t ne12) {
+    if (src0 == NULL || indices == NULL || dst == NULL || head_dim == 0) {
+        return -1;
+    }
+    for (uint32_t i12 = 0; i12 < ne12; ++i12) {
+        for (uint32_t i11 = 0; i11 < ne11; ++i11) {
+            for (uint32_t i10 = 0; i10 < ne10; ++i10) {
+                const int32_t i01 = *indices_i32_at(
+                    indices, i10, i11, indices_nb1, i12, indices_nb2);
+                if (i01 < 0 || (uint32_t) i01 >= ne01) return -2;
+
+                const uint16_t * src_row = (const uint16_t *)(src0
+                    + (size_t) i01 * src0_nb1
+                    + (size_t) i11 * src0_nb2
+                    + (size_t) i12 * src0_nb3);
+                float * dst_row = (float *)(dst
+                    + (size_t) i10 * dst_nb1
+                    + (size_t) i11 * dst_nb2
+                    + (size_t) i12 * dst_nb3);
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    dst_row[d] = half_to_float(src_row[d]);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+int bonsai_get_rows_q1_0(
+    const uint8_t * src0,
+    size_t src0_nb1, size_t src0_nb2, size_t src0_nb3,
+    const uint8_t * indices,
+    size_t indices_nb1, size_t indices_nb2,
+    uint8_t * dst,
+    size_t dst_nb1, size_t dst_nb2, size_t dst_nb3,
+    uint32_t head_dim, uint32_t ne01,
+    uint32_t ne10, uint32_t ne11, uint32_t ne12) {
+    if (src0 == NULL || indices == NULL || dst == NULL ||
+        head_dim == 0 || (head_dim % BONSAI_Q1_BLOCK) != 0) {
+        return -1;
+    }
+    (void) src0_nb1;
+    (void) src0_nb2;
+    (void) src0_nb3;
+
+    const uint32_t blocks_per_row = head_dim / BONSAI_Q1_BLOCK;
+    const size_t packed_rowblock_bytes =
+        (size_t) blocks_per_row * BONSAI_Q1A8_PACKED_PER_Q1_BLOCK;
+
+    for (uint32_t i12 = 0; i12 < ne12; ++i12) {
+        for (uint32_t i11 = 0; i11 < ne11; ++i11) {
+            for (uint32_t i10 = 0; i10 < ne10; ++i10) {
+                const int32_t i01 = *indices_i32_at(
+                    indices, i10, i11, indices_nb1, i12, indices_nb2);
+                if (i01 < 0 || (uint32_t) i01 >= ne01) return -2;
+
+                float * dst_row = (float *)(dst
+                    + (size_t) i10 * dst_nb1
+                    + (size_t) i11 * dst_nb2
+                    + (size_t) i12 * dst_nb3);
+
+                const uint32_t rb = (uint32_t) i01 / BONSAI_Q1A8_ROWS_PER_BLOCK;
+                const uint32_t lane = (uint32_t) i01 % BONSAI_Q1A8_ROWS_PER_BLOCK;
+                const uint8_t * rb_base =
+                    src0 + (size_t) rb * packed_rowblock_bytes;
+
+                for (uint32_t b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t * blk =
+                        rb_base + (size_t) b * BONSAI_Q1A8_PACKED_PER_Q1_BLOCK;
+                    const uint8_t * scale_ptr =
+                        blk + (size_t) (lane / 4) * 8 + (size_t) (lane % 4) * 2;
+                    const float scale = half_to_float(read_le_u16(scale_ptr));
+                    float * out = dst_row + (size_t) b * BONSAI_Q1_BLOCK;
+
+                    for (uint32_t sub = 0; sub < BONSAI_Q1A8_Q8_SUBBLOCKS; ++sub) {
+                        const uint8_t * sub_ptr =
+                            blk + BONSAI_Q1A8_SCALES_BYTES
+                            + (size_t) sub * BONSAI_Q1A8_WBITS_BYTES
+                            + (size_t) (lane / 2) * 8
+                            + (size_t) (lane % 2) * 4;
+                        const uint32_t bits = read_le_u32(sub_ptr);
+                        for (uint32_t i = 0; i < BONSAI_Q8_BLOCK; ++i) {
+                            const uint32_t out_i = sub * BONSAI_Q8_BLOCK + i;
+                            const int bit = (bits >> i) & 1;
+                            out[out_i] = bit ? scale : -scale;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/*
+ * SET_ROWS: writes src0 (F32) rows into dst (F16) at indices in src1.
+ * Mirrors ggml-cpu/ops.cpp:4904 with the F32→F16 from_float specialization.
+ *
+ * Two entry points by indices type (I32 vs I64). All other strides in BYTES.
+ *   for i03 in 0..ne03:
+ *     for i02 in 0..ne02:
+ *       for i in 0..ne01:
+ *         i12 = i03 % ne12
+ *         i11 = i02 % ne11
+ *         i10 = i
+ *         row = indices[i10*nb10 + i11*nb11 + i12*nb12]
+ *         dst[row, i02, i03] := f16( src0[i, i02, i03] )
+ */
+int bonsai_set_rows_f32_to_f16_i32(
+    const uint8_t * src0,
+    size_t src0_nb1, size_t src0_nb2, size_t src0_nb3,
+    const uint8_t * indices,
+    size_t indices_nb1, size_t indices_nb2,
+    uint8_t * dst,
+    size_t dst_nb1, size_t dst_nb2, size_t dst_nb3,
+    uint32_t head_dim,
+    uint32_t ne01, uint32_t ne02, uint32_t ne03,
+    uint32_t ne11, uint32_t ne12) {
+    if (src0 == NULL || indices == NULL || dst == NULL || head_dim == 0) {
+        return -1;
+    }
+    for (uint32_t i03 = 0; i03 < ne03; ++i03) {
+        for (uint32_t i02 = 0; i02 < ne02; ++i02) {
+            const uint32_t i12 = i03 % ne12;
+            const uint32_t i11 = i02 % ne11;
+            for (uint32_t i = 0; i < ne01; ++i) {
+                const int32_t row = *indices_i32_at(
+                    indices, i, i11, indices_nb1, i12, indices_nb2);
+                if (row < 0) return -2;
+
+                const float * src_row = (const float *)(src0
+                    + (size_t) i   * src0_nb1
+                    + (size_t) i02 * src0_nb2
+                    + (size_t) i03 * src0_nb3);
+                uint16_t * dst_row = (uint16_t *)(dst
+                    + (size_t) row * dst_nb1
+                    + (size_t) i02 * dst_nb2
+                    + (size_t) i03 * dst_nb3);
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    dst_row[d] = float_to_half(src_row[d]);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+int bonsai_set_rows_f32_to_f16_i64(
+    const uint8_t * src0,
+    size_t src0_nb1, size_t src0_nb2, size_t src0_nb3,
+    const uint8_t * indices,
+    size_t indices_nb1, size_t indices_nb2,
+    uint8_t * dst,
+    size_t dst_nb1, size_t dst_nb2, size_t dst_nb3,
+    uint32_t head_dim,
+    uint32_t ne01, uint32_t ne02, uint32_t ne03,
+    uint32_t ne11, uint32_t ne12) {
+    if (src0 == NULL || indices == NULL || dst == NULL || head_dim == 0) {
+        return -1;
+    }
+    for (uint32_t i03 = 0; i03 < ne03; ++i03) {
+        for (uint32_t i02 = 0; i02 < ne02; ++i02) {
+            const uint32_t i12 = i03 % ne12;
+            const uint32_t i11 = i02 % ne11;
+            for (uint32_t i = 0; i < ne01; ++i) {
+                const int64_t * idx_ptr = (const int64_t *)(indices
+                    + (size_t) i   * sizeof(int64_t)
+                    + (size_t) i11 * indices_nb1
+                    + (size_t) i12 * indices_nb2);
+                const int64_t row = *idx_ptr;
+                if (row < 0) return -2;
+
+                const float * src_row = (const float *)(src0
+                    + (size_t) i   * src0_nb1
+                    + (size_t) i02 * src0_nb2
+                    + (size_t) i03 * src0_nb3);
+                uint16_t * dst_row = (uint16_t *)(dst
+                    + (size_t) row * dst_nb1
+                    + (size_t) i02 * dst_nb2
+                    + (size_t) i03 * dst_nb3);
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    dst_row[d] = float_to_half(src_row[d]);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/*
+ * FLASH_ATTN_EXT F32 — online softmax flash attention for Bonsai shape.
+ *
+ * Mirrors ggml-cpu/ops.cpp:8168 (ggml_compute_forward_flash_attn_ext_f16_one_chunk)
+ * with these specializations: Q=F32, K=F16, V=F16, mask=F16 (or none),
+ * GQA (n_head % n_head_kv == 0), no ALiBi, no softcap, no sinks.
+ *
+ * Tensor layout (ggml convention):
+ *   q  : [head_dim_q, n_token, n_head,    1]   nb=[4, q_nb1, q_nb2, *]
+ *   k  : [head_dim_q, n_kv,    n_head_kv, 1]   nb=[2, k_nb1, k_nb2, *]
+ *   v  : [head_dim_v, n_kv,    n_head_kv, 1]   nb=[2, v_nb1, v_nb2, *]
+ *   mask:[n_kv,       n_pad,   1,         1]   nb=[2, mask_nb1, *, *]   (optional)
+ *   dst: [head_dim_v, n_head,  n_token,   1]   nb=[4, dst_nb1, dst_nb2, *]
+ *
+ * Note dst's middle dim is n_head and the slowest is n_token — this is
+ * ggml's permute-on-write. dst_nb1 = head_dim_v*sizeof(float).
+ *
+ * Stack scratch: 4 * BONSAI_FATTN_MAX_HEAD_DIM floats = 4 KiB at HD=256.
+ */
+#define BONSAI_FATTN_MAX_HEAD_DIM 256
+
+int bonsai_flash_attn_ext_f32(
+    const uint8_t * q_data,
+    size_t q_nb1, size_t q_nb2,
+    const uint8_t * k_data,
+    size_t k_nb1, size_t k_nb2,
+    const uint8_t * v_data,
+    size_t v_nb1, size_t v_nb2,
+    const uint8_t * mask_data,   /* NULL if no mask */
+    size_t mask_nb1,
+    uint8_t * dst,
+    size_t dst_nb1, size_t dst_nb2,
+    uint32_t head_dim_q, uint32_t head_dim_v,
+    uint32_t n_head, uint32_t n_head_kv,
+    uint32_t n_kv, uint32_t n_token,
+    float scale) {
+
+    if (q_data == NULL || k_data == NULL || v_data == NULL || dst == NULL) {
+        return -1;
+    }
+    if (head_dim_q == 0 || head_dim_v == 0 || n_head == 0 ||
+        n_head_kv == 0 || n_kv == 0 || n_token == 0) {
+        return -2;
+    }
+    if (head_dim_q > BONSAI_FATTN_MAX_HEAD_DIM ||
+        head_dim_v > BONSAI_FATTN_MAX_HEAD_DIM) {
+        return -3;
+    }
+    if ((n_head % n_head_kv) != 0) return -4;
+
+    const uint32_t rk2 = n_head / n_head_kv;
+
+    float Q_row[BONSAI_FATTN_MAX_HEAD_DIM];
+    float VKQ[BONSAI_FATTN_MAX_HEAD_DIM];
+
+    for (uint32_t iq1 = 0; iq1 < n_token; ++iq1) {
+        const uint8_t * mask_row = mask_data
+            ? (mask_data + (size_t) iq1 * mask_nb1)
+            : NULL;
+
+        for (uint32_t iq2 = 0; iq2 < n_head; ++iq2) {
+            const uint32_t ik2 = iq2 / rk2;
+
+            const float * q_ptr = (const float *)(q_data
+                + (size_t) iq1 * q_nb1
+                + (size_t) iq2 * q_nb2);
+            for (uint32_t d = 0; d < head_dim_q; ++d) Q_row[d] = q_ptr[d];
+
+            float M = -INFINITY;
+            float S = 0.0f;
+            for (uint32_t d = 0; d < head_dim_v; ++d) VKQ[d] = 0.0f;
+
+            for (uint32_t ic = 0; ic < n_kv; ++ic) {
+                float mv = 0.0f;
+                if (mask_row != NULL) {
+                    const uint16_t * mp = (const uint16_t *) mask_row;
+                    mv = half_to_float(mp[ic]);
+                    if (!isfinite(mv) && mv < 0.0f) continue;  /* -INF mask = skip */
+                }
+
+                /* Dot Q (F32) · K[ic] (F16). */
+                const uint16_t * k_ptr = (const uint16_t *)(k_data
+                    + (size_t) ic  * k_nb1
+                    + (size_t) ik2 * k_nb2);
+                float s = 0.0f;
+                for (uint32_t d = 0; d < head_dim_q; ++d) {
+                    s += Q_row[d] * half_to_float(k_ptr[d]);
+                }
+                s = s * scale + mv;
+
+                /* Online softmax update — branchless form taken from
+                 * the ggml reference. */
+                const float Mold = M;
+                float ms = 1.0f;
+                float vs = 1.0f;
+                if (s > M) {
+                    M = s;
+                    ms = expf(Mold - M);
+                    for (uint32_t d = 0; d < head_dim_v; ++d) VKQ[d] *= ms;
+                } else {
+                    vs = expf(s - M);
+                }
+
+                /* VKQ += vs * V[ic] (F16 → F32 mad). */
+                const uint16_t * v_ptr = (const uint16_t *)(v_data
+                    + (size_t) ic  * v_nb1
+                    + (size_t) ik2 * v_nb2);
+                for (uint32_t d = 0; d < head_dim_v; ++d) {
+                    VKQ[d] += vs * half_to_float(v_ptr[d]);
+                }
+
+                S = S * ms + vs;
+            }
+
+            /* Normalize and write to dst[head_dim_v, iq2, iq1]. */
+            const float S_inv = (S == 0.0f) ? 0.0f : (1.0f / S);
+            float * dst_ptr = (float *)(dst
+                + (size_t) iq2 * dst_nb1
+                + (size_t) iq1 * dst_nb2);
+            for (uint32_t d = 0; d < head_dim_v; ++d) {
+                dst_ptr[d] = VKQ[d] * S_inv;
+            }
+        }
+    }
+    return 0;
+}
+
 // Pack a full MATMUL_Q1A8 into the AXIS wire stream. Output layout:
 //   out_stream[col][rowblock] = rowblock_bytes consecutive bytes
 // rowblock count = ceil(rows / ROWS_PER_BLOCK). The last rowblock may be
