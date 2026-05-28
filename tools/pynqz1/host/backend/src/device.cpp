@@ -29,6 +29,7 @@ const char * backend_get_name(ggml_backend_t backend) {
 }
 
 void backend_free(ggml_backend_t backend) {
+    dump_unsupported_op_census();
     delete static_cast<BackendContext *>(backend->context);
     delete backend;
 }

@@ -25,6 +25,13 @@ struct TraceCounters {
 
 TraceCounters & trace_counters();
 
+// Census of ops the scheduler asked about that we returned false for. Used
+// to size the cost-of-adding-support for graph fusion (Phase 2). Always
+// records, even with PYNQ_TRACE off — dump happens at backend_free via
+// dump_unsupported_op_census() so the histogram is visible exactly once.
+void record_unsupported_op(const ggml_tensor * op);
+void dump_unsupported_op_census();
+
 void log_rpc_failure(const char * action, const ggml_tensor * tensor, const std::exception & exc);
 
 } // namespace pynq

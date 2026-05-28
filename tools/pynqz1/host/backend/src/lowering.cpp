@@ -501,7 +501,13 @@ bool device_supports_op_impl(const ggml_tensor * op) {
     if (op != nullptr && is_metadata_op(op->op)) {
         return true;
     }
-    return lookup_lowering(op) != nullptr;
+    const bool ok = lookup_lowering(op) != nullptr;
+    if (!ok) {
+        // Record so dump_unsupported_op_census() at backend_free can show
+        // which op kinds are forcing scheduler splits.
+        record_unsupported_op(op);
+    }
+    return ok;
 }
 
 bool device_offload_op_impl(const ggml_tensor * op) {
