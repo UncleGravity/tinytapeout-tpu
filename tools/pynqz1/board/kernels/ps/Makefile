@@ -23,7 +23,7 @@ endif
 PROTO_DIR := $(abspath ../../../proto)
 INCLUDES  := -I$(PROTO_DIR)/..
 
-SOURCES := native.c $(PROTO_DIR)/q1a8_layout.c
+SOURCES := native.c $(PROTO_DIR)/q1a8_layout.c q1a8_runner.c
 
 $(OUT_DIR)/$(LIB): $(SOURCES)
 	@mkdir -p $(OUT_DIR)

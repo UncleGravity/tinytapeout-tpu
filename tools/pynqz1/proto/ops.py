@@ -42,6 +42,8 @@ GOP_SCALE_F32 = "SCALE_F32"
 GOP_SILU_F32 = "SILU_F32"
 GOP_SWIGLU_F32 = "SWIGLU_F32"
 GOP_RMS_NORM_F32 = "RMS_NORM_F32"
+GOP_ROPE_F32 = "ROPE_F32"
+GOP_FLASH_ATTN_EXT_F32 = "FLASH_ATTN_EXT_F32"
 
 GRAPH_OPS = (
     GOP_COPY,
@@ -52,6 +54,8 @@ GRAPH_OPS = (
     GOP_SILU_F32,
     GOP_SWIGLU_F32,
     GOP_RMS_NORM_F32,
+    GOP_ROPE_F32,
+    GOP_FLASH_ATTN_EXT_F32,
 )
 
 # Envelope
@@ -125,6 +129,30 @@ F_SCALE = "scale"
 F_BIAS = "bias"
 F_EPS = "eps"
 F_NAME = "name"
+
+# ROPE / FLASH_ATTN_EXT
+F_POSITIONS = "positions"
+F_POSITIONS_OFFSET = "positions_offset"
+F_HEAD_DIM = "head_dim"
+F_N_HEAD = "n_head"
+F_N_HEAD_KV = "n_head_kv"
+F_N_TOKEN = "n_token"
+F_N_KV = "n_kv"
+F_N_DIMS = "n_dims"
+F_MODE = "mode"
+F_FREQ_BASE = "freq_base"
+F_FREQ_SCALE = "freq_scale"
+
+F_K_TENSOR = "k_tensor"
+F_K_OFFSET = "k_offset"
+F_V_TENSOR = "v_tensor"
+F_V_OFFSET = "v_offset"
+F_MASK = "mask"
+F_MASK_OFFSET = "mask_offset"
+F_HAS_MASK = "has_mask"
+F_HEAD_DIM_V = "head_dim_v"
+F_MAX_BIAS = "max_bias"
+F_LOGIT_SOFTCAP = "logit_softcap"
 
 # Error codes returned by the daemon. Hosts should switch on these, not on
 # the human-readable message.

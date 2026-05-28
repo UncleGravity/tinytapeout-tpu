@@ -143,6 +143,44 @@ def swiglu_f32(gate: bytes, up: bytes, elements: int) -> bytes:
     )
 
 
+def rope_f32(
+    src: bytes,
+    positions: list[int],
+    head_dim: int,
+    n_head: int,
+    n_token: int,
+    n_dims: int,
+    mode: int,
+    freq_base: float,
+    freq_scale: float = 1.0,
+) -> bytes:
+    """Pure-Python reference for the standard ROPE (NORMAL or NEOX)."""
+    elements = head_dim * n_head * n_token
+    values = list(struct.unpack(f"<{elements}f", src))
+    out = list(values)
+    is_neox = (mode & 2) != 0
+    for t in range(n_token):
+        pos = float(positions[t])
+        for h in range(n_head):
+            base = (t * n_head + h) * head_dim
+            for i in range(0, n_dims, 2):
+                theta = pos * (freq_base ** (-i / n_dims)) * freq_scale
+                c = math.cos(theta)
+                s = math.sin(theta)
+                if is_neox:
+                    i0 = i // 2
+                    i1 = i // 2 + n_dims // 2
+                else:
+                    i0 = i
+                    i1 = i + 1
+                x0 = values[base + i0]
+                x1 = values[base + i1]
+                out[base + i0] = x0 * c - x1 * s
+                out[base + i1] = x0 * s + x1 * c
+            # Tail dims pass through (already copied from values into out)
+    return struct.pack(f"<{elements}f", *out)
+
+
 def rms_norm_f32(src: bytes, rows: int, cols: int, eps: float) -> bytes:
     elements = rows * cols
     values = struct.unpack(f"<{elements}f", src)

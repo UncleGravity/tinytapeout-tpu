@@ -51,7 +51,10 @@ STATUS_DONE = 1 << 1
 
 EXPECTED_ID = 0xB05A_2000
 EXPECTED_VERSION = 4  # v4 = dual-stream (acts via S_AXIS_ACTS, weights via S_AXIS)
-POLL_LIMIT = 100_000
+# Used by the C runner for ALL DMA + kernel waits. Each MMIO poll is ~100ns
+# on Cortex-A9, so 10M polls ≈ 1s — plenty for an 8 MiB DMA chunk (~11ms)
+# but bounded so a hung kernel surfaces as RuntimeError rather than hang.
+POLL_LIMIT = 10_000_000
 
 
 def _required(op: dict[str, Any], key: str) -> int:
@@ -101,7 +104,30 @@ def _bind_native(lib: ctypes.CDLL):
         ctypes.POINTER(ctypes.c_uint8),  # out
     ]
     pack_acts.restype = ctypes.c_int
-    return quantize, pack_acts
+
+    # Single-call orchestration: kernel + DMA reg pokes + wait loops in C
+    # (q1a8_runner.c). Cuts ~10 Python sections out of the hot per-matmul
+    # path, killing the ctypes/PYNQ wrapper overhead that dominated v4 wall
+    # time. Caller (Python) still handles cache flush/invalidate and slab
+    # pointer resolution.
+    run_chunk = lib.bonsai_q1a8_run_matmul_chunk
+    run_chunk.argtypes = [
+        ctypes.c_void_p,                 # kernel_regs (volatile uint32_t *)
+        ctypes.c_void_p,                 # dma_w_regs
+        ctypes.c_void_p,                 # dma_a_regs
+        ctypes.c_uint32,                 # weights_phys_addr
+        ctypes.c_uint32,                 # weights_nbytes
+        ctypes.c_uint32,                 # acts_phys_addr
+        ctypes.c_uint32,                 # acts_nbytes
+        ctypes.c_uint32,                 # result_phys_addr
+        ctypes.c_uint32,                 # result_nbytes
+        ctypes.c_uint32,                 # num_q1_blocks
+        ctypes.c_uint32,                 # num_rowblocks
+        ctypes.c_uint32,                 # poll_limit
+        ctypes.POINTER(ctypes.c_uint32), # out_cycles
+    ]
+    run_chunk.restype = ctypes.c_int
+    return quantize, pack_acts, run_chunk
 
 
 # -- legacy Python helpers (kept for tests & golden comparisons) ----------
@@ -233,6 +259,7 @@ class PLMatmulQ1A8:
     def __init__(self, overlay):
         # v4 bitstream has two DMAs: weights+results on axi_dma_0, acts on
         # axi_dma_1 (MM2S only).
+        self._overlay = overlay
         self._dma_w = overlay.axi_dma_0
         self._dma_a = overlay.axi_dma_1
         self._kernel = overlay.q1a8_kernel_top_0
@@ -247,6 +274,14 @@ class PLMatmulQ1A8:
         self._lib = None
         self._c_quantize = None
         self._c_pack_acts = None
+        self._c_run_chunk = None
+        # MMIO pointers passed to the C runner. Resolved lazily on first
+        # run() (overlay is fully wired by then) since some tests construct
+        # PLMatmulQ1A8 against a fake overlay with no real ip_dict.
+        self._kernel_regs_ptr = None
+        self._dma_w_regs_ptr = None
+        self._dma_a_regs_ptr = None
+        self._mmio_refs: list = []  # keep MMIO objects alive
         # Lazy CMA scratch buffers for the rare case where a tensor spans
         # slab extents: allocator.slab_pointer refuses to hand out a single
         # pointer there, so we copy the bytes into a contiguous CMA scratch
@@ -336,7 +371,35 @@ class PLMatmulQ1A8:
         if self._c_quantize is not None:
             return
         self._lib = load_lib()
-        self._c_quantize, self._c_pack_acts = _bind_native(self._lib)
+        self._c_quantize, self._c_pack_acts, self._c_run_chunk = _bind_native(self._lib)
+
+    def _ensure_mmio_pointers(self) -> None:
+        """Resolve MMIO base addresses for the C runner.
+
+        Called lazily on first run() — the overlay's ip_dict isn't fully
+        populated until the bitstream is actually loaded, which doesn't
+        happen in the host-side registration tests.
+        """
+        if self._kernel_regs_ptr is not None:
+            return
+        from pynq import MMIO
+
+        # Kernel: use the kernel object's existing MMIO so it's the same
+        # view Python uses for ID/version checks. PYNQ exposes it as .mmio
+        # on the DefaultIP-derived kernel object.
+        kernel_mmio = self._kernel.mmio
+        self._mmio_refs.append(kernel_mmio)
+        self._kernel_regs_ptr = kernel_mmio.array.ctypes.data
+
+        # DMAs: open our own MMIO views — PYNQ's DMA Python object wraps
+        # the registers in classes we can't directly hand to C.
+        ip_dict = self._overlay.ip_dict
+        for name, attr in (("axi_dma_0", "_dma_w_regs_ptr"),
+                           ("axi_dma_1", "_dma_a_regs_ptr")):
+            info = ip_dict[name]
+            mmio = MMIO(info["phys_addr"], info["addr_range"])
+            self._mmio_refs.append(mmio)
+            setattr(self, attr, mmio.array.ctypes.data)
 
     def run(self, allocator: TensorAllocator, op: dict[str, Any], timer: Timer) -> None:
         rows = _required(op, F_ROWS)
@@ -355,6 +418,7 @@ class PLMatmulQ1A8:
         timer.add("k", k)
 
         self._ensure_native()
+        self._ensure_mmio_pointers()
 
         blocks_per_row = k // Q1_BLOCK
         packed_bytes_per_rb = q1a8_layout.packed_bytes_per_rowblock(k)
@@ -541,27 +605,26 @@ class PLMatmulQ1A8:
             self._result_buf = allocate(shape=(result_nbytes,), dtype=self._np.uint8)
             self._result_buf_size = result_nbytes
 
-    def _resolve_weights_view(
+    def _resolve_weights_phys(
         self,
         allocator: TensorAllocator,
         handle: int,
         offset: int,
         nbytes: int,
-    ):
-        """Return a PYNQ buffer slice for the weight chunk.
+    ) -> int:
+        """Return the CMA physical address of the weight chunk for DMA.
 
-        Fast path: the chunk fits in one slab extent → return a slice of the
-        slab's pynq_buffer (zero-copy DMA). Fallback: the chunk spans extents
-        → copy bytes through the persistent self._weights_dma_buf scratch
-        and return its view.
+        Fast path: the chunk fits in one slab extent → physical address is
+        slab.pynq_buffer.physical_address + extent.offset. Fallback: copy
+        the chunk through self._weights_dma_buf scratch and return its
+        physical address.
         """
         try:
             slab, abs_off, _ = allocator.slab_view(handle, offset, nbytes)
-            return slab.pynq_buffer[abs_off : abs_off + nbytes]
+            return slab.pynq_buffer.physical_address + abs_off
         except AllocatorError as exc:
             if exc.code != "multi_extent":
                 raise
-        # Multi-extent fallback: stream into the scratch CMA buffer.
         import ctypes as _ct
         assert self._weights_dma_buf is not None
         if nbytes > self._weights_dma_buf_size:
@@ -576,7 +639,7 @@ class PLMatmulQ1A8:
             nbytes,
         )
         self._weights_dma_buf.flush()
-        return self._weights_dma_buf[:nbytes]
+        return self._weights_dma_buf.physical_address
 
     def _run_matmul_dual_stream(
         self,
@@ -590,55 +653,41 @@ class PLMatmulQ1A8:
         num_rowblocks: int,
         timer: Timer,
     ) -> int:
-        """Drive one column-chunk: configure kernel, kick both MM2S DMAs and the
-        result S2MM in parallel, wait for completion. Returns cycle count."""
+        """Drive one column-chunk via the C runner.
+
+        Python does only: resolve weight physical address, call C, then
+        invalidate the result cache. Everything between (~10 sections in
+        the old path) is one bonsai_q1a8_run_matmul_chunk call.
+        """
         assert self._acts_buf is not None and self._result_buf is not None
 
-        acts_view   = self._acts_buf[:acts_stream_nbytes]
-        result_view = self._result_buf[:result_nbytes]
         with timer.section("resolve_weights"):
-            weights_view = self._resolve_weights_view(
+            weights_phys = self._resolve_weights_phys(
                 allocator, weights_handle, weights_offset, weights_nbytes)
 
-        with timer.section("kernel_setup"):
-            self._kernel.write(REG_NUM_Q1_BLOCKS, num_q1_blocks)
-            self._kernel.write(REG_NUM_ROWBLOCKS, num_rowblocks)
-
-        with timer.section("recv_start"):
-            # Arm S2MM before the kernel starts emitting (after first rowblock).
-            self._dma_w.recvchannel.transfer(result_view)
-
-        with timer.section("kernel_start"):
-            self._kernel.write(REG_CTRL, CTRL_START)
-
-        with timer.section("acts_send_start"):
-            # Acts stream is consumed first by the kernel's LOAD_ACTS state;
-            # the weights DMA back-pressures naturally until acts are loaded.
-            self._dma_a.sendchannel.transfer(acts_view)
-
-        with timer.section("weights_send_start"):
-            self._dma_w.sendchannel.transfer(weights_view)
-
-        with timer.section("acts_send_wait"):
-            self._dma_a.sendchannel.wait()
-
-        with timer.section("weights_send_wait"):
-            self._dma_w.sendchannel.wait()
-
-        with timer.section("recv_wait"):
-            self._dma_w.recvchannel.wait()
-
-        with timer.section("poll"):
-            status = 0
-            for _ in range(POLL_LIMIT):
-                status = self._kernel.read(REG_STATUS)
-                if status & STATUS_DONE:
-                    break
-            else:
-                raise RuntimeError(
-                    f"q1a8 kernel never reported done (status=0x{status:08x})")
+        out_cycles = ctypes.c_uint32(0)
+        with timer.section("run_chunk"):
+            rc = self._c_run_chunk(
+                self._kernel_regs_ptr,
+                self._dma_w_regs_ptr,
+                self._dma_a_regs_ptr,
+                ctypes.c_uint32(weights_phys),
+                ctypes.c_uint32(weights_nbytes),
+                ctypes.c_uint32(self._acts_buf.physical_address),
+                ctypes.c_uint32(acts_stream_nbytes),
+                ctypes.c_uint32(self._result_buf.physical_address),
+                ctypes.c_uint32(result_nbytes),
+                ctypes.c_uint32(num_q1_blocks),
+                ctypes.c_uint32(num_rowblocks),
+                ctypes.c_uint32(POLL_LIMIT),
+                ctypes.byref(out_cycles),
+            )
+        if rc != 0:
+            raise RuntimeError(
+                f"bonsai_q1a8_run_matmul_chunk rc={rc} "
+                f"(see q1a8_runner.c for error code mapping)")
 
         with timer.section("result_invalidate"):
-            result_view.invalidate()
+            self._result_buf[:result_nbytes].invalidate()
 
-        return int(self._kernel.read(REG_CYCLES))
+        return int(out_cycles.value)

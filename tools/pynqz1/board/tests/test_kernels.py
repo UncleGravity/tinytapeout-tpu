@@ -14,6 +14,7 @@ from proto.ops import (
     GOP_MATMUL_Q1A8,
     GOP_MUL_F32,
     GOP_RMS_NORM_F32,
+    GOP_ROPE_F32,
     GOP_SCALE_F32,
     GOP_SILU_F32,
     GOP_SWIGLU_F32,
@@ -151,6 +152,60 @@ def _make_q1_weights(rows: int, k: int) -> bytes:
             out += bits
     assert len(out) == rows * blocks_per_row * Q1_BLOCK_BYTES
     return bytes(out)
+
+
+def test_rope_f32_normal(registry, allocator):
+    head_dim, n_head, n_token = 8, 4, 3
+    n_dims = 8  # full rotation
+    mode = 0   # NORMAL
+    freq_base = 10000.0
+    elements = head_dim * n_head * n_token
+
+    src = f32_bytes(elements, seed=21)
+    positions = [0, 5, 11]
+    pos_bytes = struct.pack(f"<{n_token}i", *positions)
+
+    hs = allocate_and_upload(allocator, src)
+    hp = allocate_and_upload(allocator, pos_bytes)
+    dst = allocate_empty(allocator, elements * F32)
+
+    out = run_one(registry, allocator, {
+        "op": GOP_ROPE_F32, "src": hs, "positions": hp, "dst": dst,
+        "head_dim": head_dim, "n_head": n_head, "n_token": n_token,
+        "n_dims": n_dims, "mode": mode,
+        "freq_base": freq_base, "freq_scale": 1.0,
+    })
+    expected = golden.rope_f32(
+        src, positions, head_dim, n_head, n_token, n_dims, mode, freq_base)
+    for got, exp in zip(struct.iter_unpack("<f", out), struct.iter_unpack("<f", expected), strict=False):
+        assert got[0] == pytest.approx(exp[0], abs=1e-5)
+
+
+def test_rope_f32_neox_partial(registry, allocator):
+    head_dim, n_head, n_token = 16, 2, 2
+    n_dims = 8  # only first 8 of 16 rotated; tail copies through
+    mode = 2   # NEOX
+    freq_base = 10000.0
+    elements = head_dim * n_head * n_token
+
+    src = f32_bytes(elements, seed=22)
+    positions = [3, 7]
+    pos_bytes = struct.pack(f"<{n_token}i", *positions)
+
+    hs = allocate_and_upload(allocator, src)
+    hp = allocate_and_upload(allocator, pos_bytes)
+    dst = allocate_empty(allocator, elements * F32)
+
+    out = run_one(registry, allocator, {
+        "op": GOP_ROPE_F32, "src": hs, "positions": hp, "dst": dst,
+        "head_dim": head_dim, "n_head": n_head, "n_token": n_token,
+        "n_dims": n_dims, "mode": mode,
+        "freq_base": freq_base, "freq_scale": 1.0,
+    })
+    expected = golden.rope_f32(
+        src, positions, head_dim, n_head, n_token, n_dims, mode, freq_base)
+    for got, exp in zip(struct.iter_unpack("<f", out), struct.iter_unpack("<f", expected), strict=False):
+        assert got[0] == pytest.approx(exp[0], abs=1e-5)
 
 
 def test_matmul_q1a8(registry, allocator):

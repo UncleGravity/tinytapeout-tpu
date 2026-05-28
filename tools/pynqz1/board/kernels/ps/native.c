@@ -346,6 +346,72 @@ int bonsai_swiglu_f32(
     return 0;
 }
 
+/*
+ * ROPE F32 — rotary position embedding for a [head_dim, n_head, n_token]
+ * tensor in row-major (n_token slowest, head_dim fastest) layout.
+ *
+ * mode bit 1 (GGML_ROPE_TYPE_NEOX = 2) selects NEOX-style element pairing
+ * (i pairs with i + n_dims/2). Otherwise NORMAL-style (i pairs with i+1).
+ * Dimensions >= n_dims are copied through unmodified.
+ *
+ * Only implements the standard ROPE: no YaRN scaling (ext_factor/attn_factor/
+ * beta_*) and no freq_factors tensor. The host lowering predicate refuses
+ * to lower nodes with non-default YaRN params.
+ */
+int bonsai_rope_f32(
+    const float * src,
+    const int32_t * positions,
+    float * dst,
+    uint32_t head_dim,
+    uint32_t n_head,
+    uint32_t n_token,
+    uint32_t n_dims,
+    uint32_t mode,
+    float freq_base,
+    float freq_scale) {
+    if (src == NULL || positions == NULL || dst == NULL) return -1;
+    if (head_dim == 0 || n_head == 0 || n_token == 0) return -2;
+    if (n_dims == 0 || n_dims > head_dim || (n_dims & 1)) return -3;
+
+    const int is_neox = (mode & 2) != 0;
+    const float inv_n_dims = 1.0f / (float) n_dims;
+
+    for (uint32_t t = 0; t < n_token; ++t) {
+        const float pos = (float) positions[t];
+        for (uint32_t h = 0; h < n_head; ++h) {
+            const size_t off = ((size_t) t * n_head + h) * head_dim;
+            const float * in  = src + off;
+            float       * out = dst + off;
+
+            for (uint32_t i = 0; i < n_dims; i += 2) {
+                const float theta = pos
+                    * powf(freq_base, -((float) i) * inv_n_dims)
+                    * freq_scale;
+                const float c = cosf(theta);
+                const float s = sinf(theta);
+
+                uint32_t i0, i1;
+                if (is_neox) {
+                    i0 = i / 2;
+                    i1 = i / 2 + n_dims / 2;
+                } else {
+                    i0 = i;
+                    i1 = i + 1;
+                }
+
+                const float x0 = in[i0];
+                const float x1 = in[i1];
+                out[i0] = x0 * c - x1 * s;
+                out[i1] = x0 * s + x1 * c;
+            }
+            for (uint32_t i = n_dims; i < head_dim; ++i) {
+                out[i] = in[i];
+            }
+        }
+    }
+    return 0;
+}
+
 int bonsai_rms_norm_f32(
     const float * src,
     float * dst,

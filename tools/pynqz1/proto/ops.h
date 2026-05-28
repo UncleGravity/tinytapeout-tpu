@@ -30,6 +30,8 @@ inline constexpr const char GOP_SCALE_F32[]    = "SCALE_F32";
 inline constexpr const char GOP_SILU_F32[]     = "SILU_F32";
 inline constexpr const char GOP_SWIGLU_F32[]   = "SWIGLU_F32";
 inline constexpr const char GOP_RMS_NORM_F32[] = "RMS_NORM_F32";
+inline constexpr const char GOP_ROPE_F32[]     = "ROPE_F32";
+inline constexpr const char GOP_FLASH_ATTN_EXT_F32[] = "FLASH_ATTN_EXT_F32";
 
 // Envelope
 inline constexpr const char F_ID[]      = "id";
@@ -102,6 +104,31 @@ inline constexpr const char F_SCALE[]           = "scale";
 inline constexpr const char F_BIAS[]            = "bias";
 inline constexpr const char F_EPS[]             = "eps";
 inline constexpr const char F_NAME[]            = "name";
+
+// ROPE / FLASH_ATTN_EXT fields
+inline constexpr const char F_POSITIONS[]       = "positions";
+inline constexpr const char F_POSITIONS_OFFSET[] = "positions_offset";
+inline constexpr const char F_HEAD_DIM[]        = "head_dim";
+inline constexpr const char F_N_HEAD[]          = "n_head";
+inline constexpr const char F_N_HEAD_KV[]       = "n_head_kv";
+inline constexpr const char F_N_TOKEN[]         = "n_token";
+inline constexpr const char F_N_KV[]            = "n_kv";
+inline constexpr const char F_N_DIMS[]          = "n_dims";
+inline constexpr const char F_MODE[]            = "mode";
+inline constexpr const char F_FREQ_BASE[]       = "freq_base";
+inline constexpr const char F_FREQ_SCALE[]      = "freq_scale";
+
+// FLASH_ATTN_EXT additional fields
+inline constexpr const char F_K_TENSOR[]        = "k_tensor";
+inline constexpr const char F_K_OFFSET[]        = "k_offset";
+inline constexpr const char F_V_TENSOR[]        = "v_tensor";
+inline constexpr const char F_V_OFFSET[]        = "v_offset";
+inline constexpr const char F_MASK[]            = "mask";
+inline constexpr const char F_MASK_OFFSET[]     = "mask_offset";
+inline constexpr const char F_HAS_MASK[]        = "has_mask";
+inline constexpr const char F_HEAD_DIM_V[]      = "head_dim_v";
+inline constexpr const char F_MAX_BIAS[]        = "max_bias";
+inline constexpr const char F_LOGIT_SOFTCAP[]   = "logit_softcap";
 
 // Error codes
 inline constexpr const char ERR_INVALID_REQUEST[]            = "invalid_request";

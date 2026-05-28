@@ -81,6 +81,15 @@ float op_param_f32(const ggml_tensor * tensor, int index) {
     return value;
 }
 
+int32_t op_param_i32(const ggml_tensor * tensor, int index) {
+    int32_t value = 0;
+    std::memcpy(
+        &value,
+        reinterpret_cast<const char *>(tensor->op_params) + index * sizeof(value),
+        sizeof(value));
+    return value;
+}
+
 bool is_row_broadcast_for(const ggml_tensor * src, const ggml_tensor * dst) {
     if (!is_contiguous_f32(src) || !is_contiguous_f32(dst) || src->ne[0] != dst->ne[0]) {
         return false;
@@ -158,6 +167,37 @@ bool supports_rms_norm_f32(const ggml_tensor * op) {
         is_contiguous_f32(op) &&
         is_contiguous_f32(op->src[0]) &&
         same_shape(op, op->src[0]);
+}
+
+// ROPE: rotary position embedding on F32 [head_dim, n_head, n_token, 1].
+// Supports only the standard ROPE — refuses any YaRN scaling and the
+// optional freq_factors input that newer phi-3-style models use.
+bool supports_rope_f32(const ggml_tensor * op) {
+    if (op == nullptr || op->op != GGML_OP_ROPE) return false;
+    if (op->type != GGML_TYPE_F32) return false;
+    const ggml_tensor * src  = op->src[0];
+    const ggml_tensor * pos  = op->src[1];
+    const ggml_tensor * freq = (GGML_MAX_SRC >= 3) ? op->src[2] : nullptr;
+    if (src == nullptr || pos == nullptr) return false;
+    if (src->type != GGML_TYPE_F32) return false;
+    if (pos->type != GGML_TYPE_I32) return false;
+    if (freq != nullptr) return false;  // no freq_factors support
+    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
+    if (src->ne[3] != 1 || op->ne[3] != 1) return false;
+    if (src->ne[0] != op->ne[0] || src->ne[1] != op->ne[1] ||
+        src->ne[2] != op->ne[2]) return false;
+    // Params: n_dims, mode, _, n_ctx_orig, freq_base, freq_scale,
+    //         ext_factor, attn_factor, beta_fast, beta_slow.
+    const int32_t n_dims = op_param_i32(op, 0);
+    const int32_t mode   = op_param_i32(op, 1);
+    if (n_dims <= 0 || (n_dims & 1) || n_dims > src->ne[0]) return false;
+    if (mode != 0 /*NORMAL*/ && mode != 2 /*NEOX*/) return false;
+    // YaRN must be disabled — non-default values change theta scaling.
+    if (op_param_f32(op, 6) != 0.0f) return false;  // ext_factor
+    if (op_param_f32(op, 7) != 1.0f) return false;  // attn_factor
+    if (op_param_f32(op, 8) != 0.0f) return false;  // beta_fast
+    if (op_param_f32(op, 9) != 0.0f) return false;  // beta_slow
+    return true;
 }
 
 bool supports_matmul_q1a8(const ggml_tensor * op) {
@@ -421,6 +461,60 @@ bool append_rms_norm_f32_op(const ggml_tensor * node, nlohmann::json * ops, nloh
     return true;
 }
 
+bool append_rope_f32_op(const ggml_tensor * node, nlohmann::json * ops, nlohmann::json * outputs) {
+    const ggml_tensor * src = node->src[0];
+    const ggml_tensor * pos = node->src[1];
+    const RemoteBinding * src_b = find_tensor_binding(src);
+    const RemoteBinding * pos_b = find_tensor_binding(pos);
+    const RemoteBinding * dst_b = find_tensor_binding(node);
+    if (src_b == nullptr || pos_b == nullptr || dst_b == nullptr ||
+        !remote_range_is_valid(*src_b, 0, ggml_nbytes(src)) ||
+        !remote_range_is_valid(*pos_b, 0, ggml_nbytes(pos)) ||
+        !remote_range_is_valid(*dst_b, 0, ggml_nbytes(node))) {
+        GGML_LOG_ERROR("pynq: ROPE node %s is missing PYNQ tensor handles\n", node->name);
+        return false;
+    }
+    const int32_t n_dims     = op_param_i32(node, 0);
+    const int32_t mode       = op_param_i32(node, 1);
+    const float   freq_base  = op_param_f32(node, 4);
+    const float   freq_scale = op_param_f32(node, 5);
+    ops->push_back({
+        { P::F_OP, P::GOP_ROPE_F32 },
+        { P::F_NAME, tensor_name(node) },
+        { P::F_SRC, src_b->handle },
+        { P::F_POSITIONS, pos_b->handle },
+        { P::F_DST, dst_b->handle },
+        { P::F_HEAD_DIM, src->ne[0] },
+        { P::F_N_HEAD, src->ne[1] },
+        { P::F_N_TOKEN, src->ne[2] },
+        { P::F_N_DIMS, n_dims },
+        { P::F_MODE, mode },
+        { P::F_FREQ_BASE, freq_base },
+        { P::F_FREQ_SCALE, freq_scale },
+        { P::F_SRC_OFFSET, src_b->remote_offset },
+        { P::F_POSITIONS_OFFSET, pos_b->remote_offset },
+        { P::F_DST_OFFSET, dst_b->remote_offset },
+    });
+    outputs->push_back(dst_b->handle);
+    if (trace_enabled()) {
+        tracef(
+            "pynq trace: lower ROPE_F32 node=%s src=%s/%llu pos=%s/%llu dst=%llu "
+            "head_dim=%lld n_head=%lld n_token=%lld n_dims=%d mode=%d "
+            "freq_base=%g freq_scale=%g\n",
+            tensor_name(node),
+            tensor_name(src),
+            static_cast<unsigned long long>(src_b->handle),
+            tensor_name(pos),
+            static_cast<unsigned long long>(pos_b->handle),
+            static_cast<unsigned long long>(dst_b->handle),
+            static_cast<long long>(src->ne[0]),
+            static_cast<long long>(src->ne[1]),
+            static_cast<long long>(src->ne[2]),
+            n_dims, mode, freq_base, freq_scale);
+    }
+    return true;
+}
+
 bool append_matmul_q1a8_op(const ggml_tensor * node, nlohmann::json * ops, nlohmann::json * outputs) {
     const ggml_tensor * weights = node->src[0];
     const ggml_tensor * acts = node->src[1];
@@ -484,6 +578,7 @@ constexpr OpLowering k_lowerings[] = {
     { supports_silu_f32,      append_silu_f32_op },
     { supports_swiglu_f32,    append_swiglu_f32_op },
     { supports_rms_norm_f32,  append_rms_norm_f32_op },
+    { supports_rope_f32,      append_rope_f32_op },
 };
 
 const OpLowering * lookup_lowering(const ggml_tensor * op) {

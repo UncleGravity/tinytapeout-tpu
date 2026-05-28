@@ -27,8 +27,17 @@ from proto.ops import (
     F_DST_OFFSET,
     F_ELEMENTS,
     F_EPS,
+    F_FREQ_BASE,
+    F_FREQ_SCALE,
+    F_HEAD_DIM,
     F_K,
+    F_MODE,
+    F_N_DIMS,
+    F_N_HEAD,
+    F_N_TOKEN,
     F_NBYTES,
+    F_POSITIONS,
+    F_POSITIONS_OFFSET,
     F_ROWS,
     F_SCALE,
     F_SRC,
@@ -45,6 +54,7 @@ from proto.ops import (
     GOP_MATMUL_Q1A8,
     GOP_MUL_F32,
     GOP_RMS_NORM_F32,
+    GOP_ROPE_F32,
     GOP_SCALE_F32,
     GOP_SILU_F32,
     GOP_SWIGLU_F32,
@@ -454,6 +464,76 @@ class RmsNormF32(_NativeKernel):
         )
 
 
+class RopeF32(_NativeKernel):
+    name = GOP_ROPE_F32
+    symbol = "bonsai_rope_f32"
+    argtypes = (
+        ctypes.POINTER(ctypes.c_float),     # src
+        ctypes.POINTER(ctypes.c_int32),     # positions
+        ctypes.POINTER(ctypes.c_float),     # dst
+        ctypes.c_uint32,                    # head_dim
+        ctypes.c_uint32,                    # n_head
+        ctypes.c_uint32,                    # n_token
+        ctypes.c_uint32,                    # n_dims
+        ctypes.c_uint32,                    # mode
+        ctypes.c_float,                     # freq_base
+        ctypes.c_float,                     # freq_scale
+    )
+
+    def run(self, allocator, op, timer):
+        head_dim = _positive(op, F_HEAD_DIM)
+        n_head   = _positive(op, F_N_HEAD)
+        n_token  = _positive(op, F_N_TOKEN)
+        n_dims   = _positive(op, F_N_DIMS)
+        mode     = _optional_int(op, F_MODE)
+        freq_base  = float(op[F_FREQ_BASE])
+        freq_scale = float(op.get(F_FREQ_SCALE, 1.0))
+
+        elements = head_dim * n_head * n_token
+        src_nbytes = elements * F32_BYTES
+        pos_nbytes = n_token * 4  # int32
+
+        src = _read(
+            allocator,
+            _required(op, F_SRC),
+            _optional_int(op, F_SRC_OFFSET),
+            src_nbytes,
+            timer,
+        )
+        positions = _read(
+            allocator,
+            _required(op, F_POSITIONS),
+            _optional_int(op, F_POSITIONS_OFFSET),
+            pos_nbytes,
+            timer,
+        )
+
+        with timer.section("compute"):
+            out = bytearray(src_nbytes)
+            self._check(
+                self._fn(
+                    (ctypes.c_float * elements).from_buffer_copy(src),
+                    (ctypes.c_int32 * n_token).from_buffer_copy(positions),
+                    (ctypes.c_float * elements).from_buffer(out),
+                    ctypes.c_uint32(head_dim),
+                    ctypes.c_uint32(n_head),
+                    ctypes.c_uint32(n_token),
+                    ctypes.c_uint32(n_dims),
+                    ctypes.c_uint32(mode),
+                    ctypes.c_float(freq_base),
+                    ctypes.c_float(freq_scale),
+                )
+            )
+
+        _write(
+            allocator,
+            _required(op, F_DST),
+            _optional_int(op, F_DST_OFFSET),
+            out,
+            timer,
+        )
+
+
 # -- registry wiring -------------------------------------------------------
 
 
@@ -465,6 +545,7 @@ NATIVE_KERNELS = (
     SiluF32,
     SwigluF32,
     RmsNormF32,
+    RopeF32,
 )
 
 
