@@ -181,6 +181,48 @@ def test_rope_f32_normal(registry, allocator):
         assert got[0] == pytest.approx(exp[0], abs=1e-5)
 
 
+def test_rope_f32_yarn_like_bonsai(registry, allocator):
+    """ROPE with YaRN params resembling Bonsai-1.7B's actual config."""
+    head_dim, n_head, n_token = 128, 4, 2
+    n_dims = 128
+    mode = 0
+    n_ctx_orig = 8192
+    freq_base = 1_000_000.0
+    freq_scale = 0.25
+    ext_factor = 1.0
+    attn_factor = 1.0
+    beta_fast = 32.0
+    beta_slow = 1.0
+    elements = head_dim * n_head * n_token
+
+    src = f32_bytes(elements, seed=33)
+    positions = [13, 27]
+    pos_bytes = struct.pack(f"<{n_token}i", *positions)
+
+    hs = allocate_and_upload(allocator, src)
+    hp = allocate_and_upload(allocator, pos_bytes)
+    dst = allocate_empty(allocator, elements * F32)
+
+    out = run_one(registry, allocator, {
+        "op": GOP_ROPE_F32, "src": hs, "positions": hp, "dst": dst,
+        "head_dim": head_dim, "n_head": n_head, "n_token": n_token,
+        "n_dims": n_dims, "mode": mode,
+        "n_ctx_orig": n_ctx_orig,
+        "freq_base": freq_base, "freq_scale": freq_scale,
+        "ext_factor": ext_factor, "attn_factor": attn_factor,
+        "beta_fast": beta_fast, "beta_slow": beta_slow,
+    })
+    expected = golden.rope_f32(
+        src, positions, head_dim, n_head, n_token, n_dims, mode,
+        freq_base, freq_scale=freq_scale, attn_factor=attn_factor,
+        ext_factor=ext_factor, beta_fast=beta_fast, beta_slow=beta_slow,
+        n_ctx_orig=n_ctx_orig)
+    for got, exp in zip(struct.iter_unpack("<f", out), struct.iter_unpack("<f", expected), strict=False):
+        # YaRN ramp + freq_scale produces small numerical differences vs the
+        # standard rope path; allow a bit more slack than the non-YaRN tests.
+        assert got[0] == pytest.approx(exp[0], abs=1e-4)
+
+
 def test_rope_f32_neox_partial(registry, allocator):
     head_dim, n_head, n_token = 16, 2, 2
     n_dims = 8  # only first 8 of 16 rotated; tail copies through

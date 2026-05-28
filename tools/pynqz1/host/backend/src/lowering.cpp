@@ -169,9 +169,22 @@ bool supports_rms_norm_f32(const ggml_tensor * op) {
         same_shape(op, op->src[0]);
 }
 
-// ROPE: rotary position embedding on F32 [head_dim, n_head, n_token, 1].
-// Supports only the standard ROPE — refuses any YaRN scaling and the
-// optional freq_factors input that newer phi-3-style models use.
+// ROPE op_params layout (ggml.c ggml_rope_impl, 15 × i32):
+//   [0]  legacy n_past (always 0)
+//   [1]  n_dims
+//   [2]  mode
+//   [3]  legacy n_ctx (always 0)
+//   [4]  n_ctx_orig
+//   [5]  freq_base   (float bits)
+//   [6]  freq_scale  (float bits)
+//   [7]  ext_factor  (float bits) — YaRN extrapolation strength
+//   [8]  attn_factor (float bits) — YaRN mscale base
+//   [9]  beta_fast   (float bits) — YaRN ramp inner bound
+//   [10] beta_slow   (float bits) — YaRN ramp outer bound
+//
+// Bonsai-1.7B uses YaRN scaling (ext_factor=1, freq_scale=0.25, beta_fast=32),
+// so the kernel implements the full rope_yarn formula. The predicate only
+// rejects unsupported shapes/dtypes/modes and the freq_factors input.
 bool supports_rope_f32(const ggml_tensor * op) {
     if (op == nullptr || op->op != GGML_OP_ROPE) return false;
     if (op->type != GGML_TYPE_F32) return false;
@@ -181,22 +194,15 @@ bool supports_rope_f32(const ggml_tensor * op) {
     if (src == nullptr || pos == nullptr) return false;
     if (src->type != GGML_TYPE_F32) return false;
     if (pos->type != GGML_TYPE_I32) return false;
-    if (freq != nullptr) return false;  // no freq_factors support
+    if (freq != nullptr) return false;  // freq_factors (phi-3-128k) not supported
     if (!ggml_is_contiguous(src) || !ggml_is_contiguous(op)) return false;
     if (src->ne[3] != 1 || op->ne[3] != 1) return false;
     if (src->ne[0] != op->ne[0] || src->ne[1] != op->ne[1] ||
         src->ne[2] != op->ne[2]) return false;
-    // Params: n_dims, mode, _, n_ctx_orig, freq_base, freq_scale,
-    //         ext_factor, attn_factor, beta_fast, beta_slow.
-    const int32_t n_dims = op_param_i32(op, 0);
-    const int32_t mode   = op_param_i32(op, 1);
+    const int32_t n_dims = op_param_i32(op, 1);
+    const int32_t mode   = op_param_i32(op, 2);
     if (n_dims <= 0 || (n_dims & 1) || n_dims > src->ne[0]) return false;
     if (mode != 0 /*NORMAL*/ && mode != 2 /*NEOX*/) return false;
-    // YaRN must be disabled — non-default values change theta scaling.
-    if (op_param_f32(op, 6) != 0.0f) return false;  // ext_factor
-    if (op_param_f32(op, 7) != 1.0f) return false;  // attn_factor
-    if (op_param_f32(op, 8) != 0.0f) return false;  // beta_fast
-    if (op_param_f32(op, 9) != 0.0f) return false;  // beta_slow
     return true;
 }
 
@@ -474,10 +480,17 @@ bool append_rope_f32_op(const ggml_tensor * node, nlohmann::json * ops, nlohmann
         GGML_LOG_ERROR("pynq: ROPE node %s is missing PYNQ tensor handles\n", node->name);
         return false;
     }
-    const int32_t n_dims     = op_param_i32(node, 0);
-    const int32_t mode       = op_param_i32(node, 1);
-    const float   freq_base  = op_param_f32(node, 4);
-    const float   freq_scale = op_param_f32(node, 5);
+    // See supports_rope_f32 for the param layout. Indices are off-by-one
+    // from "obvious" because ggml has legacy n_past at [0] and n_ctx at [3].
+    const int32_t n_dims      = op_param_i32(node, 1);
+    const int32_t mode        = op_param_i32(node, 2);
+    const int32_t n_ctx_orig  = op_param_i32(node, 4);
+    const float   freq_base   = op_param_f32(node, 5);
+    const float   freq_scale  = op_param_f32(node, 6);
+    const float   ext_factor  = op_param_f32(node, 7);
+    const float   attn_factor = op_param_f32(node, 8);
+    const float   beta_fast   = op_param_f32(node, 9);
+    const float   beta_slow   = op_param_f32(node, 10);
     ops->push_back({
         { P::F_OP, P::GOP_ROPE_F32 },
         { P::F_NAME, tensor_name(node) },
@@ -489,8 +502,13 @@ bool append_rope_f32_op(const ggml_tensor * node, nlohmann::json * ops, nlohmann
         { P::F_N_TOKEN, src->ne[2] },
         { P::F_N_DIMS, n_dims },
         { P::F_MODE, mode },
+        { P::F_N_CTX_ORIG, n_ctx_orig },
         { P::F_FREQ_BASE, freq_base },
         { P::F_FREQ_SCALE, freq_scale },
+        { P::F_EXT_FACTOR, ext_factor },
+        { P::F_ATTN_FACTOR, attn_factor },
+        { P::F_BETA_FAST, beta_fast },
+        { P::F_BETA_SLOW, beta_slow },
         { P::F_SRC_OFFSET, src_b->remote_offset },
         { P::F_POSITIONS_OFFSET, pos_b->remote_offset },
         { P::F_DST_OFFSET, dst_b->remote_offset },

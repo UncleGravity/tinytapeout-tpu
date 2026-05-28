@@ -358,6 +358,29 @@ int bonsai_swiglu_f32(
  * beta_*) and no freq_factors tensor. The host lowering predicate refuses
  * to lower nodes with non-default YaRN params.
  */
+/* YaRN per-dim correction bound (matches ggml's yarn_corr_dim):
+ *   n_dims * log(n_ctx_orig / (n_rot * 2π)) / (2 * log(freq_base))
+ *
+ * Inline pi literal — M_PI isn't in C99 strict, and the board cross-compile
+ * (cc -std=c99 without _GNU_SOURCE) doesn't pick it up from <math.h>.
+ */
+#define BONSAI_TWO_PI 6.283185307179586f
+
+static float bonsai_yarn_corr_dim(int n_dims, int n_ctx_orig,
+                                  float n_rot, float freq_base) {
+    return (float) n_dims
+        * logf((float) n_ctx_orig / (n_rot * BONSAI_TWO_PI))
+        / (2.0f * logf(freq_base));
+}
+
+static float bonsai_yarn_ramp(float low, float high, int i0) {
+    /* y = (i0/2 - low) / max(0.001, high - low); ramp = 1 - clamp01(y) */
+    const float denom = (high - low) > 0.001f ? (high - low) : 0.001f;
+    const float y = ((float) (i0 / 2) - low) / denom;
+    const float cl = y < 0.0f ? 0.0f : (y > 1.0f ? 1.0f : y);
+    return 1.0f - cl;
+}
+
 int bonsai_rope_f32(
     const float * src,
     const int32_t * positions,
@@ -367,14 +390,36 @@ int bonsai_rope_f32(
     uint32_t n_token,
     uint32_t n_dims,
     uint32_t mode,
+    uint32_t n_ctx_orig,
     float freq_base,
-    float freq_scale) {
+    float freq_scale,
+    float ext_factor,
+    float attn_factor,
+    float beta_fast,
+    float beta_slow) {
     if (src == NULL || positions == NULL || dst == NULL) return -1;
     if (head_dim == 0 || n_head == 0 || n_token == 0) return -2;
     if (n_dims == 0 || n_dims > head_dim || (n_dims & 1)) return -3;
 
     const int is_neox = (mode & 2) != 0;
+    const int use_yarn = (ext_factor != 0.0f);
     const float inv_n_dims = 1.0f / (float) n_dims;
+
+    /* YaRN correction-dim window — constant across tokens/heads/dims. */
+    float corr_low  = 0.0f;
+    float corr_high = (float) n_dims;
+    float mscale    = attn_factor;
+    if (use_yarn) {
+        const int ctx_orig = (n_ctx_orig > 0) ? (int) n_ctx_orig : 1;
+        const float start = floorf(
+            bonsai_yarn_corr_dim((int) n_dims, ctx_orig, beta_fast, freq_base));
+        const float end   = ceilf(
+            bonsai_yarn_corr_dim((int) n_dims, ctx_orig, beta_slow, freq_base));
+        corr_low  = start < 0.0f ? 0.0f : start;
+        corr_high = end > (float) (n_dims - 1) ? (float) (n_dims - 1) : end;
+        /* YaRN mscale magnitude correction (matches ggml's rope_yarn). */
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
 
     for (uint32_t t = 0; t < n_token; ++t) {
         const float pos = (float) positions[t];
@@ -384,11 +429,20 @@ int bonsai_rope_f32(
             float       * out = dst + off;
 
             for (uint32_t i = 0; i < n_dims; i += 2) {
-                const float theta = pos
-                    * powf(freq_base, -((float) i) * inv_n_dims)
-                    * freq_scale;
-                const float c = cosf(theta);
-                const float s = sinf(theta);
+                const float theta_extrap = pos
+                    * powf(freq_base, -((float) i) * inv_n_dims);
+                float theta;
+                if (use_yarn) {
+                    const float theta_interp = freq_scale * theta_extrap;
+                    const float ramp_mix = bonsai_yarn_ramp(corr_low, corr_high,
+                                                            (int) i) * ext_factor;
+                    theta = theta_interp * (1.0f - ramp_mix)
+                          + theta_extrap * ramp_mix;
+                } else {
+                    theta = theta_extrap * freq_scale;
+                }
+                const float c = cosf(theta) * mscale;
+                const float s = sinf(theta) * mscale;
 
                 uint32_t i0, i1;
                 if (is_neox) {

@@ -117,6 +117,11 @@ inline constexpr const char F_N_DIMS[]          = "n_dims";
 inline constexpr const char F_MODE[]            = "mode";
 inline constexpr const char F_FREQ_BASE[]       = "freq_base";
 inline constexpr const char F_FREQ_SCALE[]      = "freq_scale";
+inline constexpr const char F_ATTN_FACTOR[]     = "attn_factor";
+inline constexpr const char F_EXT_FACTOR[]      = "ext_factor";
+inline constexpr const char F_BETA_FAST[]       = "beta_fast";
+inline constexpr const char F_BETA_SLOW[]       = "beta_slow";
+inline constexpr const char F_N_CTX_ORIG[]      = "n_ctx_orig";
 
 // FLASH_ATTN_EXT additional fields
 inline constexpr const char F_K_TENSOR[]        = "k_tensor";

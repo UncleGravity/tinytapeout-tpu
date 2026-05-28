@@ -143,6 +143,16 @@ def swiglu_f32(gate: bytes, up: bytes, elements: int) -> bytes:
     )
 
 
+def _yarn_corr_dim(n_dims: int, n_ctx_orig: int, n_rot: float, base: float) -> float:
+    return n_dims * math.log(n_ctx_orig / (n_rot * 2 * math.pi)) / (2 * math.log(base))
+
+
+def _yarn_ramp(low: float, high: float, i0: int) -> float:
+    denom = max(0.001, high - low)
+    y = ((i0 / 2) - low) / denom
+    return 1.0 - max(0.0, min(1.0, y))
+
+
 def rope_f32(
     src: bytes,
     positions: list[int],
@@ -153,20 +163,44 @@ def rope_f32(
     mode: int,
     freq_base: float,
     freq_scale: float = 1.0,
+    attn_factor: float = 1.0,
+    ext_factor: float = 0.0,
+    beta_fast: float = 0.0,
+    beta_slow: float = 0.0,
+    n_ctx_orig: int = 0,
 ) -> bytes:
-    """Pure-Python reference for the standard ROPE (NORMAL or NEOX)."""
+    """Pure-Python reference for ROPE (NORMAL/NEOX) with optional YaRN."""
     elements = head_dim * n_head * n_token
     values = list(struct.unpack(f"<{elements}f", src))
     out = list(values)
     is_neox = (mode & 2) != 0
+    use_yarn = ext_factor != 0.0
+
+    corr_low = 0.0
+    corr_high = float(n_dims)
+    mscale = attn_factor
+    if use_yarn:
+        ctx_orig = n_ctx_orig if n_ctx_orig > 0 else 1
+        start = math.floor(_yarn_corr_dim(n_dims, ctx_orig, beta_fast, freq_base))
+        end = math.ceil(_yarn_corr_dim(n_dims, ctx_orig, beta_slow, freq_base))
+        corr_low = max(0.0, start)
+        corr_high = min(float(n_dims - 1), end)
+        mscale *= 1.0 + 0.1 * math.log(1.0 / freq_scale)
+
     for t in range(n_token):
         pos = float(positions[t])
         for h in range(n_head):
             base = (t * n_head + h) * head_dim
             for i in range(0, n_dims, 2):
-                theta = pos * (freq_base ** (-i / n_dims)) * freq_scale
-                c = math.cos(theta)
-                s = math.sin(theta)
+                theta_extrap = pos * (freq_base ** (-i / n_dims))
+                if use_yarn:
+                    theta_interp = freq_scale * theta_extrap
+                    ramp_mix = _yarn_ramp(corr_low, corr_high, i) * ext_factor
+                    theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix
+                else:
+                    theta = theta_extrap * freq_scale
+                c = math.cos(theta) * mscale
+                s = math.sin(theta) * mscale
                 if is_neox:
                     i0 = i // 2
                     i1 = i // 2 + n_dims // 2
@@ -177,7 +211,6 @@ def rope_f32(
                 x1 = values[base + i1]
                 out[base + i0] = x0 * c - x1 * s
                 out[base + i1] = x0 * s + x1 * c
-            # Tail dims pass through (already copied from values into out)
     return struct.pack(f"<{elements}f", *out)
 
 

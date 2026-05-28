@@ -27,8 +27,13 @@ from proto.ops import (
     F_DST_OFFSET,
     F_ELEMENTS,
     F_EPS,
+    F_ATTN_FACTOR,
+    F_BETA_FAST,
+    F_BETA_SLOW,
+    F_EXT_FACTOR,
     F_FREQ_BASE,
     F_FREQ_SCALE,
+    F_N_CTX_ORIG,
     F_HEAD_DIM,
     F_K,
     F_MODE,
@@ -476,8 +481,13 @@ class RopeF32(_NativeKernel):
         ctypes.c_uint32,                    # n_token
         ctypes.c_uint32,                    # n_dims
         ctypes.c_uint32,                    # mode
+        ctypes.c_uint32,                    # n_ctx_orig
         ctypes.c_float,                     # freq_base
         ctypes.c_float,                     # freq_scale
+        ctypes.c_float,                     # ext_factor
+        ctypes.c_float,                     # attn_factor
+        ctypes.c_float,                     # beta_fast
+        ctypes.c_float,                     # beta_slow
     )
 
     def run(self, allocator, op, timer):
@@ -486,8 +496,13 @@ class RopeF32(_NativeKernel):
         n_token  = _positive(op, F_N_TOKEN)
         n_dims   = _positive(op, F_N_DIMS)
         mode     = _optional_int(op, F_MODE)
-        freq_base  = float(op[F_FREQ_BASE])
-        freq_scale = float(op.get(F_FREQ_SCALE, 1.0))
+        n_ctx_orig  = _optional_int(op, F_N_CTX_ORIG)
+        freq_base   = float(op[F_FREQ_BASE])
+        freq_scale  = float(op.get(F_FREQ_SCALE, 1.0))
+        ext_factor  = float(op.get(F_EXT_FACTOR, 0.0))
+        attn_factor = float(op.get(F_ATTN_FACTOR, 1.0))
+        beta_fast   = float(op.get(F_BETA_FAST, 0.0))
+        beta_slow   = float(op.get(F_BETA_SLOW, 0.0))
 
         elements = head_dim * n_head * n_token
         src_nbytes = elements * F32_BYTES
@@ -520,8 +535,13 @@ class RopeF32(_NativeKernel):
                     ctypes.c_uint32(n_token),
                     ctypes.c_uint32(n_dims),
                     ctypes.c_uint32(mode),
+                    ctypes.c_uint32(n_ctx_orig),
                     ctypes.c_float(freq_base),
                     ctypes.c_float(freq_scale),
+                    ctypes.c_float(ext_factor),
+                    ctypes.c_float(attn_factor),
+                    ctypes.c_float(beta_fast),
+                    ctypes.c_float(beta_slow),
                 )
             )
 
