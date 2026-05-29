@@ -93,7 +93,7 @@ PYNQ_PROFILE="${HOST_PROFILE}" \
     -m "${PYNQ_MODEL}" \
     -p Hello \
     -n 2 \
-    -c 128 \
+    -c 32 \
     -b 16 -ub 16 \
     -t 4 \
     -ngl 99 \

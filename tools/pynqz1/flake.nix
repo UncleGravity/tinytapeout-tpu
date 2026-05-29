@@ -66,7 +66,7 @@
           #   `nix run .#daemon -- --heap-mib 200`
           daemon = pkgs.writeShellApplication {
             name = "pynq-daemon";
-            text = ''exec ${pkgs.lib.getExe deploy} daemon --heap-mib 256 --slab-mib 32 "$@"'';
+            text = ''exec ${pkgs.lib.getExe deploy} daemon --heap-mib 280 --slab-mib 32 "$@"'';
             meta.mainProgram = "pynq-daemon";
           };
 
