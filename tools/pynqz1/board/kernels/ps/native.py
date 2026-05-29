@@ -615,6 +615,25 @@ _SLAB_SCRATCH_BUFS: dict[tuple[str, str], object] = {}
 _SLAB_SCRATCH_SIZES: dict[tuple[str, str], int] = {}
 
 
+def _readable_base(
+    allocator: TensorAllocator, handle: int, offset: int, nbytes: int,
+) -> tuple[int, object]:
+    """Return ``(C pointer, keepalive)`` for a read-only tensor range.
+
+    Fast path: a single pynq-backed slab extent → the slab's user-space VA,
+    keepalive=None. Fallback (multi-extent, or a non-pynq FakeSlab in host
+    tests): copy the bytes into a ctypes buffer and return its address. The
+    caller must hold the returned keepalive for as long as it dereferences
+    the pointer.
+    """
+    try:
+        return allocator.slab_pointer(handle, offset, nbytes), None
+    except AllocatorError:
+        data = allocator.read(handle, offset, nbytes)
+        buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+        return ctypes.addressof(buf), buf
+
+
 def _slab_pointer_or_scratch(
     allocator: TensorAllocator,
     handle: int,
@@ -1019,33 +1038,26 @@ class SetRows:
     """SET_ROWS src0 F32 → dst F16. Indices i32 or i64."""
     name = GOP_SET_ROWS
 
+    _ALLOWED_IDX_TYPES = ("i32", "i64")
+
     def __init__(self, lib: ctypes.CDLL):
-        common_argtypes = (
-            ctypes.c_void_p,                              # src0
-            ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,  # src0_nb1/2/3
-            ctypes.c_void_p,                              # indices
-            ctypes.c_size_t, ctypes.c_size_t,            # indices_nb1/2
-            ctypes.c_void_p,                              # dst
-            ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,  # dst_nb1/2/3
-            ctypes.c_uint32,                              # head_dim
-            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,  # ne01/02/03
-            ctypes.c_uint32, ctypes.c_uint32,            # ne11/12
-        )
-        self._fns = {}
-        for tag, sym in (
-            ("i32", "bonsai_set_rows_f32_to_f16_i32"),
-            ("i64", "bonsai_set_rows_f32_to_f16_i64"),
-        ):
-            fn = getattr(lib, sym)
-            fn.argtypes = list(common_argtypes)
-            fn.restype = ctypes.c_int
-            self._fns[tag] = fn
+        # SET_ROWS writes a handful of scattered KV-cache rows per call. The
+        # dst (KV cache) is large and usually multi-extent, so staging the
+        # whole tensor through scratch dominated decode (it read+wrote the
+        # entire cache to update ~256 B). Instead we resolve each indexed row
+        # to its slab extent and convert just that row F32->F16 in place,
+        # flushing each touched slab once. This per-row converter keeps the
+        # numerics identical to the bulk bonsai_set_rows_f32_to_f16_* kernels.
+        fn = lib.bonsai_set_rows_row_f32_to_f16
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
+        fn.restype = ctypes.c_int
+        self._row_fn = fn
 
     def run(self, allocator, op, timer):
         if str(op.get(F_DST_TYPE, "f16")) != "f16":
             raise AllocatorError("invalid_request", "SET_ROWS dst must be f16")
         idx_type = str(op.get(F_INDICES_TYPE, "i32"))
-        if idx_type not in self._fns:
+        if idx_type not in self._ALLOWED_IDX_TYPES:
             raise AllocatorError(
                 "invalid_request",
                 f"SET_ROWS indices type {idx_type!r} unsupported (i32/i64 only)",
@@ -1068,56 +1080,91 @@ class SetRows:
         dst_nb2 = int(op.get(F_DST_NB2, dst_nb1))
         dst_nb3 = int(op.get(F_DST_NB3, dst_nb2))
 
+        src0_offset = _optional_int(op, F_SRC0_OFFSET)
+        indices_offset = _optional_int(op, F_INDICES_OFFSET)
+        dst_offset = _optional_int(op, F_DST_OFFSET)
+        src0_handle = _required(op, F_SRC0)
+        indices_handle = _required(op, F_INDICES)
+        dst_handle = _required(op, F_DST)
+
         src0_nbytes = src0_nb3 * ne03
         indices_nbytes = indices_nb2 * ne12
-        # dst is the KV cache — large. We touch [0, max_row*dst_nb1) potentially.
-        # For correctness we just claim the whole tensor allocation.
-        dst_handle = _required(op, F_DST)
-        dst_record = allocator.describe(dst_handle)
-        dst_nbytes = int(dst_record["nbytes"]) - _optional_int(op, F_DST_OFFSET)
+        dst_row_bytes = head_dim * 2  # F16
 
+        # Pull the (small) index table and a base pointer to the source rows.
+        # SET_ROWS only writes dst, so unlike the old path we never read the
+        # KV cache here.
         with timer.section("read"):
-            src_ptr, src_own = _slab_pointer_or_scratch(
-                allocator, _required(op, F_SRC0),
-                _optional_int(op, F_SRC0_OFFSET), src0_nbytes,
-                kernel="set_rows", role="src0",
-            )
-            idx_ptr, idx_own = _slab_pointer_or_scratch(
-                allocator, _required(op, F_INDICES),
-                _optional_int(op, F_INDICES_OFFSET), indices_nbytes,
-                kernel="set_rows", role="indices",
-            )
-            dst_ptr, dst_own = _slab_pointer_or_scratch(
-                allocator, dst_handle,
-                _optional_int(op, F_DST_OFFSET), dst_nbytes,
-                kernel="set_rows", role="dst", writeback=True,
-            )
+            idx_raw = allocator.read(indices_handle, indices_offset, indices_nbytes)
+            src_ptr, _src_keepalive = _readable_base(
+                allocator, src0_handle, src0_offset, src0_nbytes)
         timer.add("bytes_read", src0_nbytes + indices_nbytes)
 
-        fn = self._fns[idx_type]
-        with timer.section("compute"):
-            rc = fn(
-                ctypes.c_void_p(src_ptr),
-                ctypes.c_size_t(src0_nb1), ctypes.c_size_t(src0_nb2), ctypes.c_size_t(src0_nb3),
-                ctypes.c_void_p(idx_ptr),
-                ctypes.c_size_t(indices_nb1), ctypes.c_size_t(indices_nb2),
-                ctypes.c_void_p(dst_ptr),
-                ctypes.c_size_t(dst_nb1), ctypes.c_size_t(dst_nb2), ctypes.c_size_t(dst_nb3),
-                ctypes.c_uint32(head_dim),
-                ctypes.c_uint32(ne01), ctypes.c_uint32(ne02), ctypes.c_uint32(ne03),
-                ctypes.c_uint32(ne11), ctypes.c_uint32(ne12),
-            )
-            if rc != 0:
-                raise RuntimeError(f"bonsai_set_rows_f32_to_f16_{idx_type} rc={rc}")
+        # Per-slab touched byte range, so flush_range can be a true range
+        # flush once the system-wide refactor lands (it's whole-buffer today).
+        touched: dict[int, list] = {}
+        scratch = (ctypes.c_ubyte * dst_row_bytes)()
+        n_written = 0
 
-        # SET_ROWS' "dst" really is the same tensor logically as the KV
-        # cache — writes accumulate. Only the changed rows need writeback,
-        # but for the multi-extent path we wrote into scratch, so flush
-        # the whole scratch range. (When slab_pointer succeeds, dst_own
-        # is None and this is a no-op.)
+        with timer.section("compute"):
+            for i03 in range(ne03):
+                i12 = i03 % ne12
+                for i02 in range(ne02):
+                    i11 = i02 % ne11
+                    for i in range(ne01):
+                        ioff = i * idx_elem + i11 * indices_nb1 + i12 * indices_nb2
+                        row = int.from_bytes(
+                            idx_raw[ioff:ioff + idx_elem], "little", signed=True)
+                        if row < 0:
+                            raise AllocatorError(
+                                "invalid_request", "SET_ROWS index must be non-negative")
+
+                        src_addr = src_ptr + i * src0_nb1 + i02 * src0_nb2 + i03 * src0_nb3
+                        dst_rel = dst_offset + row * dst_nb1 + i02 * dst_nb2 + i03 * dst_nb3
+                        self._write_row(
+                            allocator, dst_handle, dst_rel, dst_row_bytes,
+                            src_addr, head_dim, scratch, touched)
+                        n_written += 1
+
         with timer.section("write"):
-            _scratch_writeback(dst_own, allocator)
-        timer.add("bytes_written", ne01 * head_dim * 2)  # F16 bytes
+            for slab, lo, hi in touched.values():
+                slab.flush_range(lo, hi - lo)
+        timer.add("bytes_written", n_written * dst_row_bytes)
+
+    def _write_row(self, allocator, dst_handle, dst_rel, dst_row_bytes,
+                   src_addr, head_dim, scratch, touched):
+        """Convert one F32 row to F16 directly into its dst slab extent.
+
+        Fast path: the row lives in a single pynq-backed slab → write into the
+        CMA mapping in place and defer the flush to the caller. Fallbacks:
+        FakeSlab (host tests) writes via the bytearray; a row that straddles
+        an extent boundary (very rare — rows are ~256 B) goes through the
+        allocator. Either way only the touched row moves, never the whole
+        tensor.
+        """
+        try:
+            slab, abs_off, _ = allocator.slab_view(dst_handle, dst_rel, dst_row_bytes)
+        except AllocatorError as exc:
+            if exc.code != "multi_extent":
+                raise
+            self._row_fn(scratch, ctypes.c_void_p(src_addr), head_dim)
+            allocator.write(dst_handle, dst_rel, bytes(scratch))
+            return
+
+        buf = getattr(slab, "pynq_buffer", None)
+        if buf is None:  # FakeSlab — no CMA mapping to write through.
+            self._row_fn(scratch, ctypes.c_void_p(src_addr), head_dim)
+            slab.write(abs_off, bytes(scratch))
+            return
+
+        dst_addr = buf.ctypes.data_as(ctypes.c_void_p).value + abs_off
+        self._row_fn(ctypes.c_void_p(dst_addr), ctypes.c_void_p(src_addr), head_dim)
+        entry = touched.get(id(slab))
+        if entry is None:
+            touched[id(slab)] = [slab, abs_off, abs_off + dst_row_bytes]
+        else:
+            entry[1] = min(entry[1], abs_off)
+            entry[2] = max(entry[2], abs_off + dst_row_bytes)
 
 
 # -- registry wiring -------------------------------------------------------

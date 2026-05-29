@@ -896,6 +896,26 @@ int bonsai_set_rows_f32_to_f16_i64(
 }
 
 /*
+ * SET_ROWS fast path: convert one contiguous row of `head_dim` F32 values to
+ * F16 and write it at `dst`. The Python kernel resolves each destination
+ * row's slab address and calls this per row, so it never stages the whole
+ * KV-cache tensor through scratch. Numerics match the bulk
+ * bonsai_set_rows_f32_to_f16_* kernels above (same float_to_half).
+ */
+int bonsai_set_rows_row_f32_to_f16(
+    uint8_t * dst, const uint8_t * src, uint32_t head_dim) {
+    if (dst == NULL || src == NULL || head_dim == 0) {
+        return -1;
+    }
+    const float * src_row = (const float *) src;
+    uint16_t * dst_row = (uint16_t *) dst;
+    for (uint32_t d = 0; d < head_dim; ++d) {
+        dst_row[d] = float_to_half(src_row[d]);
+    }
+    return 0;
+}
+
+/*
  * FLASH_ATTN_EXT F32 — online softmax flash attention for Bonsai shape.
  *
  * Mirrors ggml-cpu/ops.cpp:8168 (ggml_compute_forward_flash_attn_ext_f16_one_chunk)

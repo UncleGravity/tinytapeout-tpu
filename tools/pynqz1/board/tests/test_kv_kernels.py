@@ -281,6 +281,110 @@ def test_set_rows_f32_to_f16_i64(lib):
     )
 
 
+# ----------------------------------------------------------------------------
+# SET_ROWS via the full kernel dispatch path (allocator + slab layer), which
+# the C-only tests above don't cover. Exercises the per-row direct-write path
+# that replaced the whole-tensor scratch staging.
+# ----------------------------------------------------------------------------
+
+
+def _alloc_upload(allocator, data: bytes) -> int:
+    rec = allocator.allocate(len(data), shape=[len(data)], dtype="u8")
+    allocator.write(rec.handle, 0, data)
+    return rec.handle
+
+
+def _set_rows_op(src0, indices, dst, *, head_dim, n_rows):
+    from proto.ops import (
+        F_DST,
+        F_DST_NB1,
+        F_DST_TYPE,
+        F_HEAD_DIM,
+        F_INDICES,
+        F_INDICES_TYPE,
+        F_NE01,
+        F_SRC0,
+        F_SRC0_NB1,
+        GOP_SET_ROWS,
+    )
+    return {
+        "op": GOP_SET_ROWS,
+        F_SRC0: src0, F_INDICES: indices, F_DST: dst,
+        F_HEAD_DIM: head_dim, F_NE01: n_rows,
+        F_SRC0_NB1: head_dim * 4, F_DST_NB1: head_dim * 2,
+        F_INDICES_TYPE: "i32", F_DST_TYPE: "f16",
+    }
+
+
+def test_set_rows_kernel_basic(registry, allocator):
+    """Scatter 2 F32 rows into an F16 dst at indices [4, 1]; others untouched."""
+    from board.profiling.timer import Timer
+
+    head_dim, dst_rows = 8, 6
+    rng = np.random.default_rng(11)
+    src = rng.standard_normal((2, head_dim), dtype=np.float32)
+    indices = np.array([4, 1], dtype=np.int32)
+    poison = np.full((dst_rows, head_dim), 0xBEEF, dtype=np.uint16)
+
+    src_h = _alloc_upload(allocator, src.tobytes())
+    idx_h = _alloc_upload(allocator, indices.tobytes())
+    dst_h = _alloc_upload(allocator, poison.tobytes())
+
+    op = _set_rows_op(src_h, idx_h, dst_h, head_dim=head_dim, n_rows=2)
+    registry.get(op["op"]).run(allocator, op, Timer())
+
+    out = np.frombuffer(
+        allocator.read(dst_h, 0, dst_rows * head_dim * 2), dtype=np.uint16
+    ).reshape(dst_rows, head_dim)
+    out_f32 = out.view(np.float16).astype(np.float32)
+    for i, row in enumerate(indices):
+        np.testing.assert_allclose(
+            out_f32[row], src[i].astype(np.float16).astype(np.float32),
+            rtol=2e-3, atol=2e-3)
+    for r in (0, 2, 3, 5):
+        assert (out[r] == 0xBEEF).all()
+
+
+def test_set_rows_kernel_spans_slabs(registry, allocator):
+    """A dst tensor larger than one 256 KiB slab: rows land in different
+    extents, exercising per-row slab resolution."""
+    from board.profiling.timer import Timer
+
+    head_dim = 8
+    dst_rows = 40000  # 40000 * 16 B = 625 KiB > slab_bytes (256 KiB)
+    rng = np.random.default_rng(12)
+    src = rng.standard_normal((2, head_dim), dtype=np.float32)
+    indices = np.array([0, dst_rows - 1], dtype=np.int32)  # first + last slab
+
+    src_h = _alloc_upload(allocator, src.tobytes())
+    idx_h = _alloc_upload(allocator, indices.tobytes())
+    dst_h = allocator.allocate(
+        dst_rows * head_dim * 2, shape=[dst_rows * head_dim * 2], dtype="u8").handle
+
+    op = _set_rows_op(src_h, idx_h, dst_h, head_dim=head_dim, n_rows=2)
+    registry.get(op["op"]).run(allocator, op, Timer())
+
+    for i, row in enumerate(indices):
+        raw = allocator.read(dst_h, int(row) * head_dim * 2, head_dim * 2)
+        got = np.frombuffer(raw, dtype=np.uint16).view(np.float16).astype(np.float32)
+        np.testing.assert_allclose(
+            got, src[i].astype(np.float16).astype(np.float32), rtol=2e-3, atol=2e-3)
+
+
+def test_set_rows_kernel_rejects_negative_index(registry, allocator):
+    from board.memory.allocator import AllocatorError
+    from board.profiling.timer import Timer
+
+    head_dim = 4
+    src_h = _alloc_upload(allocator, np.zeros((1, head_dim), np.float32).tobytes())
+    idx_h = _alloc_upload(allocator, np.array([-1], dtype=np.int32).tobytes())
+    dst_h = _alloc_upload(allocator, np.zeros((2, head_dim), np.uint16).tobytes())
+
+    op = _set_rows_op(src_h, idx_h, dst_h, head_dim=head_dim, n_rows=1)
+    with pytest.raises(AllocatorError):
+        registry.get(op["op"]).run(allocator, op, Timer())
+
+
 # ============================================================================
 # FLASH_ATTN_EXT_F32
 # ============================================================================

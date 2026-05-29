@@ -188,6 +188,33 @@ def cmd_summary(args: argparse.Namespace) -> int:
             print(f"  {label}  {_fmt_time(value)}  {frac * 100:5.1f}%  {_bar(frac)}")
         print()
 
+    # Per top-level RPC (HELLO / ALLOC / UPLOAD / DOWNLOAD / RUN_GRAPH / FREE).
+    # The compute/memory/rpc breakdown above is derived from RUN_GRAPH op-spans
+    # only, so tensor-transfer RPCs are invisible there. This table accounts
+    # for the *whole* round-trip wall so upload/download costs are visible.
+    rpc_totals: dict[str, int] = defaultdict(int)
+    rpc_calls: dict[str, int] = defaultdict(int)
+    rpc_bytes: dict[str, int] = defaultdict(int)
+    for call in calls.values():
+        rt = call.round_trip_us
+        if rt is None:
+            continue
+        rpc_totals[call.op] += rt
+        rpc_calls[call.op] += 1
+        rpc_bytes[call.op] += call.host_send_bytes + call.host_recv_bytes
+    if rpc_totals:
+        print("By RPC (top-level round-trip):")
+        print(f"  {'op':<20} {'calls':>6} {'total':>10} {'avg':>10} {'bytes':>12}")
+        for name, total in sorted(rpc_totals.items(), key=lambda kv: kv[1], reverse=True):
+            count = rpc_calls[name]
+            avg = total // count if count else 0
+            frac = total / total_rt_us if total_rt_us else 0.0
+            print(
+                f"  {name:<20} {count:>6} {_fmt_time(total):>10} "
+                f"{_fmt_time(avg):>10} {rpc_bytes[name]:>12}  {frac * 100:5.1f}%"
+            )
+        print()
+
     if op_totals:
         print("By op:")
         print(f"  {'op':<18} {'calls':>6} {'total':>10} {'avg':>10} {'p99':>10} {'bytes':>12}")
