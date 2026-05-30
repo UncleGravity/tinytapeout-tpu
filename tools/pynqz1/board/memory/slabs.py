@@ -15,6 +15,11 @@ from typing import Protocol
 
 MIB = 1024 * 1024
 
+# Cortex-A9 L1/L2 cache line. Range flush/invalidate must cover whole lines:
+# we round the requested range out to line boundaries so a sub-cacheline tail
+# can't leave dirty/stale bytes behind.
+CACHELINE = 32
+
 
 class Slab(Protocol):
     size: int
@@ -75,28 +80,54 @@ class PynqSlab:
         """Underlying PYNQ buffer for direct DMA. Slice it for partial transfers."""
         return self._buf
 
+    @staticmethod
+    def _cacheline_bounds(offset: int, nbytes: int, size: int):
+        """Cache-line-aligned [start, end) covering [offset, offset+nbytes).
+
+        Returns None for an empty range. ``start`` rounds down and ``end``
+        rounds up to a CACHELINE multiple (clamped to ``size``) so the flush
+        never leaves a partial line uncovered. A whole-buffer cache op was the
+        single biggest cost across glue ops and tensor upload; restricting it
+        to the touched lines is the win, but only the bytes we actually moved
+        must be covered — hence the round-out, not a whole-buffer fallback.
+        """
+        if nbytes <= 0:
+            return None
+        start = offset - (offset % CACHELINE)
+        end = offset + nbytes
+        end += -end % CACHELINE  # round up to a whole cache line
+        if end > size:
+            end = size
+        return start, end
+
+    def _flush(self, offset: int, nbytes: int) -> None:
+        bounds = self._cacheline_bounds(offset, nbytes, self.size)
+        if bounds is not None:
+            self._buf[bounds[0] : bounds[1]].flush()
+
+    def _invalidate(self, offset: int, nbytes: int) -> None:
+        bounds = self._cacheline_bounds(offset, nbytes, self.size)
+        if bounds is not None:
+            self._buf[bounds[0] : bounds[1]].invalidate()
+
     def write(self, offset: int, data: bytes | memoryview) -> None:
         arr = self._np.frombuffer(data, dtype=self._np.uint8)
         self._buf[offset : offset + len(data)] = arr
-        self._buf.flush()
+        self._flush(offset, len(data))
 
     def read(self, offset: int, size: int) -> bytes:
-        self._buf.invalidate()
+        self._invalidate(offset, size)
         return bytes(self._buf[offset : offset + size])
 
     def clear(self, offset: int, size: int, value: int = 0) -> None:
         self._buf[offset : offset + size] = value
-        self._buf.flush()
+        self._flush(offset, size)
 
     def flush_range(self, offset: int, nbytes: int) -> None:
-        # PYNQ's per-slice flush is not always reliable across drivers;
-        # whole-buffer flush is cheap at our slab sizes (≤32 MiB).
-        del offset, nbytes
-        self._buf.flush()
+        self._flush(offset, nbytes)
 
     def invalidate_range(self, offset: int, nbytes: int) -> None:
-        del offset, nbytes
-        self._buf.invalidate()
+        self._invalidate(offset, nbytes)
 
     def close(self) -> None:
         self._buf.freebuffer()
