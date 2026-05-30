@@ -104,6 +104,21 @@ def test_register_all_registers_matmul_only_for_matmul_overlay():
     assert GOP_COPY not in registry
 
 
+def test_extent_remaining_respects_slab_boundary(allocator):
+    """_extent_remaining reports bytes to the end of the current slab extent,
+    so weight chunks can be sized to stay single-extent (fix #2)."""
+    nbytes = 600 * 1024  # > slab_bytes (256 KiB) → spans multiple extents
+    rec = allocator.allocate(nbytes, shape=[nbytes], dtype="u8")
+    exts = allocator.extents(rec.handle)
+    assert len(exts) > 1
+
+    remaining = matmul_q1a8.PLMatmulQ1A8._extent_remaining
+    first = exts[0].nbytes
+    assert remaining(allocator, rec.handle, 0) == first
+    assert remaining(allocator, rec.handle, first - 10) == 10
+    assert remaining(allocator, rec.handle, first) == exts[1].nbytes
+
+
 # -- C entry point tests vs Python reference -----------------------------
 
 

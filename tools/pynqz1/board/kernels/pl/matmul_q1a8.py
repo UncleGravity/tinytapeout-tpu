@@ -452,7 +452,6 @@ class PLMatmulQ1A8:
             rowblocks_per_col,
             max(1, max_weights_nbytes // packed_bytes_per_rb),
         )
-        rows_per_chunk = max_rowblocks_per_chunk * rows_per_block
         chunk_weights_nbytes_cap = max_rowblocks_per_chunk * packed_bytes_per_rb
         chunk_result_nbytes = max_rowblocks_per_chunk * rows_per_block * F32_BYTES
 
@@ -469,8 +468,13 @@ class PLMatmulQ1A8:
         scales_ptr = act_scale_bits.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
         acts_buf_ptr = self._acts_buf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
 
-        out = bytearray(dst_nbytes)
+        dst_handle = _required(op, F_DST)
+        dst_base_offset = _optional_int(op, F_DST_OFFSET)
         total_cycles = 0
+        # dst slabs the kernel wrote into via direct S2MM; invalidated once
+        # at the end so downstream CPU reads see the DMA'd data. Keyed by
+        # id(slab) → [slab, lo, hi] so a future range-invalidate is exact.
+        dst_dirty: dict[int, list] = {}
 
         for col in range(cols):
             col_acts_offset = col * k * F32_BYTES
@@ -497,15 +501,51 @@ class PLMatmulQ1A8:
             row_chunk_start = 0
             rowblock_chunk_start = 0
             while row_chunk_start < rows:
-                chunk_rows = min(rows_per_chunk, rows - row_chunk_start)
-                chunk_rowblocks = (chunk_rows + rows_per_block - 1) // rows_per_block
-                chunk_weights_nbytes = chunk_rowblocks * packed_bytes_per_rb
-                chunk_result = chunk_rowblocks * rows_per_block * F32_BYTES
-
+                # Size the chunk so its weights stay inside one slab extent:
+                # then _resolve_weights_phys hits the fast path (a physical
+                # address) instead of copying the chunk through CPU scratch.
+                remaining_rowblocks = rowblocks_per_col - rowblock_chunk_start
                 chunk_weight_offset = (
                     weights_base_offset
                     + rowblock_chunk_start * packed_bytes_per_rb
                 )
+                ext_remaining = self._extent_remaining(
+                    allocator, weights_handle, chunk_weight_offset)
+                rowblocks_to_boundary = ext_remaining // packed_bytes_per_rb
+                chunk_rowblocks = min(max_rowblocks_per_chunk, remaining_rowblocks)
+                if rowblocks_to_boundary >= 1:
+                    chunk_rowblocks = min(chunk_rowblocks, rowblocks_to_boundary)
+                else:
+                    # A single rowblock straddles an extent boundary (rare):
+                    # take just it; _resolve_weights_phys copies it via scratch.
+                    chunk_rowblocks = 1
+
+                chunk_rows = min(chunk_rowblocks * rows_per_block, rows - row_chunk_start)
+                chunk_weights_nbytes = chunk_rowblocks * packed_bytes_per_rb
+                # The kernel emits rows_per_block fp32 per rowblock; the last
+                # rowblock of an unaligned tensor over-emits past chunk_rows.
+                padded_result_nbytes = chunk_rowblocks * rows_per_block * F32_BYTES
+                actual_result_nbytes = chunk_rows * F32_BYTES
+                dst_chunk_offset = (
+                    dst_base_offset + (col * rows + row_chunk_start) * F32_BYTES
+                )
+
+                # Fast path: stream the kernel result straight into the dst
+                # slab (no result_buf → bytearray → allocator.write detour).
+                # Needs the full padded extent to land contiguously in one
+                # slab, so skip it for a partial trailing rowblock.
+                dst_slab = None
+                if padded_result_nbytes == actual_result_nbytes:
+                    try:
+                        dst_slab, dst_abs, _ = allocator.slab_view(
+                            dst_handle, dst_chunk_offset, padded_result_nbytes)
+                        result_phys = dst_slab.pynq_buffer.physical_address + dst_abs
+                    except AllocatorError as exc:
+                        if exc.code != "multi_extent":
+                            raise
+                        dst_slab = None
+                if dst_slab is None:
+                    result_phys = self._result_buf.physical_address
 
                 with timer.section("compute"):
                     cycles = self._run_matmul_dual_stream(
@@ -514,30 +554,44 @@ class PLMatmulQ1A8:
                         chunk_weight_offset,
                         chunk_weights_nbytes,
                         acts_stream_nbytes,
-                        chunk_result,
+                        result_phys,
+                        padded_result_nbytes,
                         blocks_per_row,
                         chunk_rowblocks,
                         timer,
                     )
                 total_cycles += cycles
 
-                with timer.section("result_copy"):
-                    result_view = self._np.frombuffer(
-                        self._result_buf, dtype=self._np.uint8,
-                        count=chunk_rows * F32_BYTES,
-                    )
-                    out_base = (col * rows + row_chunk_start) * F32_BYTES
-                    out[out_base : out_base + chunk_rows * F32_BYTES] = result_view.tobytes()
+                if dst_slab is not None:
+                    entry = dst_dirty.get(id(dst_slab))
+                    if entry is None:
+                        dst_dirty[id(dst_slab)] = [
+                            dst_slab, dst_abs, dst_abs + actual_result_nbytes]
+                    else:
+                        entry[1] = min(entry[1], dst_abs)
+                        entry[2] = max(entry[2], dst_abs + actual_result_nbytes)
+                else:
+                    # Fallback: kernel wrote result_buf; copy just this chunk
+                    # back into its dst range.
+                    with timer.section("result_invalidate"):
+                        self._result_buf[:padded_result_nbytes].invalidate()
+                    with timer.section("result_copy"):
+                        result_view = self._np.frombuffer(
+                            self._result_buf, dtype=self._np.uint8,
+                            count=actual_result_nbytes,
+                        )
+                        chunk_bytes = result_view.tobytes()
+                    with timer.section("write"):
+                        allocator.write(dst_handle, dst_chunk_offset, chunk_bytes)
 
                 row_chunk_start += chunk_rows
                 rowblock_chunk_start += chunk_rowblocks
 
-        with timer.section("write"):
-            allocator.write(
-                _required(op, F_DST),
-                _optional_int(op, F_DST_OFFSET),
-                out,
-            )
+        # Drop stale CPU cache lines for the directly-DMA'd dst ranges so the
+        # next op reads the kernel's output, not pre-DMA contents.
+        with timer.section("result_invalidate"):
+            for dst_slab, lo, hi in dst_dirty.values():
+                dst_slab.invalidate_range(lo, hi - lo)
         timer.add("bytes_written", dst_nbytes)
         timer.add("matmul_cols", cols)
         timer.add("rowblocks", cols * rowblocks_per_col)
@@ -641,6 +695,21 @@ class PLMatmulQ1A8:
         self._weights_dma_buf.flush()
         return self._weights_dma_buf.physical_address
 
+    @staticmethod
+    def _extent_remaining(
+        allocator: TensorAllocator, handle: int, tensor_offset: int,
+    ) -> int:
+        """Bytes from ``tensor_offset`` to the end of its slab extent.
+
+        Used to size weight chunks so each stays within one extent and the
+        DMA can stream straight out of the slab (no scratch copy)."""
+        cursor = 0
+        for extent in allocator.extents(handle):
+            if tensor_offset < cursor + extent.nbytes:
+                return cursor + extent.nbytes - tensor_offset
+            cursor += extent.nbytes
+        return 0
+
     def _run_matmul_dual_stream(
         self,
         allocator: TensorAllocator,
@@ -648,6 +717,7 @@ class PLMatmulQ1A8:
         weights_offset: int,
         weights_nbytes: int,
         acts_stream_nbytes: int,
+        result_phys: int,
         result_nbytes: int,
         num_q1_blocks: int,
         num_rowblocks: int,
@@ -655,11 +725,13 @@ class PLMatmulQ1A8:
     ) -> int:
         """Drive one column-chunk via the C runner.
 
-        Python does only: resolve weight physical address, call C, then
-        invalidate the result cache. Everything between (~10 sections in
-        the old path) is one bonsai_q1a8_run_matmul_chunk call.
+        Python does only: resolve the weight physical address and call C.
+        ``result_phys`` is where S2MM writes — the dst slab directly on the
+        fast path, or the result scratch buffer on the fallback. The caller
+        owns result-cache coherence. Everything between (~10 sections in the
+        old path) is one bonsai_q1a8_run_matmul_chunk call.
         """
-        assert self._acts_buf is not None and self._result_buf is not None
+        assert self._acts_buf is not None
 
         with timer.section("resolve_weights"):
             weights_phys = self._resolve_weights_phys(
@@ -675,7 +747,7 @@ class PLMatmulQ1A8:
                 ctypes.c_uint32(weights_nbytes),
                 ctypes.c_uint32(self._acts_buf.physical_address),
                 ctypes.c_uint32(acts_stream_nbytes),
-                ctypes.c_uint32(self._result_buf.physical_address),
+                ctypes.c_uint32(result_phys),
                 ctypes.c_uint32(result_nbytes),
                 ctypes.c_uint32(num_q1_blocks),
                 ctypes.c_uint32(num_rowblocks),
@@ -686,8 +758,5 @@ class PLMatmulQ1A8:
             raise RuntimeError(
                 f"bonsai_q1a8_run_matmul_chunk rc={rc} "
                 f"(see q1a8_runner.c for error code mapping)")
-
-        with timer.section("result_invalidate"):
-            self._result_buf[:result_nbytes].invalidate()
 
         return int(out_cycles.value)

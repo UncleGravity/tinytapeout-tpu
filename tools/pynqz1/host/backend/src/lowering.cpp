@@ -934,6 +934,14 @@ constexpr OpLowering k_lowerings[] = {
 };
 
 const OpLowering * lookup_lowering(const ggml_tensor * op) {
+    // An op that produces zero output elements is a no-op. llama.cpp builds
+    // these on every non-final prompt ubatch, where n_outputs==0: the empty
+    // inp_out_ids GET_ROWS ([n_embd, 0]) and the lm_head matmul fed from it
+    // ([vocab, 0]). The board's kernels require positive extents (ne10 > 0,
+    // rows/cols > 0), so decline empty work and let the CPU backend run it.
+    if (op != nullptr && ggml_nelements(op) == 0) {
+        return nullptr;
+    }
     for (const auto & entry : k_lowerings) {
         if (entry.matches(op)) {
             return &entry;
