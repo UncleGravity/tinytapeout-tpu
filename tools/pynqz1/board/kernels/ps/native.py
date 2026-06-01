@@ -137,30 +137,136 @@ def _positive(op: dict[str, Any], key: str) -> int:
     return value
 
 
+# PS glue kernels are CPU→CPU: their inputs/outputs are only ever produced
+# and consumed by other PS kernels (the matmul is the only DMA and it
+# self-manages its buffers — flushing its acts and invalidating its result).
+# So these reads/writes don't need the slab cache flush/invalidate; the CPU
+# cache is self-coherent. coherent=False drops the per-op PYNQ cache ioctl,
+# which was ~half of every glue op's wall time.
 def _read(allocator: TensorAllocator, handle: int, offset: int, nbytes: int, timer: Timer) -> bytes:
     with timer.section("read"):
-        data = allocator.read(handle, offset, nbytes)
+        data = allocator.read(handle, offset, nbytes, coherent=False)
     timer.add("bytes_read", nbytes)
     return data
 
 
 def _write(allocator: TensorAllocator, handle: int, offset: int, data, timer: Timer) -> None:
     with timer.section("write"):
-        allocator.write(handle, offset, data)
+        allocator.write(handle, offset, data, coherent=False)
     timer.add("bytes_written", len(data))
+
+
+def _in_ptr(allocator: TensorAllocator, handle: int, offset: int, nbytes: int,
+            ctype, timer: Timer, keep: list) -> Any:
+    """Zero-copy input pointer of ``ctype`` straight into the tensor's slab.
+
+    The old path read inputs into a ``bytes`` then ``from_buffer_copy`` into a
+    ctypes array — two copies and a PYNQ-buffer slice per input, which was the
+    bulk of every glue op's "read" time. This returns the slab's VA directly.
+    FakeSlab / multi-extent fall back to a ctypes copy whose backing buffer is
+    appended to ``keep`` so it outlives the C call. Inputs are read by
+    reference, but each kernel still computes into a *fresh* output buffer, so
+    this stays in-place safe even when dst aliases a src (e.g. ROPE)."""
+    with timer.section("read"):
+        addr, backing = _readable_base(allocator, handle, offset, nbytes)
+    timer.add("bytes_read", nbytes)
+    if backing is not None:
+        keep.append(backing)
+    return ctypes.cast(addr, ctypes.POINTER(ctype))
+
+
+def _out_ptr(allocator: TensorAllocator, handle: int, offset: int, nbytes: int,
+             ctype, timer: Timer, finalizers: list) -> Any:
+    """Zero-copy output pointer of ``ctype`` straight into the tensor's slab.
+
+    The write-side mirror of ``_in_ptr``: the kernel computes its result
+    directly into the dst slab's CMA mapping, eliminating the
+    ``bytearray`` → ``allocator.write`` copy that was the bulk of every glue
+    op's "write" time. No flush is needed — these are CPU→CPU tensors and the
+    CPU cache is self-coherent (same rationale as ``_write(coherent=False)``).
+
+    All current glue kernels are in-place safe — each output element depends
+    only on the same-index inputs (ADD/MUL/SCALE/SILU/SWIGLU), RMS_NORM reads
+    a whole column before writing it, and ROPE reads each pair before writing
+    it — so a dst that aliases a src (e.g. the ROPE residual) is fine.
+
+    Fast path (single pynq-backed slab extent) returns the slab VA and appends
+    nothing. FakeSlab (host tests) / multi-extent fall back to a ctypes scratch
+    buffer; its writeback closure is appended to ``finalizers`` for the caller
+    to run after the C call. ``bytes_written`` accounting stays with the
+    caller."""
+    addr, finalizer = _writable_base(allocator, handle, offset, nbytes)
+    if finalizer is not None:
+        finalizers.append(finalizer)
+    return ctypes.cast(addr, ctypes.POINTER(ctype))
+
+
+def _writable_base(
+    allocator: TensorAllocator, handle: int, offset: int, nbytes: int,
+) -> tuple[int, object]:
+    """Return ``(C pointer, finalizer)`` for a write destination range.
+
+    Fast path: a single pynq-backed slab extent → the slab's user-space VA,
+    finalizer=None. Fallback (multi-extent, or a non-pynq FakeSlab in host
+    tests): a plain ctypes scratch buffer plus a finalizer that copies it back
+    into the tensor via ``allocator.write(coherent=False)``. The caller must
+    run the finalizer after the C kernel returns."""
+    try:
+        return allocator.slab_pointer(handle, offset, nbytes), None
+    except AllocatorError as exc:
+        if exc.code not in ("multi_extent", "invalid_request"):
+            raise
+    buf = (ctypes.c_ubyte * nbytes)()
+
+    def _writeback() -> None:
+        allocator.write(handle, offset, memoryview(buf), coherent=False)
+
+    return ctypes.addressof(buf), _writeback
+
+
+def _run_finalizers(finalizers: list, timer: Timer) -> None:
+    """Run any output writebacks (multi-extent / FakeSlab fallback only).
+
+    Empty on the zero-copy fast path, so the "write" section collapses to ~0
+    there — the whole point of ``_out_ptr``."""
+    if not finalizers:
+        return
+    with timer.section("write"):
+        for finalizer in finalizers:
+            finalizer()
 
 
 # -- Pure-Python kernel ----------------------------------------------------
 
 
 class Copy:
+    """CPY. Same-dtype copies are a raw byte memcpy; F32→F16 is a converting
+    copy reusing the golden-tested ``bonsai_set_rows_row_f32_to_f16`` element
+    converter so the contiguous f32→f16 casts ggml emits (the sole remaining
+    graph-split offender) run on-board instead of bouncing through the host."""
+
     name = GOP_COPY
 
+    def __init__(self, lib: ctypes.CDLL | None = None):
+        self._cvt_f32_to_f16 = None
+        if lib is not None:
+            fn = lib.bonsai_set_rows_row_f32_to_f16
+            fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
+            fn.restype = ctypes.c_int
+            self._cvt_f32_to_f16 = fn
+
     def run(self, allocator, op, timer):
+        src_type = str(op.get(F_SRC0_TYPE, ""))
+        dst_type = str(op.get(F_DST_TYPE, ""))
+        if src_type == "f32" and dst_type == "f16":
+            self._run_cvt_f32_to_f16(allocator, op, timer)
+            return
+
+        # Raw same-dtype byte copy.
         nbytes = _required(op, F_NBYTES)
         data = _read(
             allocator,
-            _required(op, "src"),
+            _required(op, F_SRC),
             _optional_int(op, F_SRC_OFFSET),
             nbytes,
             timer,
@@ -172,6 +278,28 @@ class Copy:
             data,
             timer,
         )
+
+    def _run_cvt_f32_to_f16(self, allocator, op, timer):
+        if self._cvt_f32_to_f16 is None:
+            raise AllocatorError(
+                "invalid_request", "COPY f32->f16 requires libbonsai_ps")
+        elements = _required(op, F_ELEMENTS)
+        keep: list = []
+        finalizers: list = []
+        src = _in_ptr(allocator, _required(op, F_SRC), _optional_int(op, F_SRC_OFFSET),
+                      elements * F32_BYTES, ctypes.c_float, timer, keep)
+        dst = _out_ptr(allocator, _required(op, F_DST), _optional_int(op, F_DST_OFFSET),
+                       elements * 2, ctypes.c_uint16, timer, finalizers)
+        with timer.section("compute"):
+            rc = self._cvt_f32_to_f16(
+                ctypes.cast(dst, ctypes.c_void_p),
+                ctypes.cast(src, ctypes.c_void_p),
+                ctypes.c_uint32(elements),
+            )
+            if rc != 0:
+                raise RuntimeError(f"bonsai_set_rows_row_f32_to_f16 rc={rc}")
+        _run_finalizers(finalizers, timer)
+        timer.add("bytes_written", elements * 2)
 
 
 # -- ctypes-backed kernels -------------------------------------------------
@@ -280,41 +408,29 @@ class _BinaryF32(_NativeKernel):
         elements = rows * cols
         rhs_elements = rows if broadcast else elements
 
-        src0 = _read(
-            allocator,
-            _required(op, F_SRC0),
-            _optional_int(op, F_SRC0_OFFSET),
-            elements * F32_BYTES,
-            timer,
-        )
-        src1 = _read(
-            allocator,
-            _required(op, F_SRC1),
-            _optional_int(op, F_SRC1_OFFSET),
-            rhs_elements * F32_BYTES,
-            timer,
-        )
+        keep: list = []
+        finalizers: list = []
+        src0 = _in_ptr(allocator, _required(op, F_SRC0), _optional_int(op, F_SRC0_OFFSET),
+                       elements * F32_BYTES, ctypes.c_float, timer, keep)
+        src1 = _in_ptr(allocator, _required(op, F_SRC1), _optional_int(op, F_SRC1_OFFSET),
+                       rhs_elements * F32_BYTES, ctypes.c_float, timer, keep)
+        dst = _out_ptr(allocator, _required(op, F_DST), _optional_int(op, F_DST_OFFSET),
+                       elements * F32_BYTES, ctypes.c_float, timer, finalizers)
 
         with timer.section("compute"):
-            out = bytearray(elements * F32_BYTES)
             self._check(
                 self._fn(
-                    (ctypes.c_float * elements).from_buffer_copy(src0),
-                    (ctypes.c_float * rhs_elements).from_buffer_copy(src1),
-                    (ctypes.c_float * elements).from_buffer(out),
+                    src0,
+                    src1,
+                    dst,
                     ctypes.c_uint32(rows),
                     ctypes.c_uint32(cols),
                     ctypes.c_uint32(1 if broadcast else 0),
                 )
             )
 
-        _write(
-            allocator,
-            _required(op, F_DST),
-            _optional_int(op, F_DST_OFFSET),
-            out,
-            timer,
-        )
+        _run_finalizers(finalizers, timer)
+        timer.add("bytes_written", elements * F32_BYTES)
 
 
 class AddF32(_BinaryF32):
@@ -345,33 +461,26 @@ class ScaleF32(_NativeKernel):
             raise AllocatorError("invalid_request", "missing scale")
         bias = float(op.get(F_BIAS, 0.0))
 
-        src = _read(
-            allocator,
-            _required(op, F_SRC),
-            _optional_int(op, F_SRC_OFFSET),
-            elements * F32_BYTES,
-            timer,
-        )
+        keep: list = []
+        finalizers: list = []
+        src = _in_ptr(allocator, _required(op, F_SRC), _optional_int(op, F_SRC_OFFSET),
+                      elements * F32_BYTES, ctypes.c_float, timer, keep)
+        dst = _out_ptr(allocator, _required(op, F_DST), _optional_int(op, F_DST_OFFSET),
+                       elements * F32_BYTES, ctypes.c_float, timer, finalizers)
 
         with timer.section("compute"):
-            out = bytearray(elements * F32_BYTES)
             self._check(
                 self._fn(
-                    (ctypes.c_float * elements).from_buffer_copy(src),
-                    (ctypes.c_float * elements).from_buffer(out),
+                    src,
+                    dst,
                     ctypes.c_uint32(elements),
                     ctypes.c_float(scale),
                     ctypes.c_float(bias),
                 )
             )
 
-        _write(
-            allocator,
-            _required(op, F_DST),
-            _optional_int(op, F_DST_OFFSET),
-            out,
-            timer,
-        )
+        _run_finalizers(finalizers, timer)
+        timer.add("bytes_written", elements * F32_BYTES)
 
 
 class _UnaryF32(_NativeKernel):
@@ -383,31 +492,24 @@ class _UnaryF32(_NativeKernel):
 
     def run(self, allocator, op, timer):
         elements = _positive(op, F_ELEMENTS)
-        src = _read(
-            allocator,
-            _required(op, F_SRC),
-            _optional_int(op, F_SRC_OFFSET),
-            elements * F32_BYTES,
-            timer,
-        )
+        keep: list = []
+        finalizers: list = []
+        src = _in_ptr(allocator, _required(op, F_SRC), _optional_int(op, F_SRC_OFFSET),
+                      elements * F32_BYTES, ctypes.c_float, timer, keep)
+        dst = _out_ptr(allocator, _required(op, F_DST), _optional_int(op, F_DST_OFFSET),
+                       elements * F32_BYTES, ctypes.c_float, timer, finalizers)
 
         with timer.section("compute"):
-            out = bytearray(elements * F32_BYTES)
             self._check(
                 self._fn(
-                    (ctypes.c_float * elements).from_buffer_copy(src),
-                    (ctypes.c_float * elements).from_buffer(out),
+                    src,
+                    dst,
                     ctypes.c_uint32(elements),
                 )
             )
 
-        _write(
-            allocator,
-            _required(op, F_DST),
-            _optional_int(op, F_DST_OFFSET),
-            out,
-            timer,
-        )
+        _run_finalizers(finalizers, timer)
+        timer.add("bytes_written", elements * F32_BYTES)
 
 
 class SiluF32(_UnaryF32):
@@ -427,39 +529,27 @@ class SwigluF32(_NativeKernel):
 
     def run(self, allocator, op, timer):
         elements = _positive(op, F_ELEMENTS)
-        gate = _read(
-            allocator,
-            _required(op, F_SRC0),
-            _optional_int(op, F_SRC0_OFFSET),
-            elements * F32_BYTES,
-            timer,
-        )
-        up = _read(
-            allocator,
-            _required(op, F_SRC1),
-            _optional_int(op, F_SRC1_OFFSET),
-            elements * F32_BYTES,
-            timer,
-        )
+        keep: list = []
+        finalizers: list = []
+        gate = _in_ptr(allocator, _required(op, F_SRC0), _optional_int(op, F_SRC0_OFFSET),
+                       elements * F32_BYTES, ctypes.c_float, timer, keep)
+        up = _in_ptr(allocator, _required(op, F_SRC1), _optional_int(op, F_SRC1_OFFSET),
+                     elements * F32_BYTES, ctypes.c_float, timer, keep)
+        dst = _out_ptr(allocator, _required(op, F_DST), _optional_int(op, F_DST_OFFSET),
+                       elements * F32_BYTES, ctypes.c_float, timer, finalizers)
 
         with timer.section("compute"):
-            out = bytearray(elements * F32_BYTES)
             self._check(
                 self._fn(
-                    (ctypes.c_float * elements).from_buffer_copy(gate),
-                    (ctypes.c_float * elements).from_buffer_copy(up),
-                    (ctypes.c_float * elements).from_buffer(out),
+                    gate,
+                    up,
+                    dst,
                     ctypes.c_uint32(elements),
                 )
             )
 
-        _write(
-            allocator,
-            _required(op, F_DST),
-            _optional_int(op, F_DST_OFFSET),
-            out,
-            timer,
-        )
+        _run_finalizers(finalizers, timer)
+        timer.add("bytes_written", elements * F32_BYTES)
 
 
 class RmsNormF32(_NativeKernel):
@@ -481,33 +571,26 @@ class RmsNormF32(_NativeKernel):
         eps = float(op[F_EPS])
         elements = rows * cols
 
-        src = _read(
-            allocator,
-            _required(op, F_SRC),
-            _optional_int(op, F_SRC_OFFSET),
-            elements * F32_BYTES,
-            timer,
-        )
+        keep: list = []
+        finalizers: list = []
+        src = _in_ptr(allocator, _required(op, F_SRC), _optional_int(op, F_SRC_OFFSET),
+                      elements * F32_BYTES, ctypes.c_float, timer, keep)
+        dst = _out_ptr(allocator, _required(op, F_DST), _optional_int(op, F_DST_OFFSET),
+                       elements * F32_BYTES, ctypes.c_float, timer, finalizers)
 
         with timer.section("compute"):
-            out = bytearray(elements * F32_BYTES)
             self._check(
                 self._fn(
-                    (ctypes.c_float * elements).from_buffer_copy(src),
-                    (ctypes.c_float * elements).from_buffer(out),
+                    src,
+                    dst,
                     ctypes.c_uint32(rows),
                     ctypes.c_uint32(cols),
                     ctypes.c_float(eps),
                 )
             )
 
-        _write(
-            allocator,
-            _required(op, F_DST),
-            _optional_int(op, F_DST_OFFSET),
-            out,
-            timer,
-        )
+        _run_finalizers(finalizers, timer)
+        timer.add("bytes_written", elements * F32_BYTES)
 
 
 class RopeF32(_NativeKernel):
@@ -549,28 +632,22 @@ class RopeF32(_NativeKernel):
         src_nbytes = elements * F32_BYTES
         pos_nbytes = n_token * 4  # int32
 
-        src = _read(
-            allocator,
-            _required(op, F_SRC),
-            _optional_int(op, F_SRC_OFFSET),
-            src_nbytes,
-            timer,
-        )
-        positions = _read(
-            allocator,
-            _required(op, F_POSITIONS),
-            _optional_int(op, F_POSITIONS_OFFSET),
-            pos_nbytes,
-            timer,
-        )
+        keep: list = []
+        finalizers: list = []
+        src = _in_ptr(allocator, _required(op, F_SRC), _optional_int(op, F_SRC_OFFSET),
+                      src_nbytes, ctypes.c_float, timer, keep)
+        positions = _in_ptr(allocator, _required(op, F_POSITIONS),
+                            _optional_int(op, F_POSITIONS_OFFSET),
+                            pos_nbytes, ctypes.c_int32, timer, keep)
+        dst = _out_ptr(allocator, _required(op, F_DST), _optional_int(op, F_DST_OFFSET),
+                       src_nbytes, ctypes.c_float, timer, finalizers)
 
         with timer.section("compute"):
-            out = bytearray(src_nbytes)
             self._check(
                 self._fn(
-                    (ctypes.c_float * elements).from_buffer_copy(src),
-                    (ctypes.c_int32 * n_token).from_buffer_copy(positions),
-                    (ctypes.c_float * elements).from_buffer(out),
+                    src,
+                    positions,
+                    dst,
                     ctypes.c_uint32(head_dim),
                     ctypes.c_uint32(n_head),
                     ctypes.c_uint32(n_token),
@@ -586,13 +663,8 @@ class RopeF32(_NativeKernel):
                 )
             )
 
-        _write(
-            allocator,
-            _required(op, F_DST),
-            _optional_int(op, F_DST_OFFSET),
-            out,
-            timer,
-        )
+        _run_finalizers(finalizers, timer)
+        timer.add("bytes_written", src_nbytes)
 
 
 # -- KV-cache / FLASH_ATTN kernels ----------------------------------------
@@ -626,12 +698,32 @@ def _readable_base(
     caller must hold the returned keepalive for as long as it dereferences
     the pointer.
     """
+    global _RB_FAST, _RB_SLOW
     try:
-        return allocator.slab_pointer(handle, offset, nbytes), None
+        ptr = allocator.slab_pointer(handle, offset, nbytes)
+        _RB_FAST += 1
+        _rb_maybe_dump()
+        return ptr, None
     except AllocatorError:
         data = allocator.read(handle, offset, nbytes)
         buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+        _RB_SLOW += 1
+        _rb_maybe_dump()
         return ctypes.addressof(buf), buf
+
+
+# TEMP DIAGNOSTIC: count zero-copy fast path vs multi-extent copy fallback in
+# _readable_base, to confirm whether glue activation tensors are multi-extent.
+# Prints to the daemon's stderr. Remove once the question is answered.
+_RB_FAST = 0
+_RB_SLOW = 0
+
+
+def _rb_maybe_dump() -> None:
+    if (_RB_FAST + _RB_SLOW) % 5000 == 0:
+        import sys
+        print(f"[readable_base] fast(zero-copy)={_RB_FAST} slow(multi-extent copy)={_RB_SLOW}",
+              file=sys.stderr, flush=True)
 
 
 def _slab_pointer_or_scratch(
@@ -1198,9 +1290,11 @@ def load_lib(path: Path | None = None) -> ctypes.CDLL:
 
 
 def register_all(registry: KernelRegistry, lib_path: Path | None = None) -> None:
-    """Register the pure-Python COPY kernel and every libbonsai_ps.so kernel."""
-    registry.register(Copy())
+    """Register the COPY kernel and every libbonsai_ps.so kernel."""
     lib = load_lib(lib_path)
+    # Copy binds the f32→f16 element converter for converting copies; same-dtype
+    # copies stay a raw memcpy and need no native code.
+    registry.register(Copy(lib))
     for kls in NATIVE_KERNELS:
         registry.register(kls(lib))
     # GetRows / SetRows bind multiple C symbols each; construct directly.

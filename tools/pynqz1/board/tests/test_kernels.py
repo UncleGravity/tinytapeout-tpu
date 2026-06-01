@@ -54,6 +54,27 @@ def test_copy(registry, allocator):
     assert out == payload
 
 
+def test_copy_f32_to_f16(registry, allocator):
+    import numpy as np
+
+    values = np.array([0.0, 1.0, -2.5, 3.14159, 65504.0, -0.000123, 100.0, -7.0],
+                      dtype=np.float32)
+    src = allocate_and_upload(allocator, values.tobytes())
+    dst = allocate_empty(allocator, values.size * 2)
+    out = run_one(registry, allocator, {
+        "op": GOP_COPY,
+        "src": src,
+        "dst": dst,
+        "src0_type": "f32",
+        "dst_type": "f16",
+        "elements": int(values.size),
+        "nbytes": int(values.nbytes),
+    })
+    got = np.frombuffer(out, dtype=np.float16)
+    # The C converter is round-to-nearest-even, same as numpy's f32→f16 cast.
+    assert np.array_equal(got, values.astype(np.float16))
+
+
 def test_add_f32(registry, allocator):
     rows, cols = 8, 4
     src0 = f32_bytes(rows * cols, seed=1)

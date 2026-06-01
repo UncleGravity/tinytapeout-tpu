@@ -3,6 +3,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#define BONSAI_HAVE_NEON 1
+#endif
+
 #include "proto/q1a8_layout.h"
 
 /* Block-size constants now live in proto/q1a8_layout.h. Old
@@ -117,6 +122,75 @@ static int lround_like_python(float value) {
         return (int) (value + 0.5f);
     }
     return (int) (value - 0.5f);
+}
+
+/*
+ * NEON primitives for Q8_0 activation quantization. The scalar loops below
+ * dominated the PL matmul's per-column cost (~14s of decode). These produce
+ * bit-identical results to the scalar path for finite inputs (activations are
+ * always finite): amax via abs+max, and round-half-away-from-zero via
+ * x + copysign(0.5,x) then truncate-toward-zero (vcvtq_s32_f32), matching
+ * lround_like_python. Non-finite handling is intentionally dropped on the
+ * NEON path (it can't arise for activations); the scalar fallback keeps it.
+ */
+static inline float bonsai_amax_f32(const float * v, uint32_t n) {
+#if defined(BONSAI_HAVE_NEON)
+    float32x4_t m = vdupq_n_f32(0.0f);
+    uint32_t i = 0;
+    for (; i + 4 <= n; i += 4) m = vmaxq_f32(m, vabsq_f32(vld1q_f32(v + i)));
+    float32x2_t m2 = vmax_f32(vget_low_f32(m), vget_high_f32(m));
+    m2 = vpmax_f32(m2, m2);
+    float amax = vget_lane_f32(m2, 0);
+    for (; i < n; ++i) { const float a = fabsf(v[i]); if (a > amax) amax = a; }
+    return amax;
+#else
+    float amax = 0.0f;
+    for (uint32_t i = 0; i < n; ++i) {
+        const float value = v[i];
+        if (isfinite(value)) {
+            const float a = value < 0.0f ? -value : value;
+            if (a > amax) amax = a;
+        }
+    }
+    return amax;
+#endif
+}
+
+#if defined(BONSAI_HAVE_NEON)
+/* round-half-away-from-zero then clamp to int8 range, 4 lanes. */
+static inline int32x4_t bonsai_round_clamp_s32(float32x4_t x) {
+    const uint32x4_t sign = vandq_u32(vreinterpretq_u32_f32(x), vdupq_n_u32(0x80000000u));
+    const float32x4_t half =
+        vreinterpretq_f32_u32(vorrq_u32(vreinterpretq_u32_f32(vdupq_n_f32(0.5f)), sign));
+    const int32x4_t q = vcvtq_s32_f32(vaddq_f32(x, half));  /* truncates toward 0 */
+    return vminq_s32(vmaxq_s32(q, vdupq_n_s32(-128)), vdupq_n_s32(127));
+}
+#endif
+
+static inline void bonsai_quantize_into(
+    const float * v, float inv_scale, int8_t * out, uint32_t n) {
+#if defined(BONSAI_HAVE_NEON)
+    const float32x4_t vinv = vdupq_n_f32(inv_scale);
+    uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const int32x4_t q0 = bonsai_round_clamp_s32(vmulq_f32(vld1q_f32(v + i), vinv));
+        const int32x4_t q1 = bonsai_round_clamp_s32(vmulq_f32(vld1q_f32(v + i + 4), vinv));
+        vst1_s8(out + i, vmovn_s16(vcombine_s16(vmovn_s32(q0), vmovn_s32(q1))));
+    }
+    for (; i < n; ++i) {
+        int quant = lround_like_python(v[i] * inv_scale);
+        if (quant > 127) quant = 127; else if (quant < -128) quant = -128;
+        out[i] = (int8_t) quant;
+    }
+#else
+    for (uint32_t i = 0; i < n; ++i) {
+        const float value = v[i];
+        if (!isfinite(value)) { out[i] = 0; continue; }
+        int quant = lround_like_python(value * inv_scale);
+        if (quant > 127) quant = 127; else if (quant < -128) quant = -128;
+        out[i] = (int8_t) quant;
+    }
+#endif
 }
 
 static void quantize_q8_0(
@@ -511,22 +585,13 @@ int bonsai_quantize_q8_0_pl(
     }
 
     for (uint32_t block_start = 0; block_start < k; block_start += BONSAI_Q8_BLOCK) {
-        float amax = 0.0f;
-        for (uint32_t i = 0; i < BONSAI_Q8_BLOCK; ++i) {
-            const float value = values[block_start + i];
-            if (isfinite(value)) {
-                const float abs_value = value < 0.0f ? -value : value;
-                if (abs_value > amax) {
-                    amax = abs_value;
-                }
-            }
-        }
-
         const uint32_t block_index = block_start / BONSAI_Q8_BLOCK;
-        for (uint32_t i = 0; i < BONSAI_Q8_BLOCK; ++i) {
-            out_quants[block_start + i] = 0;
-        }
+        const float amax = bonsai_amax_f32(values + block_start, BONSAI_Q8_BLOCK);
+
         if (amax == 0.0f) {
+            for (uint32_t i = 0; i < BONSAI_Q8_BLOCK; ++i) {
+                out_quants[block_start + i] = 0;
+            }
             out_scale_bits[block_index] = 0;
             continue;
         }
@@ -534,20 +599,8 @@ int bonsai_quantize_q8_0_pl(
         const float scale = amax / 127.0f;
         out_scale_bits[block_index] = float_to_half(scale);
         const float inv_scale = 1.0f / scale;
-        for (uint32_t i = 0; i < BONSAI_Q8_BLOCK; ++i) {
-            const float value = values[block_start + i];
-            if (!isfinite(value)) {
-                continue;
-            }
-
-            int quant = lround_like_python(value * inv_scale);
-            if (quant > 127) {
-                quant = 127;
-            } else if (quant < -128) {
-                quant = -128;
-            }
-            out_quants[block_start + i] = (int8_t) quant;
-        }
+        bonsai_quantize_into(
+            values + block_start, inv_scale, out_quants + block_start, BONSAI_Q8_BLOCK);
     }
 
     return 0;
@@ -936,6 +989,53 @@ int bonsai_set_rows_row_f32_to_f16(
  */
 #define BONSAI_FATTN_MAX_HEAD_DIM 256
 
+/*
+ * Hot-loop primitives for flash attention. K and V are F16; the scalar
+ * path's per-element half_to_float dominated runtime (~50 cycles each,
+ * millions per op). NEON does the F16→F32 conversion in hardware
+ * (vcvt.f32.f16, 4 lanes/instr) and 4-wides the multiply-accumulate. The
+ * F16→F32 conversion is exact (every F16 is representable in F32), so the
+ * only numeric difference from the scalar path is dot-product reduction
+ * order — well within the kernel's existing test tolerances.
+ */
+static inline float bonsai_dot_q_kf16(
+    const float * q, const uint16_t * k, uint32_t n) {
+#if defined(BONSAI_HAVE_NEON)
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    uint32_t d = 0;
+    for (; d + 4 <= n; d += 4) {
+        const float32x4_t kf = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(k + d)));
+        acc = vmlaq_f32(acc, vld1q_f32(q + d), kf);
+    }
+    float32x2_t s2 = vadd_f32(vget_low_f32(acc), vget_high_f32(acc));
+    s2 = vpadd_f32(s2, s2);
+    float s = vget_lane_f32(s2, 0);
+    for (; d < n; ++d) s += q[d] * half_to_float(k[d]);
+    return s;
+#else
+    float s = 0.0f;
+    for (uint32_t d = 0; d < n; ++d) s += q[d] * half_to_float(k[d]);
+    return s;
+#endif
+}
+
+/* acc[d] += scale * f16_to_f32(v[d]) for d in [0, n). Each acc[d] is an
+ * independent accumulator, so the NEON form is bit-identical to scalar. */
+static inline void bonsai_axpy_vf16(
+    float * acc, float scale, const uint16_t * v, uint32_t n) {
+#if defined(BONSAI_HAVE_NEON)
+    const float32x4_t vscale = vdupq_n_f32(scale);
+    uint32_t d = 0;
+    for (; d + 4 <= n; d += 4) {
+        const float32x4_t vf = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(v + d)));
+        vst1q_f32(acc + d, vmlaq_f32(vld1q_f32(acc + d), vf, vscale));
+    }
+    for (; d < n; ++d) acc[d] += scale * half_to_float(v[d]);
+#else
+    for (uint32_t d = 0; d < n; ++d) acc[d] += scale * half_to_float(v[d]);
+#endif
+}
+
 int bonsai_flash_attn_ext_f32(
     const uint8_t * q_data,
     size_t q_nb1, size_t q_nb2,
@@ -999,10 +1099,7 @@ int bonsai_flash_attn_ext_f32(
                 const uint16_t * k_ptr = (const uint16_t *)(k_data
                     + (size_t) ic  * k_nb1
                     + (size_t) ik2 * k_nb2);
-                float s = 0.0f;
-                for (uint32_t d = 0; d < head_dim_q; ++d) {
-                    s += Q_row[d] * half_to_float(k_ptr[d]);
-                }
+                float s = bonsai_dot_q_kf16(Q_row, k_ptr, head_dim_q);
                 s = s * scale + mv;
 
                 /* Online softmax update — branchless form taken from
@@ -1022,9 +1119,7 @@ int bonsai_flash_attn_ext_f32(
                 const uint16_t * v_ptr = (const uint16_t *)(v_data
                     + (size_t) ic  * v_nb1
                     + (size_t) ik2 * v_nb2);
-                for (uint32_t d = 0; d < head_dim_v; ++d) {
-                    VKQ[d] += vs * half_to_float(v_ptr[d]);
-                }
+                bonsai_axpy_vf16(VKQ, vs, v_ptr, head_dim_v);
 
                 S = S * ms + vs;
             }

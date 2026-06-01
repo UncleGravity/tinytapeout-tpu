@@ -25,8 +25,8 @@ class Slab(Protocol):
     size: int
     physical_address: int
 
-    def write(self, offset: int, data: bytes | memoryview) -> None: ...
-    def read(self, offset: int, size: int) -> bytes: ...
+    def write(self, offset: int, data: bytes | memoryview, coherent: bool = True) -> None: ...
+    def read(self, offset: int, size: int, coherent: bool = True) -> bytes: ...
     def clear(self, offset: int, size: int, value: int = 0) -> None: ...
 
     # PL DMA support. Default (FakeSlab) implementations are no-ops since
@@ -44,10 +44,12 @@ class FakeSlab:
         self.physical_address = physical_address
         self._data = bytearray(size)
 
-    def write(self, offset: int, data: bytes | memoryview) -> None:
+    def write(self, offset: int, data: bytes | memoryview, coherent: bool = True) -> None:
+        del coherent  # no cache on a bytearray
         self._data[offset : offset + len(data)] = data
 
-    def read(self, offset: int, size: int) -> bytes:
+    def read(self, offset: int, size: int, coherent: bool = True) -> bytes:
+        del coherent
         return bytes(self._data[offset : offset + size])
 
     def clear(self, offset: int, size: int, value: int = 0) -> None:
@@ -110,13 +112,17 @@ class PynqSlab:
         if bounds is not None:
             self._buf[bounds[0] : bounds[1]].invalidate()
 
-    def write(self, offset: int, data: bytes | memoryview) -> None:
+    def write(self, offset: int, data: bytes | memoryview, coherent: bool = True) -> None:
         arr = self._np.frombuffer(data, dtype=self._np.uint8)
         self._buf[offset : offset + len(data)] = arr
-        self._flush(offset, len(data))
+        # coherent=False: CPU→CPU tensor, no DMA reads it → skip the flush.
+        if coherent:
+            self._flush(offset, len(data))
 
-    def read(self, offset: int, size: int) -> bytes:
-        self._invalidate(offset, size)
+    def read(self, offset: int, size: int, coherent: bool = True) -> bytes:
+        # coherent=False: no DMA wrote these bytes → skip the invalidate.
+        if coherent:
+            self._invalidate(offset, size)
         return bytes(self._buf[offset : offset + size])
 
     def clear(self, offset: int, size: int, value: int = 0) -> None:

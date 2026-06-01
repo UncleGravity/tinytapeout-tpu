@@ -119,7 +119,15 @@ def _forwarded_env() -> list[str]:
 
 
 def remote_native_build_command(config: BoardConfig) -> str:
-    cflags = "-O3 -mcpu=cortex-a9 -mfpu=neon-vfpv3 -mfloat-abi=hard -std=c99 -fPIC"
+    # neon-fp16 (not neon-vfpv3) so the A9's hardware F16<->F32 conversion
+    # (vcvt.f32.f16) is available to the flash-attention NEON intrinsics. The
+    # A9 has no VFPv4/FMA, so do NOT use neon-vfpv4 here.
+    # -mfp16-format=ieee is required on armv7 gcc for arm_neon.h to *declare*
+    # the f16 intrinsics (vcvt_f32_f16 / vreinterpret_f16_u16 / float16x4_t);
+    # without it they're implicitly-declared and the build fails. arm64/clang
+    # declares them unconditionally, so the host test build doesn't need it.
+    cflags = ("-O3 -mcpu=cortex-a9 -mfpu=neon-fp16 -mfloat-abi=hard "
+              "-mfp16-format=ieee -std=c99 -fPIC")
     return (
         f"cd {shlex.quote(config.remote_dir)}/board/kernels/ps && "
         f"make OUT_DIR=. clean && CFLAGS={shlex.quote(cflags)} make OUT_DIR=."

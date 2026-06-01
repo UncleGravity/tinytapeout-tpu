@@ -34,18 +34,40 @@ bool is_metadata_op(ggml_op op) {
     }
 }
 
-bool supports_raw_copy(const ggml_tensor * op) {
+const char * type_tag(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_F32:  return "f32";
+        case GGML_TYPE_F16:  return "f16";
+        case GGML_TYPE_I32:  return "i32";
+        case GGML_TYPE_I64:  return "i64";
+        case GGML_TYPE_Q1_0: return "q1_0";
+        default:             return "unknown";
+    }
+}
+
+// CPY: a same-dtype contiguous copy is a raw byte memcpy on the board; a
+// contiguous F32→F16 copy is the converting cast ggml emits all over the
+// graph (the sole remaining split offender) — the board runs it via the
+// shared float_to_half element converter. Both stay contiguous; strided/view
+// copies and other dtype pairs still fall back to the CPU.
+bool supports_copy(const ggml_tensor * op) {
     if (op == nullptr || op->op != GGML_OP_CPY) {
         return false;
     }
     const ggml_tensor * src = op->src[0];
     const ggml_tensor * dst = op->src[1];
-    return src != nullptr &&
-        dst != nullptr &&
-        src->type == dst->type &&
-        ggml_is_contiguous(src) &&
-        ggml_is_contiguous(dst) &&
-        ggml_nbytes(src) == ggml_nbytes(dst);
+    if (src == nullptr || dst == nullptr ||
+        !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    if (src->type == dst->type && ggml_nbytes(src) == ggml_nbytes(dst)) {
+        return true;  // raw byte copy
+    }
+    if (src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16 &&
+        ggml_nelements(src) == ggml_nelements(dst)) {
+        return true;  // converting copy
+    }
+    return false;
 }
 
 bool same_shape(const ggml_tensor * lhs, const ggml_tensor * rhs) {
@@ -353,10 +375,13 @@ bool append_copy_op(const ggml_tensor * node, nlohmann::json * ops, nlohmann::js
     const ggml_tensor * dst = node->src[1];
     const RemoteBinding * src_b = find_tensor_binding(src);
     const RemoteBinding * dst_b = find_tensor_binding(dst);
-    const std::size_t nbytes = ggml_nbytes(src);
+    // src and dst byte sizes differ for a converting copy (f32→f16); validate
+    // each binding against its own size.
+    const std::size_t src_nbytes = ggml_nbytes(src);
+    const std::size_t dst_nbytes = ggml_nbytes(dst);
     if (src_b == nullptr || dst_b == nullptr ||
-        !remote_range_is_valid(*src_b, 0, nbytes) ||
-        !remote_range_is_valid(*dst_b, 0, nbytes)) {
+        !remote_range_is_valid(*src_b, 0, src_nbytes) ||
+        !remote_range_is_valid(*dst_b, 0, dst_nbytes)) {
         GGML_LOG_ERROR("pynq: CPY node %s is missing PYNQ tensor handles\n", node->name);
         return false;
     }
@@ -365,20 +390,26 @@ bool append_copy_op(const ggml_tensor * node, nlohmann::json * ops, nlohmann::js
         { P::F_NAME, tensor_name(node) },
         { P::F_SRC, src_b->handle },
         { P::F_DST, dst_b->handle },
-        { P::F_NBYTES, nbytes },
+        { P::F_NBYTES, src_nbytes },                 // raw-copy path uses this
+        { P::F_ELEMENTS, ggml_nelements(src) },      // converting path uses this
+        { P::F_SRC0_TYPE, type_tag(src->type) },
+        { P::F_DST_TYPE, type_tag(dst->type) },
         { P::F_SRC_OFFSET, src_b->remote_offset },
         { P::F_DST_OFFSET, dst_b->remote_offset },
     });
     outputs->push_back(dst_b->handle);
     if (trace_enabled()) {
         tracef(
-            "pynq trace: lower COPY node=%s src=%s/%llu dst=%s/%llu bytes=%zu\n",
+            "pynq trace: lower COPY node=%s src=%s/%llu(%s) dst=%s/%llu(%s) "
+            "elements=%lld\n",
             tensor_name(node),
             tensor_name(src),
             static_cast<unsigned long long>(src_b->handle),
+            type_tag(src->type),
             tensor_name(dst),
             static_cast<unsigned long long>(dst_b->handle),
-            nbytes);
+            type_tag(dst->type),
+            static_cast<long long>(ggml_nelements(src)));
     }
     return true;
 }
@@ -686,17 +717,6 @@ bool append_matmul_q1a8_op(const ggml_tensor * node, nlohmann::json * ops, nlohm
     return true;
 }
 
-const char * type_tag(ggml_type t) {
-    switch (t) {
-        case GGML_TYPE_F32:  return "f32";
-        case GGML_TYPE_F16:  return "f16";
-        case GGML_TYPE_I32:  return "i32";
-        case GGML_TYPE_I64:  return "i64";
-        case GGML_TYPE_Q1_0: return "q1_0";
-        default:             return "unknown";
-    }
-}
-
 bool append_flash_attn_ext_f32_op(
     const ggml_tensor * node, nlohmann::json * ops, nlohmann::json * outputs) {
     const ggml_tensor * q = node->src[0];
@@ -920,7 +940,7 @@ struct OpLowering {
 };
 
 constexpr OpLowering k_lowerings[] = {
-    { supports_raw_copy,           append_copy_op },
+    { supports_copy,               append_copy_op },
     { supports_matmul_q1a8,        append_matmul_q1a8_op },
     { supports_f32_binary,         append_f32_binary_op },
     { supports_scale_f32,          append_scale_f32_op },
@@ -957,9 +977,12 @@ bool device_supports_op_impl(const ggml_tensor * op) {
         return true;
     }
     const bool ok = lookup_lowering(op) != nullptr;
-    if (!ok) {
+    if (!ok && op != nullptr && ggml_nelements(op) > 0) {
         // Record so dump_unsupported_op_census() at backend_free can show
-        // which op kinds are forcing scheduler splits.
+        // which op kinds are forcing scheduler splits. Skip zero-element ops:
+        // lookup_lowering intentionally declines those (empty lm_head /
+        // inp_out_ids on non-final ubatches) and they run as free CPU no-ops,
+        // so counting them as "offenders" only pollutes the histogram.
         record_unsupported_op(op);
     }
     return ok;

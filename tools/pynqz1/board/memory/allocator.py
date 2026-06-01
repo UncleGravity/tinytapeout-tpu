@@ -149,7 +149,12 @@ class TensorAllocator:
             self._release(extent.slab_index, extent.offset, extent.nbytes)
         return record
 
-    def write(self, handle: int, offset: int, data: bytes | bytearray | memoryview) -> None:
+    def write(self, handle: int, offset: int, data: bytes | bytearray | memoryview,
+              coherent: bool = True) -> None:
+        """Write into a tensor. ``coherent=False`` skips the slab cache flush:
+        safe for CPU→CPU tensors (every PS kernel — only the matmul DMAs, and
+        it self-manages its buffers), but NOT for data a DMA will read (e.g.
+        weight upload), which must stay coherent so DDR sees the bytes."""
         view = memoryview(data)
         self._validate_range(handle, offset, len(view))
         src_offset = 0
@@ -157,14 +162,19 @@ class TensorAllocator:
             self._slabs[extent.slab_index].write(
                 extent.offset + local_offset,
                 view[src_offset : src_offset + count],
+                coherent=coherent,
             )
             src_offset += count
 
-    def read(self, handle: int, offset: int, size: int) -> bytes:
+    def read(self, handle: int, offset: int, size: int, coherent: bool = True) -> bytes:
+        """Read from a tensor. ``coherent=False`` skips the slab cache
+        invalidate: safe unless a DMA wrote the bytes (matmul self-invalidates
+        its result, so glue ops reading it are still fine)."""
         self._validate_range(handle, offset, size)
         parts: list[bytes] = []
         for extent, local_offset, count in self._walk(handle, offset, size):
-            parts.append(self._slabs[extent.slab_index].read(extent.offset + local_offset, count))
+            parts.append(self._slabs[extent.slab_index].read(
+                extent.offset + local_offset, count, coherent=coherent))
         return b"".join(parts)
 
     def describe(self, handle: int) -> dict[str, object]:

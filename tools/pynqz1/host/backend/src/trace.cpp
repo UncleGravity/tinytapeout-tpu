@@ -87,14 +87,35 @@ std::unordered_map<std::string, std::size_t> & census_counts() {
     return m;
 }
 
+// Compact dtype + contiguity tag for one operand, e.g. "f32/c" or "f16/n".
+// The contiguity flag is the usual reason a supported op-kind still splits
+// (a view/permute src), and the dtype reveals converting copies — together
+// they identify which lowering guard rejected the node without exploding the
+// histogram with exact shapes.
+std::string tensor_sig(const ggml_tensor * t) {
+    if (t == nullptr) return "-";
+    std::string s = ggml_type_name(t->type);
+    s += ggml_is_contiguous(t) ? "/c" : "/n";
+    return s;
+}
+
+std::string op_cause(const ggml_tensor * op) {
+    std::string s = " |dst=" + tensor_sig(op);
+    if (op->src[0] != nullptr) s += " s0=" + tensor_sig(op->src[0]);
+    if (op->src[1] != nullptr) s += " s1=" + tensor_sig(op->src[1]);
+    return s;
+}
+
 std::string op_label(const ggml_tensor * op) {
     if (op == nullptr) return "(null)";
     const char * base = ggml_op_name(op->op);
     if (op->op == GGML_OP_UNARY) {
-        return std::string(base) + ":" + ggml_unary_op_name(ggml_get_unary_op(op));
+        return std::string(base) + ":" + ggml_unary_op_name(ggml_get_unary_op(op))
+            + op_cause(op);
     }
     if (op->op == GGML_OP_GLU) {
-        return std::string(base) + ":" + ggml_glu_op_name(ggml_get_glu_op(op));
+        return std::string(base) + ":" + ggml_glu_op_name(ggml_get_glu_op(op))
+            + op_cause(op);
     }
     if (op->op == GGML_OP_MUL_MAT) {
         // Split MUL_MAT by operand types so we see Q1_0×F32 vs F32×F32 separately.
@@ -102,10 +123,11 @@ std::string op_label(const ggml_tensor * op) {
         const ggml_tensor * a = op->src[1];
         if (w != nullptr && a != nullptr) {
             return std::string(base) + ":"
-                + ggml_type_name(w->type) + "x" + ggml_type_name(a->type);
+                + ggml_type_name(w->type) + "x" + ggml_type_name(a->type)
+                + op_cause(op);
         }
     }
-    return base;
+    return std::string(base) + op_cause(op);
 }
 
 } // namespace
