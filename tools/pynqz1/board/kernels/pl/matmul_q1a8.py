@@ -127,7 +127,36 @@ def _bind_native(lib: ctypes.CDLL):
         ctypes.POINTER(ctypes.c_uint32), # out_cycles
     ]
     run_chunk.restype = ctypes.c_int
-    return quantize, pack_acts, run_chunk
+
+    # Pipelining split of run_chunk: start kicks the DMAs + kernel and returns
+    # immediately; wait polls them to completion. Serial start()+wait() is
+    # identical to run_chunk(); the scheduler interleaves PS work between them.
+    start_chunk = lib.bonsai_q1a8_start_matmul_chunk
+    start_chunk.argtypes = [
+        ctypes.c_void_p,                 # kernel_regs
+        ctypes.c_void_p,                 # dma_w_regs
+        ctypes.c_void_p,                 # dma_a_regs
+        ctypes.c_uint32,                 # weights_phys_addr
+        ctypes.c_uint32,                 # weights_nbytes
+        ctypes.c_uint32,                 # acts_phys_addr
+        ctypes.c_uint32,                 # acts_nbytes
+        ctypes.c_uint32,                 # result_phys_addr
+        ctypes.c_uint32,                 # result_nbytes
+        ctypes.c_uint32,                 # num_q1_blocks
+        ctypes.c_uint32,                 # num_rowblocks
+    ]
+    start_chunk.restype = ctypes.c_int
+
+    wait_chunk = lib.bonsai_q1a8_wait_matmul_chunk
+    wait_chunk.argtypes = [
+        ctypes.c_void_p,                 # kernel_regs
+        ctypes.c_void_p,                 # dma_w_regs
+        ctypes.c_void_p,                 # dma_a_regs
+        ctypes.c_uint32,                 # poll_limit
+        ctypes.POINTER(ctypes.c_uint32), # out_cycles
+    ]
+    wait_chunk.restype = ctypes.c_int
+    return quantize, pack_acts, run_chunk, start_chunk, wait_chunk
 
 
 # -- legacy Python helpers (kept for tests & golden comparisons) ----------
@@ -275,6 +304,8 @@ class PLMatmulQ1A8:
         self._c_quantize = None
         self._c_pack_acts = None
         self._c_run_chunk = None
+        self._c_start_chunk = None
+        self._c_wait_chunk = None
         # MMIO pointers passed to the C runner. Resolved lazily on first
         # run() (overlay is fully wired by then) since some tests construct
         # PLMatmulQ1A8 against a fake overlay with no real ip_dict.
@@ -371,7 +402,8 @@ class PLMatmulQ1A8:
         if self._c_quantize is not None:
             return
         self._lib = load_lib()
-        self._c_quantize, self._c_pack_acts, self._c_run_chunk = _bind_native(self._lib)
+        (self._c_quantize, self._c_pack_acts, self._c_run_chunk,
+         self._c_start_chunk, self._c_wait_chunk) = _bind_native(self._lib)
 
     def _ensure_mmio_pointers(self) -> None:
         """Resolve MMIO base addresses for the C runner.
@@ -737,26 +769,41 @@ class PLMatmulQ1A8:
             weights_phys = self._resolve_weights_phys(
                 allocator, weights_handle, weights_offset, weights_nbytes)
 
+        # Serial start()+wait() — behaviourally identical to the fused
+        # run_chunk(), but split so a future scheduler can run PS work between
+        # the two. chunk_start should be ~µs (just MMIO pokes); chunk_wait is
+        # where the DMA+kernel wall time lives (= what pipelining will hide).
         out_cycles = ctypes.c_uint32(0)
         with timer.section("run_chunk"):
-            rc = self._c_run_chunk(
-                self._kernel_regs_ptr,
-                self._dma_w_regs_ptr,
-                self._dma_a_regs_ptr,
-                ctypes.c_uint32(weights_phys),
-                ctypes.c_uint32(weights_nbytes),
-                ctypes.c_uint32(self._acts_buf.physical_address),
-                ctypes.c_uint32(acts_stream_nbytes),
-                ctypes.c_uint32(result_phys),
-                ctypes.c_uint32(result_nbytes),
-                ctypes.c_uint32(num_q1_blocks),
-                ctypes.c_uint32(num_rowblocks),
-                ctypes.c_uint32(POLL_LIMIT),
-                ctypes.byref(out_cycles),
-            )
-        if rc != 0:
-            raise RuntimeError(
-                f"bonsai_q1a8_run_matmul_chunk rc={rc} "
-                f"(see q1a8_runner.c for error code mapping)")
+            with timer.section("chunk_start"):
+                rc = self._c_start_chunk(
+                    self._kernel_regs_ptr,
+                    self._dma_w_regs_ptr,
+                    self._dma_a_regs_ptr,
+                    ctypes.c_uint32(weights_phys),
+                    ctypes.c_uint32(weights_nbytes),
+                    ctypes.c_uint32(self._acts_buf.physical_address),
+                    ctypes.c_uint32(acts_stream_nbytes),
+                    ctypes.c_uint32(result_phys),
+                    ctypes.c_uint32(result_nbytes),
+                    ctypes.c_uint32(num_q1_blocks),
+                    ctypes.c_uint32(num_rowblocks),
+                )
+            if rc != 0:
+                raise RuntimeError(
+                    f"bonsai_q1a8_start_matmul_chunk rc={rc} "
+                    f"(see q1a8_runner.c for error code mapping)")
+            with timer.section("chunk_wait"):
+                rc = self._c_wait_chunk(
+                    self._kernel_regs_ptr,
+                    self._dma_w_regs_ptr,
+                    self._dma_a_regs_ptr,
+                    ctypes.c_uint32(POLL_LIMIT),
+                    ctypes.byref(out_cycles),
+                )
+            if rc != 0:
+                raise RuntimeError(
+                    f"bonsai_q1a8_wait_matmul_chunk rc={rc} "
+                    f"(see q1a8_runner.c for error code mapping)")
 
         return int(out_cycles.value)

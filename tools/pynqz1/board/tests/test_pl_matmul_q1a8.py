@@ -237,3 +237,21 @@ def test_c_pack_matmul_q1a8_stream_matches_python(native_lib_path):
             expected[off : off + rowblock_nbytes] = py_block
 
     assert bytes(c_out) == bytes(expected)
+
+
+def test_bind_native_resolves_start_wait_split(native_lib_path):
+    """_bind_native must resolve the run/start/wait runner entry points and
+    unpack into 5 callables (the pipelining split added start_chunk/wait_chunk).
+    Catches a missing C symbol or a stale binding tuple without needing a board."""
+    lib = load_lib(native_lib_path)
+    bound = matmul_q1a8._bind_native(lib)
+    assert len(bound) == 5
+    quantize, pack_acts, run_chunk, start_chunk, wait_chunk = bound
+    for fn in (quantize, pack_acts, run_chunk, start_chunk, wait_chunk):
+        assert callable(fn)
+    # The split entry points must be distinct C functions, not the fused one.
+    assert start_chunk is not run_chunk
+    assert wait_chunk is not run_chunk
+    assert run_chunk.restype is ctypes.c_int
+    assert start_chunk.restype is ctypes.c_int
+    assert wait_chunk.restype is ctypes.c_int

@@ -97,21 +97,29 @@ static int poll_dma_idle(volatile uint32_t * dma, int dmasr_off,
 }
 
 /*
- * One Q1A8 matmul chunk: configure kernel, kick all three DMAs, busy-poll
- * for completion, return cycle count.
+ * One Q1A8 matmul chunk, split into a non-blocking start and a blocking wait
+ * so the caller can run PS compute on the ARM while the DMA + kernel run
+ * autonomously in the PL (pipelining). bonsai_q1a8_run_matmul_chunk below is
+ * the serial start+wait wrapper, behaviourally identical to the old fused
+ * call (and the only entry the legacy binding needs).
  *
  * dma_w_regs is axi_dma_0 (carries weights MM2S + result S2MM).
  * dma_a_regs is axi_dma_1 (acts MM2S only).
  *
- * poll_limit is per-poll-loop iteration cap. ~100k is enough for any
- * matmul we ship today; larger values are safe but waste cycles on
+ * poll_limit (wait only) is the per-poll-loop iteration cap. ~100k is enough
+ * for any matmul we ship today; larger values are safe but waste cycles on
  * genuine errors before returning -1.
  *
- * Error codes (negative): -1 generic arg, -10..-12 DMA reset failures,
- * -20/-21 acts MM2S timeout/err, -30/-31 weights MM2S, -40/-41 S2MM,
- * -50 kernel DONE timeout. Caller maps these to a RuntimeError.
+ * Error codes (negative): -1 generic arg, -10..-12 DMA reset failures (start),
+ * -20/-21 acts MM2S timeout/err, -30/-31 weights MM2S, -40/-41 S2MM, -50
+ * kernel DONE timeout (wait). Caller maps these to a RuntimeError.
  */
-int bonsai_q1a8_run_matmul_chunk(
+
+/* Non-blocking: bring DMAs up, configure + start the kernel, kick all three
+ * DMAs, and return immediately. The DMA engines and kernel then run on their
+ * own; the caller must call wait before touching the result or reusing the
+ * acts/result buffers for the same channel. */
+int bonsai_q1a8_start_matmul_chunk(
     volatile uint32_t * kernel_regs,
     volatile uint32_t * dma_w_regs,
     volatile uint32_t * dma_a_regs,
@@ -122,12 +130,9 @@ int bonsai_q1a8_run_matmul_chunk(
     uint32_t result_phys_addr,
     uint32_t result_nbytes,
     uint32_t num_q1_blocks,
-    uint32_t num_rowblocks,
-    uint32_t poll_limit,
-    uint32_t * out_cycles
+    uint32_t num_rowblocks
 ) {
-    if (kernel_regs == NULL || dma_w_regs == NULL || dma_a_regs == NULL ||
-        out_cycles == NULL) {
+    if (kernel_regs == NULL || dma_w_regs == NULL || dma_a_regs == NULL) {
         return -1;
     }
 
@@ -157,6 +162,25 @@ int bonsai_q1a8_run_matmul_chunk(
     mmio_wr(dma_w_regs, DMA_MM2S_SA, weights_phys_addr);
     mmio_wr(dma_w_regs, DMA_MM2S_LENGTH, weights_nbytes);
 
+    return 0;
+}
+
+/* Blocking: poll the in-flight transfers started by start_matmul_chunk to
+ * completion and return the kernel's busy-cycle count. Safe to call any time
+ * after start; the wall time spent here is what pipelining hides under PS
+ * compute. */
+int bonsai_q1a8_wait_matmul_chunk(
+    volatile uint32_t * kernel_regs,
+    volatile uint32_t * dma_w_regs,
+    volatile uint32_t * dma_a_regs,
+    uint32_t poll_limit,
+    uint32_t * out_cycles
+) {
+    if (kernel_regs == NULL || dma_w_regs == NULL || dma_a_regs == NULL ||
+        out_cycles == NULL) {
+        return -1;
+    }
+
     /* Wait for both sends + result recv. Order doesn't matter for
      * correctness, only for the worst-case wall time of this function. */
     int rc;
@@ -178,4 +202,34 @@ int bonsai_q1a8_run_matmul_chunk(
         }
     }
     return -50;
+}
+
+/* Serial wrapper: start then immediately wait. Identical behaviour and error
+ * codes to the pre-split fused call. */
+int bonsai_q1a8_run_matmul_chunk(
+    volatile uint32_t * kernel_regs,
+    volatile uint32_t * dma_w_regs,
+    volatile uint32_t * dma_a_regs,
+    uint32_t weights_phys_addr,
+    uint32_t weights_nbytes,
+    uint32_t acts_phys_addr,
+    uint32_t acts_nbytes,
+    uint32_t result_phys_addr,
+    uint32_t result_nbytes,
+    uint32_t num_q1_blocks,
+    uint32_t num_rowblocks,
+    uint32_t poll_limit,
+    uint32_t * out_cycles
+) {
+    const int rc = bonsai_q1a8_start_matmul_chunk(
+        kernel_regs, dma_w_regs, dma_a_regs,
+        weights_phys_addr, weights_nbytes,
+        acts_phys_addr, acts_nbytes,
+        result_phys_addr, result_nbytes,
+        num_q1_blocks, num_rowblocks);
+    if (rc != 0) {
+        return rc;
+    }
+    return bonsai_q1a8_wait_matmul_chunk(
+        kernel_regs, dma_w_regs, dma_a_regs, poll_limit, out_cycles);
 }
