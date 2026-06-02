@@ -42,6 +42,10 @@ GOP_SCALE_F32 = "SCALE_F32"
 GOP_SILU_F32 = "SILU_F32"
 GOP_SWIGLU_F32 = "SWIGLU_F32"
 GOP_RMS_NORM_F32 = "RMS_NORM_F32"
+# Fused rms_norm followed by the learned-weight row-broadcast mul (one op
+# instead of RMS_NORM_F32 + MUL_F32). Fields: src/src_offset (norm input),
+# src1/src1_offset (weight, length=rows), dst/dst_offset, rows, cols, eps.
+GOP_RMS_NORM_MUL_F32 = "RMS_NORM_MUL_F32"
 GOP_ROPE_F32 = "ROPE_F32"
 GOP_FLASH_ATTN_EXT_F32 = "FLASH_ATTN_EXT_F32"
 GOP_GET_ROWS = "GET_ROWS"
@@ -56,6 +60,7 @@ GRAPH_OPS = (
     GOP_SILU_F32,
     GOP_SWIGLU_F32,
     GOP_RMS_NORM_F32,
+    GOP_RMS_NORM_MUL_F32,
     GOP_ROPE_F32,
     GOP_FLASH_ATTN_EXT_F32,
     GOP_GET_ROWS,

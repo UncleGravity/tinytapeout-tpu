@@ -568,6 +568,42 @@ int bonsai_rms_norm_f32(
     return 0;
 }
 
+/*
+ * Fused RMS_NORM + row-broadcast MUL: dst = rms_norm(src) * weight, where
+ * weight is one `rows`-length vector reused across all columns (the learned
+ * norm scale). Bit-identical to bonsai_rms_norm_f32 then bonsai_mul_f32 with
+ * src1_broadcast: dst[i] = (src[i] * scale) * weight[row]. In-place safe (the
+ * row is fully read for the mean before any write).
+ */
+int bonsai_rms_norm_mul_f32(
+    const float * src,
+    const float * weight,
+    float * dst,
+    uint32_t rows,
+    uint32_t cols,
+    float eps) {
+    if (src == NULL || weight == NULL || dst == NULL || rows == 0 || cols == 0) {
+        return -1;
+    }
+
+    for (uint32_t col = 0; col < cols; ++col) {
+        const size_t col_offset = (size_t) col * rows;
+        float mean_square = 0.0f;
+        for (uint32_t row = 0; row < rows; ++row) {
+            const float value = src[col_offset + row];
+            mean_square += value * value;
+        }
+
+        const float scale = 1.0f / sqrtf(mean_square / (float) rows + eps);
+        for (uint32_t row = 0; row < rows; ++row) {
+            const size_t index = col_offset + row;
+            dst[index] = src[index] * scale * weight[row];
+        }
+    }
+
+    return 0;
+}
+
 // Q8_0 quantize that emits int8 quants + fp16 scale bits (the form the PL
 // rowblock kernel wants on the wire). Matches quantize_q8_0() above bit-for-bit
 // modulo the scale representation: a float roundtrip through fp16 there, the

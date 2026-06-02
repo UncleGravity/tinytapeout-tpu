@@ -6,6 +6,8 @@
 #include "ggml-backend-impl.h"
 
 #include <cstring>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace pynq {
 
@@ -607,6 +609,76 @@ bool append_rms_norm_f32_op(const ggml_tensor * node, nlohmann::json * ops, nloh
     return true;
 }
 
+// Fusion: an RMS_NORM whose sole consumer is the learned-weight row-broadcast
+// MUL (the classic `cur = mul(rms_norm(x), w)` pattern) lowers to one
+// RMS_NORM_MUL_F32 instead of RMS_NORM_F32 + MUL_F32 — dropping a full op
+// dispatch and the materialized intermediate. Returns the absorbed RMS_NORM
+// node if `mul` is such an anchor, else nullptr. Only fires where BOTH
+// standalone ops would already have lowered on-board, so it never changes
+// what runs where — just merges two ops into one.
+const ggml_tensor * fused_rms_for(
+        const ggml_tensor * mul,
+        const std::unordered_map<const ggml_tensor *, int> & use_count) {
+    if (mul == nullptr || mul->op != GGML_OP_MUL) return nullptr;
+    const ggml_tensor * rms = mul->src[0];
+    const ggml_tensor * weight = mul->src[1];
+    if (rms == nullptr || weight == nullptr) return nullptr;
+    if (rms->op != GGML_OP_RMS_NORM) return nullptr;
+    if ((rms->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) return nullptr;  // host reads it
+    const auto it = use_count.find(rms);
+    if (it == use_count.end() || it->second != 1) return nullptr;     // sole consumer
+    if (!is_contiguous_f32(mul) || !is_contiguous_f32(rms)) return nullptr;
+    const ggml_tensor * rms_in = rms->src[0];
+    if (!is_contiguous_f32(rms_in)) return nullptr;
+    if (!same_shape(mul, rms) || !same_shape(rms, rms_in)) return nullptr;
+    if (!is_row_broadcast_for(weight, mul)) return nullptr;           // weight is [ne0]
+    return rms;
+}
+
+bool append_rms_norm_mul_op(
+        const ggml_tensor * mul, const ggml_tensor * rms,
+        nlohmann::json * ops, nlohmann::json * outputs) {
+    const ggml_tensor * src = rms->src[0];
+    const ggml_tensor * weight = mul->src[1];
+    const RemoteBinding * src_b = find_tensor_binding(src);
+    const RemoteBinding * w_b = find_tensor_binding(weight);
+    const RemoteBinding * dst_b = find_tensor_binding(mul);
+    if (src_b == nullptr || w_b == nullptr || dst_b == nullptr ||
+        !remote_range_is_valid(*src_b, 0, ggml_nbytes(src)) ||
+        !remote_range_is_valid(*w_b, 0, ggml_nbytes(weight)) ||
+        !remote_range_is_valid(*dst_b, 0, ggml_nbytes(mul))) {
+        GGML_LOG_ERROR("pynq: RMS_NORM_MUL node %s is missing PYNQ tensor handles\n",
+            mul->name);
+        return false;
+    }
+    ops->push_back({
+        { P::F_OP, P::GOP_RMS_NORM_MUL_F32 },
+        { P::F_NAME, tensor_name(mul) },
+        { P::F_SRC, src_b->handle },
+        { P::F_SRC_OFFSET, src_b->remote_offset },
+        { P::F_SRC1, w_b->handle },
+        { P::F_SRC1_OFFSET, w_b->remote_offset },
+        { P::F_DST, dst_b->handle },
+        { P::F_DST_OFFSET, dst_b->remote_offset },
+        { P::F_ROWS, mul->ne[0] },
+        { P::F_COLS, flattened_cols(mul) },
+        { P::F_EPS, op_param_f32(rms, 0) },
+    });
+    outputs->push_back(dst_b->handle);
+    if (trace_enabled()) {
+        tracef(
+            "pynq trace: lower RMS_NORM_MUL_F32 node=%s src=%s/%llu w=%s/%llu "
+            "dst=%llu rows=%lld cols=%lld\n",
+            tensor_name(mul),
+            tensor_name(src), static_cast<unsigned long long>(src_b->handle),
+            tensor_name(weight), static_cast<unsigned long long>(w_b->handle),
+            static_cast<unsigned long long>(dst_b->handle),
+            static_cast<long long>(mul->ne[0]),
+            static_cast<long long>(flattened_cols(mul)));
+    }
+    return true;
+}
+
 bool append_rope_f32_op(const ggml_tensor * node, nlohmann::json * ops, nlohmann::json * outputs) {
     const ggml_tensor * src = node->src[0];
     const ggml_tensor * pos = node->src[1];
@@ -998,12 +1070,48 @@ enum ggml_status backend_graph_compute_impl(ggml_backend_t backend, ggml_cgraph 
     nlohmann::json ops = nlohmann::json::array();
     nlohmann::json outputs = nlohmann::json::array();
 
+    // Fusion pre-pass: count tensor uses, then find each compute MUL that is
+    // the learned-weight follow-on of an RMS_NORM it solely consumes. Those
+    // emit one RMS_NORM_MUL_F32; the absorbed RMS_NORM nodes are skipped.
+    std::unordered_map<const ggml_tensor *, int> use_count;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (node->src[s] != nullptr) {
+                use_count[node->src[s]]++;
+            }
+        }
+    }
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *> mul_to_rms;
+    std::unordered_set<const ggml_tensor *> fused_rms;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;  // only fuse into a MUL that will actually be emitted
+        }
+        const ggml_tensor * rms = fused_rms_for(node, use_count);
+        if (rms != nullptr) {
+            mul_to_rms.emplace(node, rms);
+            fused_rms.insert(rms);
+        }
+    }
+
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
         if (is_metadata_op(node->op)) {
+            continue;
+        }
+        if (fused_rms.count(node) != 0) {
+            continue;  // absorbed into its consuming MUL's RMS_NORM_MUL_F32
+        }
+        const auto fit = mul_to_rms.find(node);
+        if (fit != mul_to_rms.end()) {
+            if (!append_rms_norm_mul_op(node, fit->second, &ops, &outputs)) {
+                return GGML_STATUS_FAILED;
+            }
             continue;
         }
         const OpLowering * lowering = lookup_lowering(node);

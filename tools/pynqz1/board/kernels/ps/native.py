@@ -100,6 +100,7 @@ from proto.ops import (
     GOP_MATMUL_Q1A8,
     GOP_MUL_F32,
     GOP_RMS_NORM_F32,
+    GOP_RMS_NORM_MUL_F32,
     GOP_ROPE_F32,
     GOP_SCALE_F32,
     GOP_SET_ROWS,
@@ -582,6 +583,55 @@ class RmsNormF32(_NativeKernel):
             self._check(
                 self._fn(
                     src,
+                    dst,
+                    ctypes.c_uint32(rows),
+                    ctypes.c_uint32(cols),
+                    ctypes.c_float(eps),
+                )
+            )
+
+        _run_finalizers(finalizers, timer)
+        timer.add("bytes_written", elements * F32_BYTES)
+
+
+class RmsNormMulF32(_NativeKernel):
+    """Fused rms_norm + learned-weight mul. src is [rows, cols] (rows = the
+    normalized dim), weight is a rows-length vector broadcast across cols."""
+
+    name = GOP_RMS_NORM_MUL_F32
+    symbol = "bonsai_rms_norm_mul_f32"
+    argtypes = (
+        ctypes.POINTER(ctypes.c_float),  # src
+        ctypes.POINTER(ctypes.c_float),  # weight (length rows)
+        ctypes.POINTER(ctypes.c_float),  # dst
+        ctypes.c_uint32,                 # rows
+        ctypes.c_uint32,                 # cols
+        ctypes.c_float,                  # eps
+    )
+
+    def run(self, allocator, op, timer):
+        rows = _positive(op, F_ROWS)
+        cols = _positive(op, F_COLS)
+        if F_EPS not in op:
+            raise AllocatorError("invalid_request", "missing eps")
+        eps = float(op[F_EPS])
+        elements = rows * cols
+
+        keep: list = []
+        finalizers: list = []
+        src = _in_ptr(allocator, _required(op, F_SRC), _optional_int(op, F_SRC_OFFSET),
+                      elements * F32_BYTES, ctypes.c_float, timer, keep)
+        weight = _in_ptr(allocator, _required(op, F_SRC1),
+                         _optional_int(op, F_SRC1_OFFSET),
+                         rows * F32_BYTES, ctypes.c_float, timer, keep)
+        dst = _out_ptr(allocator, _required(op, F_DST), _optional_int(op, F_DST_OFFSET),
+                       elements * F32_BYTES, ctypes.c_float, timer, finalizers)
+
+        with timer.section("compute"):
+            self._check(
+                self._fn(
+                    src,
+                    weight,
                     dst,
                     ctypes.c_uint32(rows),
                     ctypes.c_uint32(cols),
@@ -1270,6 +1320,7 @@ NATIVE_KERNELS = (
     SiluF32,
     SwigluF32,
     RmsNormF32,
+    RmsNormMulF32,
     RopeF32,
     FlashAttnExtF32,
     # GetRows / SetRows are constructed below — they need lib explicitly,

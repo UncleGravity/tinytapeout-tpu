@@ -30,6 +30,7 @@ inline constexpr const char GOP_SCALE_F32[]    = "SCALE_F32";
 inline constexpr const char GOP_SILU_F32[]     = "SILU_F32";
 inline constexpr const char GOP_SWIGLU_F32[]   = "SWIGLU_F32";
 inline constexpr const char GOP_RMS_NORM_F32[] = "RMS_NORM_F32";
+inline constexpr const char GOP_RMS_NORM_MUL_F32[] = "RMS_NORM_MUL_F32";
 inline constexpr const char GOP_ROPE_F32[]     = "ROPE_F32";
 inline constexpr const char GOP_FLASH_ATTN_EXT_F32[] = "FLASH_ATTN_EXT_F32";
 inline constexpr const char GOP_GET_ROWS[]     = "GET_ROWS";

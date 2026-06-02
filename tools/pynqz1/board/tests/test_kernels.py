@@ -15,6 +15,7 @@ from proto.ops import (
     GOP_MATMUL_Q1A8,
     GOP_MUL_F32,
     GOP_RMS_NORM_F32,
+    GOP_RMS_NORM_MUL_F32,
     GOP_ROPE_F32,
     GOP_SCALE_F32,
     GOP_SILU_F32,
@@ -351,3 +352,35 @@ def test_matmul_q1a8(registry, allocator):
     expected = golden.matmul_q1a8(weights_q1_0, acts, rows, cols, k)
     for got, exp in zip(struct.iter_unpack("<f", out), struct.iter_unpack("<f", expected), strict=False):
         assert got[0] == pytest.approx(exp[0], abs=1e-4)
+
+
+def test_rms_norm_mul_fused_matches_two_ops(registry, allocator):
+    """Fused RMS_NORM_MUL_F32 must be bit-identical to RMS_NORM_F32 followed by
+    a row-broadcast MUL_F32 — same f32 op order, so the bytes match exactly."""
+    import numpy as np
+
+    rows, cols = 64, 5
+    rng = np.random.default_rng(7)
+    src = rng.standard_normal((cols, rows), dtype=np.float32)
+    weight = rng.standard_normal(rows, dtype=np.float32)
+    eps = 1e-5
+
+    src_h = allocate_and_upload(allocator, src.tobytes())
+    w_h = allocate_and_upload(allocator, weight.tobytes())
+
+    # Reference: two separate ops through a materialized intermediate.
+    tmp_h = allocate_empty(allocator, rows * cols * F32)
+    ref_h = allocate_empty(allocator, rows * cols * F32)
+    run_one(registry, allocator, {
+        "op": GOP_RMS_NORM_F32, "src": src_h, "dst": tmp_h,
+        "rows": rows, "cols": cols, "eps": eps})
+    ref = run_one(registry, allocator, {
+        "op": GOP_MUL_F32, "src0": tmp_h, "src1": w_h, "dst": ref_h,
+        "rows": rows, "cols": cols, "src1_broadcast": True})
+
+    fused_h = allocate_empty(allocator, rows * cols * F32)
+    fused = run_one(registry, allocator, {
+        "op": GOP_RMS_NORM_MUL_F32, "src": src_h, "src1": w_h, "dst": fused_h,
+        "rows": rows, "cols": cols, "eps": eps})
+
+    assert fused == ref
