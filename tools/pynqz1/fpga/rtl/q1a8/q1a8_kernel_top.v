@@ -22,7 +22,12 @@
 
 module q1a8_kernel_top (
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 s_axi_aclk CLK" *)
-    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF S_AXI:S_AXIS:S_AXIS_ACTS:M_AXIS, ASSOCIATED_RESET s_axi_aresetn, FREQ_HZ 100000000" *)
+    // No fixed FREQ_HZ: the Zynq PLL can't hit every requested FCLK exactly
+    // (e.g. a 150 MHz request yields 142.857 MHz), and a pinned value here
+    // makes validate_bd_design fail with a FREQ_HZ mismatch against the
+    // propagated DMA/FCLK clock. Leaving it out lets Vivado propagate the
+    // actual FCLK_CLK0 frequency through all four associated interfaces.
+    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF S_AXI:S_AXIS:S_AXIS_ACTS:M_AXIS, ASSOCIATED_RESET s_axi_aresetn" *)
     input  wire         s_axi_aclk,
     (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 s_axi_aresetn RST" *)
     (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)

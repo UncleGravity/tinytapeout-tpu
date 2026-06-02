@@ -36,6 +36,11 @@ create_project $proj_name $proj_dir -part xc7z020clg400-1 -force
 set_property board_part www.digilentinc.com:pynq-z1:part0:1.0 [current_project]
 set_property target_language Verilog [current_project]
 
+# Multicycle constraint for the enable-gated fp32 accumulator (see timing.xdc).
+# Implementation-only: the cells it targets don't exist until after synthesis.
+add_files -norecurse -fileset constrs_1 [file join $script_dir timing.xdc]
+set_property used_in_synthesis false [get_files [file join $script_dir timing.xdc]]
+
 # -- Add all q1a8 RTL files --------------------------------------------------
 foreach v {
     fp16_to_fp32.v
@@ -60,11 +65,16 @@ create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:* ps7_0
 apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \
     -config {make_external "FIXED_IO, DDR" apply_board_preset "1" Master "Disable" Slave "Disable"} \
     [get_bd_cells ps7_0]
+# FCLK 150 MHz (was 100) → ~1.2 GB/s per HP port. Requires the kernel to
+# close timing at 150 (see fp32_mul DSP inference + the timing notes); drop
+# back to 125/100 if impl reports negative WNS on q1a8_kernel.
+# HP1 enabled so the weight stream gets its own DDR port (see interconnects).
 set_property -dict [list \
     CONFIG.PCW_USE_M_AXI_GP0 {1} \
     CONFIG.PCW_USE_S_AXI_HP0 {1} \
+    CONFIG.PCW_USE_S_AXI_HP1 {1} \
     CONFIG.PCW_EN_CLK0_PORT {1} \
-    CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {100} \
+    CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {150} \
 ] [get_bd_cells ps7_0]
 
 # Reset generator.
@@ -105,9 +115,15 @@ set_property -dict [list \
 create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:* axi_lite_interconnect
 set_property -dict [list CONFIG.NUM_MI {3} CONFIG.NUM_SI {1}] [get_bd_cells axi_lite_interconnect]
 
-# Memory interconnect: 3 SI (DMA0 MM2S + S2MM, DMA1 MM2S) -> 1 MI (HP0).
+# Memory interconnects, split across two HP ports so the weight stream (the
+# bandwidth hog, ~236 MiB/token) gets a dedicated DDR port:
+#   HP0 ← results S2MM + acts MM2S  (2 SI)
+#   HP1 ← weights MM2S              (1 SI, dedicated)
 create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:* axi_mem_interconnect
-set_property -dict [list CONFIG.NUM_MI {1} CONFIG.NUM_SI {3}] [get_bd_cells axi_mem_interconnect]
+set_property -dict [list CONFIG.NUM_MI {1} CONFIG.NUM_SI {2}] [get_bd_cells axi_mem_interconnect]
+
+create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:* axi_mem_interconnect_hp1
+set_property -dict [list CONFIG.NUM_MI {1} CONFIG.NUM_SI {1}] [get_bd_cells axi_mem_interconnect_hp1]
 
 # Custom kernel top (Vivado infers the AXI-Lite slave + AXIS slave from
 # the X_INTERFACE_INFO attributes in the RTL).
@@ -130,6 +146,7 @@ puts "==============================================================="
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]     [get_bd_pins rst_0/slowest_sync_clk]
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]     [get_bd_pins ps7_0/M_AXI_GP0_ACLK]
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]     [get_bd_pins ps7_0/S_AXI_HP0_ACLK]
+connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]     [get_bd_pins ps7_0/S_AXI_HP1_ACLK]
 connect_bd_net [get_bd_pins ps7_0/FCLK_RESET0_N] [get_bd_pins reset_inv_0/Op1]
 connect_bd_net [get_bd_pins reset_inv_0/Res]     [get_bd_pins rst_0/ext_reset_in]
 connect_bd_net [get_bd_pins const_1/dout]        [get_bd_pins rst_0/dcm_locked]
@@ -161,17 +178,23 @@ connect_bd_net [get_bd_pins rst_0/peripheral_aresetn]   [get_bd_pins axi_lite_in
 connect_bd_net [get_bd_pins rst_0/peripheral_aresetn]   [get_bd_pins axi_lite_interconnect/M01_ARESETN]
 connect_bd_net [get_bd_pins rst_0/peripheral_aresetn]   [get_bd_pins axi_lite_interconnect/M02_ARESETN]
 
-# Memory interconnect (3 SI + 1 MI)
+# Memory interconnect HP0 (2 SI + 1 MI): results S2MM + acts MM2S
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]            [get_bd_pins axi_mem_interconnect/ACLK]
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]            [get_bd_pins axi_mem_interconnect/S00_ACLK]
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]            [get_bd_pins axi_mem_interconnect/S01_ACLK]
-connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]            [get_bd_pins axi_mem_interconnect/S02_ACLK]
 connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]            [get_bd_pins axi_mem_interconnect/M00_ACLK]
 connect_bd_net [get_bd_pins rst_0/interconnect_aresetn] [get_bd_pins axi_mem_interconnect/ARESETN]
 connect_bd_net [get_bd_pins rst_0/peripheral_aresetn]   [get_bd_pins axi_mem_interconnect/S00_ARESETN]
 connect_bd_net [get_bd_pins rst_0/peripheral_aresetn]   [get_bd_pins axi_mem_interconnect/S01_ARESETN]
-connect_bd_net [get_bd_pins rst_0/peripheral_aresetn]   [get_bd_pins axi_mem_interconnect/S02_ARESETN]
 connect_bd_net [get_bd_pins rst_0/peripheral_aresetn]   [get_bd_pins axi_mem_interconnect/M00_ARESETN]
+
+# Memory interconnect HP1 (1 SI + 1 MI): weights MM2S, dedicated DDR port
+connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]            [get_bd_pins axi_mem_interconnect_hp1/ACLK]
+connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]            [get_bd_pins axi_mem_interconnect_hp1/S00_ACLK]
+connect_bd_net [get_bd_pins ps7_0/FCLK_CLK0]            [get_bd_pins axi_mem_interconnect_hp1/M00_ACLK]
+connect_bd_net [get_bd_pins rst_0/interconnect_aresetn] [get_bd_pins axi_mem_interconnect_hp1/ARESETN]
+connect_bd_net [get_bd_pins rst_0/peripheral_aresetn]   [get_bd_pins axi_mem_interconnect_hp1/S00_ARESETN]
+connect_bd_net [get_bd_pins rst_0/peripheral_aresetn]   [get_bd_pins axi_mem_interconnect_hp1/M00_ARESETN]
 
 # -- AXI plumbing -----------------------------------------------------------
 
@@ -181,11 +204,12 @@ connect_bd_intf_net [get_bd_intf_pins axi_lite_interconnect/M00_AXI] [get_bd_int
 connect_bd_intf_net [get_bd_intf_pins axi_lite_interconnect/M01_AXI] [get_bd_intf_pins axi_dma_1/S_AXI_LITE]
 connect_bd_intf_net [get_bd_intf_pins axi_lite_interconnect/M02_AXI] [get_bd_intf_pins q1a8_kernel_top_0/S_AXI]
 
-# Data: DMA0 MM2S + S2MM and DMA1 MM2S -> mem interconnect -> HP0
-connect_bd_intf_net [get_bd_intf_pins axi_dma_0/M_AXI_MM2S]          [get_bd_intf_pins axi_mem_interconnect/S00_AXI]
-connect_bd_intf_net [get_bd_intf_pins axi_dma_0/M_AXI_S2MM]          [get_bd_intf_pins axi_mem_interconnect/S01_AXI]
-connect_bd_intf_net [get_bd_intf_pins axi_dma_1/M_AXI_MM2S]          [get_bd_intf_pins axi_mem_interconnect/S02_AXI]
-connect_bd_intf_net [get_bd_intf_pins axi_mem_interconnect/M00_AXI]  [get_bd_intf_pins ps7_0/S_AXI_HP0]
+# Data: results S2MM + acts MM2S -> HP0; weights MM2S -> HP1 (dedicated).
+connect_bd_intf_net [get_bd_intf_pins axi_dma_0/M_AXI_S2MM]              [get_bd_intf_pins axi_mem_interconnect/S00_AXI]
+connect_bd_intf_net [get_bd_intf_pins axi_dma_1/M_AXI_MM2S]              [get_bd_intf_pins axi_mem_interconnect/S01_AXI]
+connect_bd_intf_net [get_bd_intf_pins axi_mem_interconnect/M00_AXI]      [get_bd_intf_pins ps7_0/S_AXI_HP0]
+connect_bd_intf_net [get_bd_intf_pins axi_dma_0/M_AXI_MM2S]              [get_bd_intf_pins axi_mem_interconnect_hp1/S00_AXI]
+connect_bd_intf_net [get_bd_intf_pins axi_mem_interconnect_hp1/M00_AXI]  [get_bd_intf_pins ps7_0/S_AXI_HP1]
 
 # Stream: DMA0 MM2S -> kernel weights input
 connect_bd_intf_net [get_bd_intf_pins axi_dma_0/M_AXIS_MM2S]         [get_bd_intf_pins q1a8_kernel_top_0/S_AXIS]

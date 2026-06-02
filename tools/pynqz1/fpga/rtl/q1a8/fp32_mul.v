@@ -31,7 +31,10 @@ module fp32_mul (
     // Prepend the implicit "1." hidden bit and multiply 24x24 -> 48 bits.
     // The product is in [1.0, 4.0); bit 47 set means it's in [2.0, 4.0) and
     // we need to renormalize by shifting right one place.
-    wire [47:0] prod   = {1'b1, ma} * {1'b1, mb};
+    // use_dsp forces the 24x24 onto DSP48 slices — at 150 MHz a LUT-fabric
+    // multiply on this path will not close timing. (Verilator ignores the
+    // attribute, so the sim stays bit-exact.)
+    (* use_dsp = "yes" *) wire [47:0] prod = {1'b1, ma} * {1'b1, mb};
     wire        renorm = prod[47];
     wire [22:0] mr     = renorm ? prod[46:24] : prod[45:23];
 
