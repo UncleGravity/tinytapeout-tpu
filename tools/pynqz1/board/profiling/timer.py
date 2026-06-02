@@ -13,11 +13,15 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
 from board.profiling import events
+
+# Reused no-op context for section()/op() on the disabled path — avoids
+# building a fresh generator-based context manager per (sub-)op.
+_NULL_CTX = nullcontext()
 
 
 @dataclass
@@ -39,15 +43,33 @@ class OpSpan:
 
 
 class Timer:
-    def __init__(self, req_id: int | None = None) -> None:
+    """Per-graph span recorder.
+
+    When ``profile`` is off (the default in production, gated on
+    ``PYNQ_PROFILE``), op()/section() are near-no-ops: no per-op span object,
+    no event emission, no per-section ``perf_counter`` — only the two byte
+    counters the RUN_GRAPH response needs are accumulated. On the A9 the span +
+    event + section machinery cost ~0.2-0.3ms per op × ~40k ops/token; skipping
+    it when nobody reads the NDJSON is the win. With ``profile`` on, the full
+    per-op spans + ``op_begin``/``op_end`` events are recorded as before.
+    """
+
+    def __init__(self, req_id: int | None = None, *, profile: bool | None = None) -> None:
         self._ops: list[OpSpan] = []
         self._current: OpSpan | None = None
         self.graph_us: int = 0
         self.req_id = req_id
+        self._profile = events.enabled() if profile is None else profile
+        # Always tracked (cheap) so the response counters don't need spans.
+        self.total_bytes_read: int = 0
+        self.total_bytes_written: int = 0
+
+    @property
+    def profile(self) -> bool:
+        return self._profile
 
     @contextmanager
-    def op(self, name: str, **fields: Any) -> Iterator[OpSpan]:
-        """Record one graph op span. Emits ``op_begin`` / ``op_end`` events."""
+    def _op_profiled(self, name: str, **fields: Any) -> Iterator[OpSpan]:
         fields.pop("index", None)  # span owns its own index; ignore any duplicate
         span = OpSpan(op=name, index=len(self._ops), fields=dict(fields))
         previous = self._current
@@ -70,9 +92,20 @@ class Timer:
                 **span.fields,
             )
 
+    def op(self, name: str, **fields: Any):
+        """Record one graph op span (profiled), or a no-op context (disabled)."""
+        if self._profile:
+            return self._op_profiled(name, **fields)
+        return _NULL_CTX
+
+    def section(self, name: str):
+        """Record a named sub-span inside the current op (profiled only)."""
+        if not self._profile:
+            return _NULL_CTX
+        return self._section_profiled(name)
+
     @contextmanager
-    def section(self, name: str) -> Iterator[None]:
-        """Record a named sub-span inside the current op."""
+    def _section_profiled(self, name: str) -> Iterator[None]:
         start_ns = time.perf_counter_ns()
         try:
             yield
@@ -85,11 +118,16 @@ class Timer:
                 self._current.sections[key] = self._current.sections.get(key, 0) + elapsed
 
     def add(self, key: str, value: Any) -> None:
-        """Accumulate a free-form field on the current op span."""
-        if self._current is None:
-            return
-        existing = self._current.fields.get(key, 0)
-        self._current.fields[key] = existing + value
+        """Accumulate a field. The two byte counters always feed the graph-level
+        totals (used by the response); the rest land on the current span when
+        profiling."""
+        if key == "bytes_read":
+            self.total_bytes_read += value
+        elif key == "bytes_written":
+            self.total_bytes_written += value
+        if self._current is not None:
+            existing = self._current.fields.get(key, 0)
+            self._current.fields[key] = existing + value
 
     def summary(self, counters: dict[str, int] | None = None) -> dict[str, Any]:
         """Aggregate payload — matches the legacy ``pynq profile:`` JSON shape."""

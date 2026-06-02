@@ -47,7 +47,7 @@ def test_loopback_dispatches_dma_with_correct_slices():
     overlay = _mock_overlay()
     kernel = pl.loopback.PLLoopback(overlay)
 
-    timer = Timer()
+    timer = Timer(profile=True)  # exercise per-op span recording
     with timer.op(GOP_COPY):
         kernel.run(alloc, {
             "op": GOP_COPY,

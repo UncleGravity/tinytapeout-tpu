@@ -225,18 +225,16 @@ class TensorAllocator:
         a Python ``bytes`` object. Raises if the range spans extents, or if
         the slab is not pynq-backed (FakeSlab has no usable VA).
         """
-        import ctypes
-
         slab, abs_offset, _ = self.slab_view(handle, offset, nbytes)
-        buf = getattr(slab, "pynq_buffer", None)
-        if buf is None:
+        # base_va is the slab's CMA user-space VA, resolved once at slab
+        # construction (PynqSlab.base_va). Non-pynq slabs (FakeSlab) have
+        # base_va=None → callers fall back to a copy.
+        base = getattr(slab, "base_va", None)
+        if base is None:
             raise AllocatorError(
                 "invalid_request",
                 "slab_pointer requires a pynq-backed slab",
             )
-        base = buf.ctypes.data_as(ctypes.c_void_p).value
-        if base is None:
-            raise AllocatorError("internal_error", "slab has no usable data pointer")
         return base + abs_offset
 
     def physical(self, handle: int, offset: int = 0) -> int:

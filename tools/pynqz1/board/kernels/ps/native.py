@@ -748,32 +748,12 @@ def _readable_base(
     caller must hold the returned keepalive for as long as it dereferences
     the pointer.
     """
-    global _RB_FAST, _RB_SLOW
     try:
-        ptr = allocator.slab_pointer(handle, offset, nbytes)
-        _RB_FAST += 1
-        _rb_maybe_dump()
-        return ptr, None
+        return allocator.slab_pointer(handle, offset, nbytes), None
     except AllocatorError:
         data = allocator.read(handle, offset, nbytes)
         buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
-        _RB_SLOW += 1
-        _rb_maybe_dump()
         return ctypes.addressof(buf), buf
-
-
-# TEMP DIAGNOSTIC: count zero-copy fast path vs multi-extent copy fallback in
-# _readable_base, to confirm whether glue activation tensors are multi-extent.
-# Prints to the daemon's stderr. Remove once the question is answered.
-_RB_FAST = 0
-_RB_SLOW = 0
-
-
-def _rb_maybe_dump() -> None:
-    if (_RB_FAST + _RB_SLOW) % 5000 == 0:
-        import sys
-        print(f"[readable_base] fast(zero-copy)={_RB_FAST} slow(multi-extent copy)={_RB_SLOW}",
-              file=sys.stderr, flush=True)
 
 
 def _slab_pointer_or_scratch(

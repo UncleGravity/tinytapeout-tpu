@@ -39,6 +39,9 @@ class Slab(Protocol):
 
 
 class FakeSlab:
+    # No CMA mapping → no user-space base VA; slab_pointer falls back to copy.
+    base_va = None
+
     def __init__(self, size: int, physical_address: int = 0):
         self.size = size
         self.physical_address = physical_address
@@ -76,6 +79,10 @@ class PynqSlab:
         self._np = np
         self._buf = allocate(shape=(size,), dtype=np.uint8)
         self.physical_address = int(self._buf.physical_address)
+        # User-space VA of the CMA mapping, resolved once. slab_pointer adds the
+        # tensor offset to this instead of rebuilding a ctypes object per call
+        # (that per-op cast dominated glue ops' address-resolution time).
+        self.base_va = int(self._buf.ctypes.data)
 
     @property
     def pynq_buffer(self):

@@ -17,6 +17,7 @@ inside the matmul's dst byte interval.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from board.kernels.registry import KernelRegistry
@@ -108,6 +109,9 @@ def run_graph(
     timer = Timer(req_id=req_id)
     counts = {"ps": 0, "pl": 0}
     events.emit("graph_begin", req_id=req_id, op_count=len(ops))
+    # Elapsed is measured directly (not via the timer) so the response counter
+    # is correct whether or not per-op profiling is enabled.
+    graph_start_ns = time.perf_counter_ns()
     with timer.section("graph"):
         # The single in-flight pending op (a matmul whose DMA is streaming),
         # or None. `.pending` is opaque to the scheduler; `.dst_*` bound the
@@ -158,6 +162,7 @@ def run_graph(
         if in_flight is not None:
             complete(in_flight)
             in_flight = None
+    elapsed_us = max(0, (time.perf_counter_ns() - graph_start_ns) // 1000)
     ps_ops = counts["ps"]
     pl_ops = counts["pl"]
 
@@ -168,9 +173,9 @@ def run_graph(
     counters = {
         "ps_ops": ps_ops,
         "pl_ops": pl_ops,
-        "bytes_read": sum(int(s.fields.get("bytes_read", 0)) for s in timer.ops),
-        "bytes_written": sum(int(s.fields.get("bytes_written", 0)) for s in timer.ops),
-        "elapsed_us": timer.graph_us,
+        "bytes_read": timer.total_bytes_read,
+        "bytes_written": timer.total_bytes_written,
+        "elapsed_us": elapsed_us,
     }
     events.emit("graph_end", req_id=req_id, **counters)
 
