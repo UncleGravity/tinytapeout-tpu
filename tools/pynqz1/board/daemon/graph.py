@@ -1,9 +1,18 @@
 """``RUN_GRAPH`` handler.
 
-The dispatch loop is a flat table-driven walk: parse op metadata, look
-up the matching kernel in the registry, run it under a ``Timer``. There
-are no per-op branches, no per-op handler functions, and no Python
-fallbacks. Adding a new op = one ``registry.register`` call.
+The dispatch loop is a single-in-flight pipelining scheduler. Ops run in
+order, but a kernel that exposes ``run_async`` (today only the PL matmul)
+may issue its DMA and return a *pending* handle; subsequent ops that don't
+touch the in-flight result run on the ARM while the PL streams, and the
+pending op is ``complete``d the moment an op needs its output (or another
+matmul needs the kernel). Kernels without ``run_async`` run synchronously,
+so the loop is behaviourally identical to the old flat walk for them.
+
+Dependency safety rests on ggml's compute-arena guarantee: two
+simultaneously-live tensors never overlap in memory. So the only op that
+touches the in-flight matmul's destination bytes is one that reads (or
+overwrites) that tensor — detectable by its tensor handle+offset landing
+inside the matmul's dst byte interval.
 """
 
 from __future__ import annotations
@@ -15,15 +24,69 @@ from board.memory.allocator import AllocatorError, TensorAllocator
 from board.profiling import events
 from board.profiling.timer import Timer
 from proto.ops import (
+    F_ACTS,
+    F_ACTS_OFFSET,
     F_COUNTERS,
+    F_DST,
+    F_DST_OFFSET,
     F_GRAPH_VERSION,
     F_ID,
+    F_INDICES,
+    F_INDICES_OFFSET,
+    F_K_OFFSET,
+    F_K_TENSOR,
+    F_MASK,
+    F_MASK_OFFSET,
     F_OP,
     F_OP_COUNT,
     F_OPS,
     F_OUTPUTS,
+    F_POSITIONS,
+    F_POSITIONS_OFFSET,
+    F_SRC,
+    F_SRC0,
+    F_SRC0_OFFSET,
+    F_SRC1,
+    F_SRC1_OFFSET,
+    F_SRC_OFFSET,
+    F_V_OFFSET,
+    F_V_TENSOR,
+    F_WEIGHTS,
+    F_WEIGHTS_OFFSET,
     GRAPH_VERSION,
 )
+
+# (handle field, offset field) for every tensor an op can reference. Used to
+# test whether an op touches the in-flight matmul's result range.
+_TENSOR_ROLES: tuple[tuple[str, str], ...] = (
+    (F_SRC, F_SRC_OFFSET),
+    (F_DST, F_DST_OFFSET),
+    (F_SRC0, F_SRC0_OFFSET),
+    (F_SRC1, F_SRC1_OFFSET),
+    (F_WEIGHTS, F_WEIGHTS_OFFSET),
+    (F_ACTS, F_ACTS_OFFSET),
+    (F_POSITIONS, F_POSITIONS_OFFSET),
+    (F_K_TENSOR, F_K_OFFSET),
+    (F_V_TENSOR, F_V_OFFSET),
+    (F_MASK, F_MASK_OFFSET),
+    (F_INDICES, F_INDICES_OFFSET),
+)
+
+
+def _op_touches(op: dict[str, Any], handle: int, lo: int, hi: int) -> bool:
+    """True if ``op`` references byte ``[lo, hi)`` of tensor ``handle``.
+
+    Sound under ggml's arena non-overlap guarantee: an op that reads or
+    overwrites the in-flight matmul's dst tensor references it at a (handle,
+    offset) whose offset lands in the dst byte interval; no *other* live
+    tensor can occupy those bytes. Unknown offsets default to 0, which is
+    conservative (more likely to land in [lo, hi) and force a wait)."""
+    for handle_field, offset_field in _TENSOR_ROLES:
+        if handle_field in op and int(op[handle_field]) == handle:
+            offset = int(op.get(offset_field, 0))
+            if lo <= offset < hi:
+                return True
+    return False
 
 
 def run_graph(
@@ -43,10 +106,20 @@ def run_graph(
     req_id = metadata.get(F_ID)
 
     timer = Timer(req_id=req_id)
-    ps_ops = 0
-    pl_ops = 0
+    counts = {"ps": 0, "pl": 0}
     events.emit("graph_begin", req_id=req_id, op_count=len(ops))
     with timer.section("graph"):
+        # The single in-flight pending op (a matmul whose DMA is streaming),
+        # or None. `.pending` is opaque to the scheduler; `.dst_*` bound the
+        # bytes downstream ops must not touch until it completes.
+        in_flight = None
+
+        def complete(pending) -> None:
+            # Attribute the wait + result handling to a span named like the op
+            # so the profile aggregates it with the issue span.
+            with timer.op(pending.op_name):
+                pending.kernel.complete(pending, timer)
+
         for index, op in enumerate(ops):
             op_name = str(op.get(F_OP, ""))
             if not op_name:
@@ -54,12 +127,39 @@ def run_graph(
                     "invalid_request", f"graph op {index} is missing op"
                 )
             kernel = registry.get(op_name)
-            if getattr(kernel, "backend", "ps") == "pl":
-                pl_ops += 1
-            else:
-                ps_ops += 1
+
+            # Barrier: finish the in-flight matmul before an op that consumes
+            # its result, or before another op that needs the PL kernel.
+            if in_flight is not None and (
+                getattr(kernel, "backend", "ps") == "pl"
+                or _op_touches(op, in_flight.dst_handle,
+                               in_flight.dst_lo, in_flight.dst_hi)
+            ):
+                complete(in_flight)
+                in_flight = None
+
+            run_async = getattr(kernel, "run_async", None)
+            if run_async is not None and in_flight is None:
+                with timer.op(op_name):
+                    pending = run_async(allocator, op, timer)
+                counts["pl" if getattr(kernel, "backend", "ps") == "pl"
+                       else "ps"] += 1
+                if pending is not None:
+                    pending.op_name = op_name
+                    pending.kernel = kernel
+                    in_flight = pending
+                continue
+
+            counts["pl" if getattr(kernel, "backend", "ps") == "pl"
+                   else "ps"] += 1
             with timer.op(op_name):
                 kernel.run(allocator, op, timer)
+
+        if in_flight is not None:
+            complete(in_flight)
+            in_flight = None
+    ps_ops = counts["ps"]
+    pl_ops = counts["pl"]
 
     # Validate every declared output exists.
     for handle in outputs:

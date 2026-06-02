@@ -255,3 +255,16 @@ def test_bind_native_resolves_start_wait_split(native_lib_path):
     assert run_chunk.restype is ctypes.c_int
     assert start_chunk.restype is ctypes.c_int
     assert wait_chunk.restype is ctypes.c_int
+
+
+def test_matmul_exposes_async_scheduler_contract():
+    """The PL matmul must expose run_async/complete so the graph scheduler
+    pipelines it, and _PendingMatmul must carry the fields the scheduler reads
+    to bar dependent ops. (The MMIO path itself is board-only.)"""
+    kernel = matmul_q1a8.PLMatmulQ1A8(overlay=SimpleNamespace(
+        axi_dma_0=None, axi_dma_1=None, q1a8_kernel_top_0=None))
+    assert callable(getattr(kernel, "run_async", None))
+    assert callable(getattr(kernel, "complete", None))
+    assert kernel.backend == "pl"
+    for slot in ("kernel", "op_name", "dst_handle", "dst_lo", "dst_hi"):
+        assert slot in matmul_q1a8._PendingMatmul.__slots__

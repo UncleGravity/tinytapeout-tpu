@@ -281,6 +281,38 @@ def _pack_rowblock_into(
 # -- runtime driver -------------------------------------------------------
 
 
+class _PendingMatmul:
+    """Handle for an in-flight matmul column (DMA started, wait deferred).
+
+    The graph scheduler reads ``dst_handle``/``dst_lo``/``dst_hi`` to bar ops
+    that would consume the streaming result, sets ``op_name``/``kernel``, and
+    later calls ``kernel.complete(pending, timer)``. Everything else here is
+    private to ``PLMatmulQ1A8.complete``."""
+
+    __slots__ = (
+        "kernel", "op_name", "dst_handle", "dst_lo", "dst_hi",
+        "out_cycles", "dst_slab", "dst_abs", "dst_nbytes", "weight_nbytes",
+        "acts_stream_nbytes", "rowblocks_per_col", "rows_per_block",
+    )
+
+    def __init__(self, *, kernel, out_cycles, dst_slab, dst_abs, dst_handle,
+                 dst_lo, dst_hi, dst_nbytes, weight_nbytes, acts_stream_nbytes,
+                 rowblocks_per_col, rows_per_block):
+        self.kernel = kernel
+        self.op_name = None
+        self.dst_handle = dst_handle
+        self.dst_lo = dst_lo
+        self.dst_hi = dst_hi
+        self.out_cycles = out_cycles
+        self.dst_slab = dst_slab
+        self.dst_abs = dst_abs
+        self.dst_nbytes = dst_nbytes
+        self.weight_nbytes = weight_nbytes
+        self.acts_stream_nbytes = acts_stream_nbytes
+        self.rowblocks_per_col = rowblocks_per_col
+        self.rows_per_block = rows_per_block
+
+
 class PLMatmulQ1A8:
     name = GOP_MATMUL_Q1A8
     backend = "pl"
@@ -636,6 +668,138 @@ class PLMatmulQ1A8:
         )
         timer.add("kernel_cycles", total_cycles)
 
+    def run_async(self, allocator: TensorAllocator, op: dict[str, Any],
+                  timer: Timer):
+        """Issue a pipelinable matmul and return a ``_PendingMatmul``, or run it
+        synchronously and return ``None``.
+
+        Only the common decode shape is pipelined: a single matmul column whose
+        weights are one contiguous slab chunk and whose result lands directly
+        in a single dst slab extent (rows a multiple of ROWS_PER_BLOCK). Every
+        other shape — cols>1 prefill, multi-chunk lm_head, multi-extent weights
+        or dst, unaligned rows — falls back to the proven synchronous ``run()``.
+        The deferred wait + dst-cache-invalidate happen in ``complete()``."""
+        rows = _required(op, F_ROWS)
+        cols = _required(op, F_COLS)
+        k = _required(op, F_K)
+        if cols != 1 or rows == 0 or k == 0 or k % Q1_BLOCK != 0:
+            self.run(allocator, op, timer)
+            return None
+
+        self._ensure_native()
+        self._ensure_mmio_pointers()
+        self._check_kernel_id()
+        rows_per_block = self._read_rows_per_block()
+
+        packed_bytes_per_rb = q1a8_layout.packed_bytes_per_rowblock(k)
+        rowblocks_per_col = (rows + rows_per_block - 1) // rows_per_block
+        max_rowblocks_per_chunk = min(
+            rowblocks_per_col, max(1, (8 * 1024 * 1024) // packed_bytes_per_rb))
+
+        weights_handle = _required(op, F_WEIGHTS)
+        weights_base_offset = _optional_int(op, F_WEIGHTS_OFFSET)
+        dst_handle = _required(op, F_DST)
+        dst_base_offset = _optional_int(op, F_DST_OFFSET)
+
+        # Pipeline only when the whole column is one contiguous weight chunk
+        # landing in a single dst slab extent (the run() fast path). Else defer
+        # to the synchronous loop, which handles chunking + fallbacks.
+        ext_remaining = self._extent_remaining(
+            allocator, weights_handle, weights_base_offset)
+        rowblocks_to_boundary = ext_remaining // packed_bytes_per_rb
+        single_chunk = (max_rowblocks_per_chunk >= rowblocks_per_col
+                        and rowblocks_to_boundary >= rowblocks_per_col)
+        if not (single_chunk and rows % rows_per_block == 0):
+            self.run(allocator, op, timer)
+            return None
+
+        dst_nbytes = rows * cols * F32_BYTES
+        try:
+            dst_slab, dst_abs, _ = allocator.slab_view(
+                dst_handle, dst_base_offset, dst_nbytes)
+        except AllocatorError as exc:
+            if exc.code != "multi_extent":
+                raise
+            self.run(allocator, op, timer)
+            return None
+        if getattr(dst_slab, "pynq_buffer", None) is None:
+            self.run(allocator, op, timer)
+            return None
+        result_phys = dst_slab.pynq_buffer.physical_address + dst_abs
+
+        # -- confirmed simple: quantize + pack + start, defer the wait --------
+        timer.add("rows", rows)
+        timer.add("cols", cols)
+        timer.add("k", k)
+
+        blocks_per_row = k // Q1_BLOCK
+        weight_nbytes = q1a8_layout.packed_nbytes(rows, k)
+        acts_stream_nbytes = q1a8_layout.acts_stream_nbytes(k)
+        act_nbytes = k * F32_BYTES
+
+        with timer.section("read"):
+            acts_addr = self._resolve_slab_pointer(
+                allocator, _required(op, F_ACTS),
+                _optional_int(op, F_ACTS_OFFSET), act_nbytes, "acts")
+        timer.add("bytes_read", weight_nbytes + act_nbytes)
+
+        import numpy as np
+
+        self._np = np
+        chunk_weights_nbytes = rowblocks_per_col * packed_bytes_per_rb
+        chunk_result_nbytes = rowblocks_per_col * rows_per_block * F32_BYTES
+        self._ensure_buffers(acts_stream_nbytes, chunk_weights_nbytes,
+                             chunk_result_nbytes)
+
+        act_quants = np.empty(k, dtype=np.int8)
+        act_scale_bits = np.empty(k // Q8_BLOCK, dtype=np.uint16)
+        quants_ptr = act_quants.ctypes.data_as(ctypes.POINTER(ctypes.c_int8))
+        scales_ptr = act_scale_bits.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
+        acts_buf_ptr = self._acts_buf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+
+        with timer.section("quantize"):
+            acts_in_ptr = ctypes.cast(acts_addr, ctypes.POINTER(ctypes.c_float))
+            rc = self._c_quantize(acts_in_ptr, ctypes.c_uint32(k),
+                                  quants_ptr, scales_ptr)
+            if rc != 0:
+                raise RuntimeError(f"bonsai_quantize_q8_0_pl rc={rc}")
+        with timer.section("pack_acts"):
+            rc = self._c_pack_acts(quants_ptr, scales_ptr, ctypes.c_uint32(k),
+                                   acts_buf_ptr)
+            if rc != 0:
+                raise RuntimeError(f"bonsai_q1a8_pack_acts rc={rc}")
+            self._acts_buf.flush()
+
+        # rows % rows_per_block == 0 → padded result == dst_nbytes.
+        with timer.section("compute"):
+            out_cycles = self._run_matmul_dual_stream(
+                allocator, weights_handle, weights_base_offset,
+                chunk_weights_nbytes, acts_stream_nbytes, result_phys,
+                dst_nbytes, blocks_per_row, rowblocks_per_col, timer,
+                defer_wait=True)
+
+        return _PendingMatmul(
+            kernel=self, out_cycles=out_cycles, dst_slab=dst_slab, dst_abs=dst_abs,
+            dst_handle=dst_handle, dst_lo=dst_base_offset,
+            dst_hi=dst_base_offset + dst_nbytes, dst_nbytes=dst_nbytes,
+            weight_nbytes=weight_nbytes, acts_stream_nbytes=acts_stream_nbytes,
+            rowblocks_per_col=rowblocks_per_col, rows_per_block=rows_per_block)
+
+    def complete(self, pending: _PendingMatmul, timer: Timer) -> None:
+        """Block on the deferred chunk, then invalidate the dst slab range so
+        downstream CPU reads see the DMA'd result."""
+        cycles = self._wait_chunk_deferred(pending.out_cycles, timer)
+        with timer.section("result_invalidate"):
+            pending.dst_slab.invalidate_range(pending.dst_abs, pending.dst_nbytes)
+        timer.add("bytes_written", pending.dst_nbytes)
+        timer.add("matmul_cols", 1)
+        timer.add("rowblocks", pending.rowblocks_per_col)
+        timer.add("dma_bytes_read",
+                  pending.weight_nbytes + pending.acts_stream_nbytes)
+        timer.add("dma_bytes_written",
+                  pending.rowblocks_per_col * pending.rows_per_block * F32_BYTES)
+        timer.add("kernel_cycles", cycles)
+
     def _check_kernel_id(self) -> None:
         got_id = self._kernel.read(REG_ID)
         got_version = self._kernel.read(REG_VERSION)
@@ -754,7 +918,8 @@ class PLMatmulQ1A8:
         num_q1_blocks: int,
         num_rowblocks: int,
         timer: Timer,
-    ) -> int:
+        defer_wait: bool = False,
+    ):
         """Drive one column-chunk via the C runner.
 
         Python does only: resolve the weight physical address and call C.
@@ -793,6 +958,10 @@ class PLMatmulQ1A8:
                 raise RuntimeError(
                     f"bonsai_q1a8_start_matmul_chunk rc={rc} "
                     f"(see q1a8_runner.c for error code mapping)")
+            if defer_wait:
+                # DMA + kernel now run autonomously; the caller holds out_cycles
+                # and calls _wait_chunk_deferred once it needs the result.
+                return out_cycles
             with timer.section("chunk_wait"):
                 rc = self._c_wait_chunk(
                     self._kernel_regs_ptr,
@@ -806,4 +975,21 @@ class PLMatmulQ1A8:
                     f"bonsai_q1a8_wait_matmul_chunk rc={rc} "
                     f"(see q1a8_runner.c for error code mapping)")
 
+        return int(out_cycles.value)
+
+    def _wait_chunk_deferred(self, out_cycles, timer: Timer) -> int:
+        """Block on a chunk started with ``defer_wait=True`` and return cycles."""
+        with timer.section("run_chunk"):
+            with timer.section("chunk_wait"):
+                rc = self._c_wait_chunk(
+                    self._kernel_regs_ptr,
+                    self._dma_w_regs_ptr,
+                    self._dma_a_regs_ptr,
+                    ctypes.c_uint32(POLL_LIMIT),
+                    ctypes.byref(out_cycles),
+                )
+        if rc != 0:
+            raise RuntimeError(
+                f"bonsai_q1a8_wait_matmul_chunk rc={rc} "
+                f"(see q1a8_runner.c for error code mapping)")
         return int(out_cycles.value)
