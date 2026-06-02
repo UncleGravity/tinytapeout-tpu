@@ -6,9 +6,12 @@ verifies the byte counts match the header.
 
 The packed layout (what the host stores on the board) carries only the
 weight portion of the AXIS stream and is exactly the same total size as
-the Q1_0 source: 8 × Q1_BLOCK_BYTES bytes per Q1 block per rowblock. The
-runtime merge function then walks packed[rb][q1] + acts[col][q8] in
-lock-step to produce the full 304-byte stream chunk the PL kernel reads.
+the Q1_0 source: 8 × Q1_BLOCK_BYTES bytes per Q1 block per rowblock.
+
+v4 (dual-stream) streams those packed weights directly on S_AXIS while acts
+are packed separately (``pack_acts``, ``ACTS_PER_Q1_BLOCK``) onto S_AXIS_ACTS.
+``merge_acts`` / ``STREAM_PER_Q1_BLOCK`` (304 B) are the legacy v3 merged
+single-stream path, kept only for tests and reference.
 """
 
 from __future__ import annotations

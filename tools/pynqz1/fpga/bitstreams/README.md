@@ -8,7 +8,7 @@ runner, and any design-specific RTL not shared via `../rtl/`.
 
 | Folder            | What                                                       |
 |-------------------|------------------------------------------------------------|
-| `matmul_q1a8/`    | W1A8 rowblock matmul kernel - ps7 + axi_dma + axi_lite + q1a8_kernel |
+| `matmul_q1a8/`    | W1A8 rowblock matmul kernel - ps7 + 2x axi_dma + axi_lite + q1a8_kernel; weights on HP1, acts/results on HP0 |
 | `benchmarks/`     | standalone plumbing tests; no shipping function           |
 | `benchmarks/dma_loopback/`      | single-HP AXI DMA loopback (bandwidth + plumbing baseline) |
 | `benchmarks/dma_dual_loopback/` | two-HP concurrent loopback (measures DDR ceiling)          |

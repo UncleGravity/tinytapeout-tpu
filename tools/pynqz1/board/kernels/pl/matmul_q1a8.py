@@ -1,10 +1,10 @@
 """PL-backed MATMUL_Q1A8 driver for the rowblock bitstream.
 
-Hot path: per-column quantize + merge_acts(packed_weights, quants, scales)
-+ DMA. The merge_acts step is a memcpy walk over weights that the host
-already pre-packed into AXIS rowblock layout at upload time. No bit
-shuffles in the hot path; the legacy per-matmul stream pack that used to
-dominate matmul wall time (~85%) is gone.
+Hot path (v4 dual-stream): per-column quantize + pack_acts (acts wire stream)
++ DMA. Weights are streamed directly out of the slab (pre-packed into AXIS
+rowblock layout at upload time); acts go on a separate S_AXIS_ACTS stream, so
+there is no per-matmul weight repack. The legacy v3 merge_acts step that used
+to dominate matmul wall time (~85%) is gone.
 """
 
 from __future__ import annotations

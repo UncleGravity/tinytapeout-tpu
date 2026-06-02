@@ -166,8 +166,9 @@ def _in_ptr(allocator: TensorAllocator, handle: int, offset: int, nbytes: int,
     bulk of every glue op's "read" time. This returns the slab's VA directly.
     FakeSlab / multi-extent fall back to a ctypes copy whose backing buffer is
     appended to ``keep`` so it outlives the C call. Inputs are read by
-    reference, but each kernel still computes into a *fresh* output buffer, so
-    this stays in-place safe even when dst aliases a src (e.g. ROPE)."""
+    reference and outputs are written zero-copy via ``_out_ptr``; this stays
+    in-place safe even when dst aliases a src (e.g. ROPE) because every glue
+    kernel is per-element in-place safe (see ``_out_ptr``)."""
     with timer.section("read"):
         addr, backing = _readable_base(allocator, handle, offset, nbytes)
     timer.add("bytes_read", nbytes)
@@ -726,11 +727,9 @@ class RopeF32(_NativeKernel):
 # pointer. Multi-extent fallback copies through a per-kernel scratch
 # buffer (same pattern as PLMatmulQ1A8._copy_to_cma_scratch).
 #
-# Cache coherence is whole-slab on read/write today (slabs.py:PynqSlab),
-# so we don't need a separate per-range flush — the slab's flush()
-# happens once per write. For pure CPU computation (no DMA) this is
-# overkill but correct; the Phase 1.2 range-flush refactor will fix it
-# system-wide.
+# Cache ops are cacheline-range scoped (slabs.py:_cacheline_bounds), and these
+# CPU-only ops read/write with coherent=False (no flush/invalidate) since the
+# CPU cache is self-coherent — only the matmul DMA needs explicit coherence.
 
 
 _SLAB_SCRATCH_BUFS: dict[tuple[str, str], object] = {}

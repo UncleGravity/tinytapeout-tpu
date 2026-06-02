@@ -215,7 +215,7 @@ ggml_backend_dev_t reg_get_device(ggml_backend_reg_t reg, std::size_t index) {
 ggml_backend_feature g_features[] = {
     { "transport", "bonsaid-tcp" },
     { "buffer", "remote-tensor-handles" },
-    { "graph_ops", "copy,matmul_q1a8,add_f32,mul_f32,scale_f32,silu_f32,swiglu_f32,rms_norm_f32,rope_f32,flash_attn_ext_f32,get_rows,set_rows" },
+    { "graph_ops", "copy,matmul_q1a8,add_f32,mul_f32,scale_f32,silu_f32,swiglu_f32,rms_norm_f32,rms_norm_mul_f32,rope_f32,flash_attn_ext_f32,get_rows,set_rows" },
     { nullptr, nullptr },
 };
 

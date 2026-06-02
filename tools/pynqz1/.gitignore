@@ -1,6 +1,9 @@
-# Built PS kernel artifact (board/kernels/ps/Makefile output)
+# Built PS kernel artifact
 libbonsai_ps.so
 libbonsai_ps.dylib
 .ruff_cache/
 sim_build/
 results.xml
+
+# Nix
+result/

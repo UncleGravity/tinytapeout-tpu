@@ -385,7 +385,9 @@ def cmd_bench(args):
         us_per_matmul = dt / args.iters * 1e6
         us_per_rowblock = us_per_matmul / args.rowblocks
         avg_cycles = cycle_total / args.iters
-        pl_us = avg_cycles / 100.0
+        # FCLK is ~142.857 MHz (1000/7; the PLL's value for a 150 MHz request).
+        fclk_mhz = 142.857
+        pl_us = avg_cycles / fclk_mhz
         macs_per_matmul = m_rows * k
         bytes_in_per_matmul = len(packed)
         print(
@@ -394,7 +396,7 @@ def cmd_bench(args):
         )
         print(f"  wall:        {dt*1000:.1f} ms ({us_per_matmul:.1f} us/matmul, "
               f"{us_per_rowblock:.1f} us/rowblock)")
-        print(f"  pl compute:  {avg_cycles:.0f} cycles ({pl_us:.1f} us @ 100 MHz)")
+        print(f"  pl compute:  {avg_cycles:.0f} cycles ({pl_us:.1f} us @ {fclk_mhz:.3f} MHz)")
         print(f"  ps overhead: {us_per_matmul - pl_us:.1f} us/matmul")
         print(f"  throughput:  {macs_per_matmul * args.iters / dt / 1e6:.1f} MMAC/s "
               f"({bytes_in_per_matmul * args.iters / dt / 1e6:.1f} MB/s in)")
